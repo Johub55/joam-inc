@@ -453,10 +453,28 @@ export const GtaEasterEggModal: React.FC<GtaEasterEggModalProps> = ({ isOpen, on
     ];
 
     const spawnNewTarget = () => {
-      // Pick random safe locations on horizontal/vertical ROADS
-      const rd = ROADS[Math.floor(Math.random() * ROADS.length)];
-      target.x = rd.x + (rd.w === MAP_WIDTH ? Math.random() * (MAP_WIDTH - 200) + 100 : rd.w / 2);
-      target.y = rd.y + (rd.h === MAP_HEIGHT ? Math.random() * (MAP_HEIGHT - 200) + 100 : rd.h / 2);
+      let valid = false;
+      let newTargetX = 0;
+      let newTargetY = 0;
+      let attempts = 0;
+      while (!valid && attempts < 100) {
+        attempts++;
+        // Pick random safe locations on horizontal/vertical ROADS
+        const rd = ROADS[Math.floor(Math.random() * ROADS.length)];
+        newTargetX = rd.x + (rd.w === MAP_WIDTH ? Math.random() * (MAP_WIDTH - 200) + 100 : rd.w / 2);
+        newTargetY = rd.y + (rd.h === MAP_HEIGHT ? Math.random() * (MAP_HEIGHT - 200) + 100 : rd.h / 2);
+
+        // Check if overlaps any building (with safety padding of 50px)
+        const hitsBuilding = BUILDINGS.some(b => 
+          newTargetX >= b.x - 50 && 
+          newTargetX <= b.x + b.width + 50 && 
+          newTargetY >= b.y - 50 && 
+          newTargetY <= b.y + b.height + 50
+        );
+        if (!hitsBuilding) valid = true;
+      }
+      target.x = newTargetX;
+      target.y = newTargetY;
       target.name = targetNames[Math.floor(Math.random() * targetNames.length)];
     };
 
