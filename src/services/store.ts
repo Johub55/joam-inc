@@ -25,8 +25,8 @@ export const DEFAULT_SUPABASE_PAY_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ey
 
 // Store / Brand Branding Presets
 export const BRAND_CONFIGS: Record<BrandType, BrandConfig> = {
-  werkdonalds: {
-    id: 'werkdonalds',
+  werkpay: {
+    id: 'werkpay',
     name: 'Werkdonalds',
     tagline: 'Vers Bereid • Snelle Kassa & Keuken',
     logoEmoji: '🍔',

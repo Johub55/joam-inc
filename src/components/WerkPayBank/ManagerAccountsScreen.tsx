@@ -17,6 +17,8 @@ import {
   EyeOff,
   Lock
 } from 'lucide-react';
+import { LinkCardModal } from '../WerkPayPOS/LinkCardModal';
+
 
 export const ManagerAccountsScreen: React.FC = () => {
   const { 
@@ -29,7 +31,11 @@ export const ManagerAccountsScreen: React.FC = () => {
 
   const [search, setSearch] = useState<string>('');
   const [editingAcc, setEditingAcc] = useState<BankAccount | null>(null);
+  const [showPairingModal, setShowPairingModal] = useState<boolean>(false);
+  const [pairingAcc, setPairingAcc] = useState<BankAccount | null>(null);
   const [showCreateModal, setShowCreateModal] = useState<boolean>(false);
+  // ...
+  // ... (no code here, moved to return)
   const [revealedPins, setRevealedPins] = useState<Record<string | number, boolean>>({});
   const [showEditSecrets, setShowEditSecrets] = useState<boolean>(false);
 
@@ -217,6 +223,12 @@ export const ManagerAccountsScreen: React.FC = () => {
                   </td>
                   <td className="p-3.5 text-right">
                     <div className="flex items-center justify-end gap-1.5">
+                      <button
+                        onClick={() => { setPairingAcc(acc); setShowPairingModal(true); }}
+                        className="px-2 py-1 rounded-lg text-xs font-bold bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 border border-purple-500/30"
+                      >
+                        Koppel NFC
+                      </button>
                       {!acc.is_admin && (
                         <>
                           <button
@@ -366,6 +378,7 @@ export const ManagerAccountsScreen: React.FC = () => {
       {/* MODAL: Edit Bank Account */}
       {editingAcc && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-3xl w-full max-w-md p-6 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
               <h3 className="font-bold text-base text-white">✏️ Rekening Bewerken</h3>
@@ -480,6 +493,15 @@ export const ManagerAccountsScreen: React.FC = () => {
             </form>
           </div>
         </div>
+        </div>
+      )}
+
+      {/* MODAL: NFC Pairing */}
+      {showPairingModal && pairingAcc && (
+        <LinkCardModal 
+          onClose={() => setShowPairingModal(false)}
+          username={pairingAcc.username}
+        />
       )}
 
     </div>

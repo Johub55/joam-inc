@@ -155,7 +155,7 @@ export const WalletScreen: React.FC = () => {
             <h1 className="text-xl font-black text-white flex items-center gap-2">
               <span>WerkPay Digitale Bankpas &amp; Saldo</span>
               <span className="text-xs px-2.5 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-mono font-bold">
-                WerkDonalds Bank
+                WerkPay Bank
               </span>
             </h1>
             <p className="text-xs text-slate-400">
@@ -288,7 +288,7 @@ export const WalletScreen: React.FC = () => {
                       Debit
                     </span>
                   </div>
-                  <span className="text-[11px] text-slate-400">WerkDonalds Bank Card</span>
+                  <span className="text-[11px] text-slate-400">WerkPay Bank Card</span>
                 </div>
 
                 {currentBankAccount.is_admin ? (

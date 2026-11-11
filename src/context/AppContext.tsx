@@ -481,7 +481,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
         // 3. Try server-side PostgreSQL REVOKE/GRANT RPC if installed
         try {
-          await client.rpc('werkdonalds_set_tables_readonly', { p_lock: nextFreeze, p_allow_orders: true });
+          await client.rpc('werkpay_set_tables_readonly', { p_lock: nextFreeze, p_allow_orders: true });
         } catch {}
       } catch {}
     }
@@ -814,10 +814,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const isBlocked = Boolean(blockedMatch);
   const blockedReason = blockedMatch?.reason || 'Toegang ontzegd door de beheerder.';
 
-  // Active Brand ('werkdonalds' | 'koekploeg') - Defaults to 'koekploeg'
+  // Active Brand ('werkpay' | 'koekploeg') - Defaults to 'koekploeg'
   const [activeBrand, setActiveBrandState] = useState<BrandType>(() => {
     const saved = localStorage.getItem('wd_active_brand');
-    if (saved === 'werkdonalds' || saved === 'koekploeg') {
+    if (saved === 'werkpay' || saved === 'koekploeg') {
       return saved as BrandType;
     }
     return 'koekploeg';
@@ -885,7 +885,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [products, setProducts] = useState<Product[]>(() => {
     const version = localStorage.getItem('wd_products_version');
     const saved = localStorage.getItem('wd_products');
-    if (saved && version === 'v8_koekploeg_and_werkdonalds') {
+    if (saved && version === 'v8_koekploeg_and_werkpay') {
       try {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length >= 10) {
@@ -894,7 +894,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } catch {}
     }
     localStorage.setItem('wd_products', JSON.stringify(ALL_DEFAULT_PRODUCTS));
-    localStorage.setItem('wd_products_version', 'v8_koekploeg_and_werkdonalds');
+    localStorage.setItem('wd_products_version', 'v8_koekploeg_and_werkpay');
     return ALL_DEFAULT_PRODUCTS;
   });
 

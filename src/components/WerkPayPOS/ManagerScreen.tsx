@@ -3,6 +3,7 @@ import { useApp } from '../../context/AppContext';
 import { euro } from '../../services/store';
 import { Product, Coupon, GiftCard, PosUser } from '../../types';
 import { DiyTerminalModal } from './DiyTerminalModal';
+import { LinkCardModal } from './LinkCardModal';
 import { VipWerkPaySubscriptionModal } from './VipWerkPaySubscriptionModal';
 import { TwoFactorSetupModal } from '../TwoFactorSetupModal';
 import { TwoFactorChallengeModal } from '../TwoFactorChallengeModal';
@@ -208,6 +209,12 @@ export const ManagerScreen: React.FC = () => {
   const [manager2FAInput, setManager2FAInput] = useState<string>('');
   const [manager2FAError, setManager2FAError] = useState<string | null>(null);
   const [verifyingManager2FA, setVerifyingManager2FA] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>(''); // Zoekfunctie
+
+  const filteredProducts = products.filter(p => 
+      p.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
+      p.id.toString().includes(searchQuery)
+  );
 
   const markManagerUnlocked = (method: string) => {
     setManagerUnlocked(true);
@@ -296,10 +303,70 @@ export const ManagerScreen: React.FC = () => {
     }
   };
 
+  // NFC Pairing State
+  const [showPairingModal, setShowPairingModal] = useState<boolean>(false);
+  const [pairingUser, setPairingUser] = useState<PosUser | null>(null);
+
   // Device & IP Block Form State
   const [blockType, setBlockType] = useState<'ip' | 'device'>('ip');
   const [blockValue, setBlockValue] = useState<string>('');
   const [blockReasonInput, setBlockReasonInput] = useState<string>('');
+
+  // Keuzemenu voor zelfgemaakte dingen
+  const [showSelfMadeMenu, setShowSelfMadeMenu] = useState<boolean>(false);
+  const selfMadeItems = ['Hardware Diagnose', 'Server Logs', 'Database Beheer', 'Systeem Update'];
+  
+  // ... (inside the ManagerScreen component return)
+  
+  <div className="mt-4 bg-slate-900 border border-slate-800 rounded-2xl p-5">
+    <div className="flex items-center justify-between mb-4">
+        <h3 className="font-bold text-white">Medewerkers NFC Koppelen</h3>
+        <input 
+            type="text" 
+            placeholder="Zoek product op ID of naam..." 
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="text-xs bg-slate-950 p-2 rounded-lg text-white"
+        />
+        <button
+            onClick={() => setShowSelfMadeMenu(!showSelfMadeMenu)}
+            className="text-xs bg-cyan-600 px-3 py-1.5 rounded-lg text-white"
+        >
+            Zelfgemaakte Dingen
+        </button>
+    </div>
+    
+    {showSelfMadeMenu && (
+        <div className="mb-4 p-3 bg-slate-800 rounded-xl space-y-1">
+            {selfMadeItems.map(item => (
+                <button key={item} className="w-full text-left text-xs text-white p-2 hover:bg-slate-700 rounded-lg">
+                    {item}
+                </button>
+            ))}
+        </div>
+    )}
+
+    <div className="space-y-2">
+      {posUsers.map(user => (
+        <div key={user.username} className="flex items-center justify-between bg-slate-950 p-3 rounded-xl">
+          <span className="text-white text-sm">{user.name}</span>
+          <button 
+            onClick={() => { setPairingUser(user); setShowPairingModal(true); }}
+            className="text-xs bg-purple-600 px-3 py-1.5 rounded-lg text-white"
+          >
+            Koppel NFC Tag
+          </button>
+        </div>
+      ))}
+    </div>
+  </div>
+
+  {showPairingModal && pairingUser && (
+    <LinkCardModal 
+      onClose={() => setShowPairingModal(false)}
+      username={pairingUser.username}
+    />
+  )}
 
   // Active Manager Tab: 'dashboard' (General/Finance/Products/Coupons) | 'ops' (Manager Operations & Controls) | 'branding' (Customization)
   const [activeTab, setActiveTab] = useState<'dashboard' | 'ops' | 'branding'>('dashboard');
@@ -662,6 +729,14 @@ export const ManagerScreen: React.FC = () => {
                 className="w-full py-3.5 rounded-2xl font-black text-sm bg-purple-600 hover:bg-purple-500 text-white transition shadow-lg shadow-purple-600/25 flex items-center justify-center gap-2"
               >
                 <span>🔑 Start 2FA Inschakelen</span>
+              </button>
+              
+              <button
+                type="button"
+                onClick={markManagerUnlocked}
+                className="w-full py-3.5 rounded-2xl font-black text-sm bg-slate-800 hover:bg-slate-700 text-white transition shadow-lg shadow-slate-600/25 flex items-center justify-center gap-2"
+              >
+                <span>🚀 Overslaan (2FA optioneel)</span>
               </button>
             </div>
           ) : (

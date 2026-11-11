@@ -1,6 +1,6 @@
 export type AppMode = 'pos' | 'werkpay' | 'split' | 'setup';
 
-export type BrandType = 'werkdonalds' | 'koekploeg';
+export type BrandType = 'werkpay' | 'koekploeg';
 
 export interface BrandConfig {
   id: BrandType;
@@ -19,11 +19,11 @@ export type PosScreenType = 'kassa' | 'keuken' | 'afhaal' | 'pickup_control' | '
 
 export type WerkPayScreenType = 'wallet' | 'overboeken' | 'accounts';
 
-export interface ProductRecipeItem {
-  inventoryItemId: number;
-  itemName: string;
-  qtyNeeded: number;
-  unit: string;
+export interface ProductOption {
+  id: string;
+  name: string;
+  choices: { name: string; priceAdjustment: number }[];
+  multipleSelection: boolean;
 }
 
 export interface Product {
@@ -35,8 +35,7 @@ export interface Product {
   cat: string;
   emoji: string;
   inStock: boolean;
-  recipe?: ProductRecipeItem[];
-  recipeDescription?: string;
+  options?: ProductOption[];
 }
 
 export interface CartItem {
@@ -205,6 +204,7 @@ export interface PosUser {
   is_terminal_locked?: boolean;
   assigned_screen?: PosScreenType;
   session_token?: string;
+  theme?: string;
 }
 
 export interface OrderStopConfig {

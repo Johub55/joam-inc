@@ -1,0 +1,89 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "A product available for sale",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "name": { "type": "string" },
+        "price": { "type": "number" },
+        "salePrice": { "type": "number" },
+        "onSale": { "type": "boolean" },
+        "cat": { "type": "string" },
+        "emoji": { "type": "string" },
+        "inStock": { "type": "boolean" }
+      },
+      "required": ["id", "name", "price", "cat", "inStock"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "A customer order",
+      "type": "object",
+      "properties": {
+        "no": { "type": "number" },
+        "total": { "type": "number" },
+        "status": { "type": "string" },
+        "orderType": { "type": "string" },
+        "identifier": { "type": "string" }
+      },
+      "required": ["no", "total", "status", "orderType", "identifier"]
+    },
+    "BankAccount": {
+      "title": "BankAccount",
+      "description": "User bank account",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "username": { "type": "string" },
+        "balance": { "type": "number" }
+      },
+      "required": ["id", "username", "balance"]
+    },
+    "PosUser": {
+      "title": "PosUser",
+      "description": "POS User",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "username": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "required": ["id", "username", "name"]
+    }
+  },
+  "firestore": {
+    "products/{productId}": {
+      "schema": "Product",
+      "description": "Collection of products"
+    },
+    "orders/{orderId}": {
+      "schema": "Order",
+      "description": "Collection of orders"
+    },
+    "bank_accounts/{accountId}": {
+      "schema": "BankAccount",
+      "description": "Collection of bank accounts"
+    },
+    "pos_users/{userId}": {
+      "schema": "PosUser",
+      "description": "Collection of POS users"
+    },
+    "pos_settings/{settingId}": {
+      "description": "Collection of POS settings"
+    },
+    "bank_transactions/{transactionId}": { "description": "Collection of bank transactions" },
+    "cash_requests/{requestId}": { "description": "Collection of cash requests" },
+    "chat_groups/{groupId}": { "description": "Collection of chat groups" },
+    "coupons/{couponId}": { "description": "Collection of coupons" },
+    "gift_cards/{cardId}": { "description": "Collection of gift cards" },
+    "group_members/{memberId}": { "description": "Collection of group members" },
+    "group_messages/{messageId}": { "description": "Collection of group messages" },
+    "inventory/{itemId}": { "description": "Collection of inventory" },
+    "loyalty_customers/{customerId}": { "description": "Collection of loyalty customers" },
+    "phone_messages/{messageId}": { "description": "Collection of phone messages" },
+    "pos_audit_logs/{logId}": { "description": "Collection of audit logs" },
+    "pos_sessions/{sessionId}": { "description": "Collection of POS sessions" },
+    "tv_presets/{presetId}": { "description": "Collection of TV presets" }
+  }
+}

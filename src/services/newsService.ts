@@ -1,5 +1,6 @@
 import { broadcastSync } from './syncHelpers';
-import { getSupabaseClient } from './store';
+import { db } from './firebase';
+import { doc, setDoc } from 'firebase/firestore';
 
 export interface NewsItem {
   id: string;
@@ -64,18 +65,12 @@ export function saveNewsConfig(cfg: NewsTickerConfig) {
     window.dispatchEvent(new Event('wd_news_config_updated'));
     broadcastSync('SYNC_NEWS_CONFIG', { config: cfg, customItems: getCustomNewsItems() });
 
-    // Cloud sync to Supabase pos_settings
-    const client = getSupabaseClient();
-    if (client) {
-      client.from('pos_settings').upsert({
-        id: 'default',
-        news_config: cfg,
-        custom_news_items: getCustomNewsItems(),
-        updated_at: new Date().toISOString()
-      }).then(({ error }) => {
-        if (error) console.warn('Cloud sync error for news_config:', error.message);
-      });
-    }
+    // Cloud sync to Firestore pos_settings
+    setDoc(doc(db, 'pos_settings', 'default'), {
+      news_config: cfg,
+      custom_news_items: getCustomNewsItems(),
+      updated_at: new Date().toISOString()
+    }, { merge: true }).catch((e) => console.warn('Cloud sync error for news_config:', e));
   } catch (e) {
     console.error('Failed to save news config:', e);
   }
@@ -99,18 +94,12 @@ export function saveCustomNewsItems(items: NewsItem[]) {
     window.dispatchEvent(new Event('wd_news_config_updated'));
     broadcastSync('SYNC_NEWS_CONFIG', { config: getNewsConfig(), customItems: items });
 
-    // Cloud sync to Supabase pos_settings
-    const client = getSupabaseClient();
-    if (client) {
-      client.from('pos_settings').upsert({
-        id: 'default',
-        news_config: getNewsConfig(),
-        custom_news_items: items,
-        updated_at: new Date().toISOString()
-      }).then(({ error }) => {
-        if (error) console.warn('Cloud sync error for custom_news_items:', error.message);
-      });
-    }
+    // Cloud sync to Firestore pos_settings
+    setDoc(doc(db, 'pos_settings', 'default'), {
+      news_config: getNewsConfig(),
+      custom_news_items: items,
+      updated_at: new Date().toISOString()
+    }, { merge: true }).catch((e) => console.warn('Cloud sync error for custom_news_items:', e));
   } catch (e) {
     console.error('Failed to save custom news items:', e);
   }

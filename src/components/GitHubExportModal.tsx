@@ -140,22 +140,22 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
                 </div>
                 <div className="bg-slate-900 px-2.5 py-1.5 rounded-lg font-mono text-[11px] text-amber-300 border border-slate-800 flex items-center gap-1.5">
                   <FileCode className="w-3.5 h-3.5 text-slate-400" />
-                  <span>werkdonalds.html</span>
+                  <span>werkpay.html</span>
                 </div>
               </div>
 
               <div className="pt-4 mt-4 border-t border-slate-800/80 space-y-2">
                 <button
-                  onClick={() => handleDownload('/werkdonalds.html', 'werkdonalds.html')}
+                  onClick={() => handleDownload('/werkpay.html', 'werkpay.html')}
                   className="w-full py-2 px-3 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs transition flex items-center justify-center gap-2 shadow"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>Download werkdonalds.html</span>
+                  <span>Download werkpay.html</span>
                 </button>
 
                 <div className="flex gap-2">
                   <a
-                    href="/werkdonalds.html"
+                    href="/werkpay.html"
                     target="_blank"
                     rel="noreferrer"
                     className="flex-1 py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-center text-[11px] font-medium transition flex items-center justify-center gap-1"
@@ -165,13 +165,13 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
                   </a>
                   <button
                     onClick={async () => {
-                      const res = await fetch('/werkdonalds.html');
+                      const res = await fetch('/werkpay.html');
                       const text = await res.text();
-                      handleCopy(text, 'werkdonalds');
+                      handleCopy(text, 'werkpay');
                     }}
                     className="flex-1 py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium transition flex items-center justify-center gap-1"
                   >
-                    {copiedFile === 'werkdonalds' ? (
+                    {copiedFile === 'werkpay' ? (
                       <>
                         <Check className="w-3 h-3 text-emerald-400" />
                         <span className="text-emerald-400 font-bold">Gekopieerd!</span>
@@ -321,8 +321,8 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
                   <span>🍔</span> Optie A: Twee aparte GitHub Repositories (Aanbevolen)
                 </div>
                 <ol className="list-decimal pl-4 space-y-1 text-slate-300">
-                  <li>Maak op GitHub een repository aan, bijv. <strong>werkdonalds</strong>.</li>
-                  <li>Upload <code className="text-amber-300">werkdonalds.html</code> en noem het bestand <code className="text-amber-300 font-bold">index.html</code>.</li>
+                  <li>Maak op GitHub een repository aan, bijv. <strong>werkpay</strong>.</li>
+                  <li>Upload <code className="text-amber-300">werkpay.html</code> en noem het bestand <code className="text-amber-300 font-bold">index.html</code>.</li>
                   <li>Ga in de repository naar <strong>Settings → Pages</strong>, kies branch <strong>main</strong> en klik <strong>Save</strong>. Je Werkdonalds app is nu direct gratis online!</li>
                   <li>Herhaal ditzelfde voor een 2e repository <strong>werkpay</strong> met <code className="text-cyan-300">werkpay.html</code> (als <code className="text-cyan-300 font-bold">index.html</code>).</li>
                 </ol>

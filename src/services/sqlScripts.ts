@@ -542,7 +542,7 @@ CREATE TRIGGER trg_orders_bank_payment
   EXECUTE FUNCTION public.trg_fn_process_order_bank_payment();
 
 -- 3.4 1-KLIK SERVER-NIVEAU TABEL BEVRIEZING (0 VERANDERINGEN AAN TABELLEN)
-CREATE OR REPLACE FUNCTION public.werkdonalds_set_tables_readonly(p_lock BOOLEAN, p_allow_orders BOOLEAN DEFAULT TRUE)
+CREATE OR REPLACE FUNCTION public.werkpay_set_tables_readonly(p_lock BOOLEAN, p_allow_orders BOOLEAN DEFAULT TRUE)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -811,7 +811,7 @@ ON CONFLICT (username) DO NOTHING;
 -- Werkdonalds & De Koekploeg Producten
 INSERT INTO public.products (id, name, price, sale_price, on_sale, cat, emoji, in_stock) VALUES
   -- Werkdonalds
-  (1, 'WerkDonalds Classic Burger', 6.25, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
+  (1, 'WerkPay Classic Burger', 6.25, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (2, 'Double WerkBurger', 8.25, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (3, 'Triple WerkBurger Extra Beef', 9.45, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (4, 'Big Werk Mac', 5.85, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
@@ -865,7 +865,7 @@ export const SELF_HOSTED_LAPTOP_SQL = `-- ======================================
 -- 
 -- INSTRUCTIES DOCKER SERVER OP OUDE LAPTOP:
 -- 1. Install Docker & Docker Compose op de oude laptop.
--- 2. Voer uit: docker run -d --name werkdonalds-db -e POSTGRES_PASSWORD=werkdonalds123 -p 5432:5432 postgres:15
+-- 2. Voer uit: docker run -d --name werkpay-db -e POSTGRES_PASSWORD=werkpay123 -p 5432:5432 postgres:15
 -- 3. Of gebruik Supabase CLI: npx supabase init && npx supabase start
 -- 4. Voer onderstaand SQL script uit in pgAdmin, psql of Supabase Studio (http://localhost:5432 of port 8000)
 -- ==============================================================================
@@ -933,7 +933,7 @@ ALTER TABLE public.pos_settings ADD COLUMN IF NOT EXISTS tables_frozen BOOLEAN N
 ALTER TABLE public.pos_settings ADD COLUMN IF NOT EXISTS blocked_devices JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE public.pos_settings ADD COLUMN IF NOT EXISTS order_stop_text TEXT DEFAULT 'Beste gast, wegens extreme drukte in onze keuken hebben we tijdelijk een bestelstop ingelast. We bereiden momenteel de lopende bestellingen voor. Excuses voor de vertraging!';
 
-CREATE OR REPLACE FUNCTION public.werkdonalds_set_tables_readonly(p_lock BOOLEAN, p_allow_orders BOOLEAN DEFAULT TRUE)
+CREATE OR REPLACE FUNCTION public.werkpay_set_tables_readonly(p_lock BOOLEAN, p_allow_orders BOOLEAN DEFAULT TRUE)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -954,7 +954,7 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.werkdonalds_set_tables_readonly TO anon, authenticated, service_role;`;
+GRANT EXECUTE ON FUNCTION public.werkpay_set_tables_readonly TO anon, authenticated, service_role;`;
 
 
 

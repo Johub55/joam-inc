@@ -96,7 +96,7 @@ export const DigitalPhone: React.FC = () => {
   useEffect(() => {
     const checkTvMode = () => {
       if (typeof document !== 'undefined') {
-        const active = document.body.classList.contains('tv-mode-active') || !!document.getElementById('werkdonalds-tv-mode-root');
+        const active = document.body.classList.contains('tv-mode-active') || !!document.getElementById('werkpay-tv-mode-root');
         setIsTvModeActive(active);
       }
     };
@@ -107,8 +107,8 @@ export const DigitalPhone: React.FC = () => {
   }, []);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // Apps: 'home', 'werkpay', 'phone', 'messages', 'settings', 'werkdonalds', 'loyalty'
-  const [activeApp, setActiveApp] = useState<'home' | 'werkpay' | 'phone' | 'messages' | 'settings' | 'werkdonalds' | 'loyalty'>('home');
+  // Apps: 'home', 'werkpay', 'phone', 'messages', 'settings', 'werkpay', 'loyalty'
+  const [activeApp, setActiveApp] = useState<'home' | 'werkpay' | 'phone' | 'messages' | 'settings' | 'werkpay' | 'loyalty'>('home');
   const [time, setTime] = useState<string>('12:00');
   const [notification, setNotification] = useState<{ title: string; body: string } | null>(null);
 
@@ -1417,7 +1417,7 @@ export const DigitalPhone: React.FC = () => {
                   {/* APP: WERKDONALDS EMPLOYEE PORTAL */}
                   <button
                     onClick={() => {
-                      setActiveApp('werkdonalds');
+                      setActiveApp('werkpay');
                       playClick();
                     }}
                     className="flex flex-col items-center gap-1.5 group"
@@ -1725,7 +1725,7 @@ export const DigitalPhone: React.FC = () => {
             )}
 
             {/* 3. APP: WERKDONALDS STAFF EMPLOYEE PORTAL APP */}
-            {activeApp === 'werkdonalds' && (
+            {activeApp === 'werkpay' && (
               <div className="flex-1 flex flex-col bg-slate-950 min-h-0">
                 {/* Header */}
                 <div className="p-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between shrink-0">

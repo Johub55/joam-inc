@@ -579,7 +579,7 @@ ON CONFLICT DO NOTHING;
 INSERT INTO public.products (id, name, price, sale_price, on_sale, cat, emoji, in_stock)
 VALUES
   (0, '✨ Bouw je Eigen WerkBurger', 6.95, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
-  (1, 'WerkDonalds Classic Burger', 6.25, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
+  (1, 'WerkPay Classic Burger', 6.25, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (2, 'Double WerkBurger', 8.25, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (3, 'Triple WerkBurger Extra Beef', 9.45, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (4, 'Giga WerkBurger 4-Dubbel', 10.95, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),

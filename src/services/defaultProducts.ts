@@ -5,7 +5,7 @@ export const DEFAULT_PRODUCTS: Product[] = [
   // 🍔 BURGERS & WRAPS (Allemaal 'Werk', GEEN 'Mc')
   // ==========================================
   { id: 0, name: "✨ Bouw je Eigen WerkBurger", price: 6.95, salePrice: 0, onSale: false, cat: "Burgers & Wraps", emoji: "🍔", inStock: true },
-  { id: 1, name: "WerkDonalds Classic Burger", price: 6.25, salePrice: 3.95, onSale: false, cat: "Burgers & Wraps", emoji: "🍔", inStock: true },
+  { id: 1, name: "WerkPay Classic Burger", price: 6.25, salePrice: 3.95, onSale: false, cat: "Burgers & Wraps", emoji: "🍔", inStock: true },
   { id: 2, name: "Double WerkBurger", price: 8.25, salePrice: 0, onSale: false, cat: "Burgers & Wraps", emoji: "🍔", inStock: true },
   { id: 3, name: "Triple WerkBurger Extra Beef", price: 9.45, salePrice: 0, onSale: false, cat: "Burgers & Wraps", emoji: "🍔", inStock: true },
   { id: 4, name: "Giga WerkBurger 4-Dubbel", price: 10.95, salePrice: 0, onSale: false, cat: "Burgers & Wraps", emoji: "🍔", inStock: true },

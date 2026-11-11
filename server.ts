@@ -84,6 +84,96 @@ async function startServer() {
     }
   });
 
+
+  // In-memory state
+  let linkModeUsername: string | null = null;
+  let payModeActive: boolean = false;
+
+  app.post("/api/hardware/set-link-mode", (req, res) => {
+    linkModeUsername = req.body.username;
+    res.json({ status: "ok", mode: "LINK", username: linkModeUsername });
+  });
+
+  app.post("/api/hardware/set-pay-mode", (req, res) => {
+    payModeActive = true;
+    res.json({ status: "ok", mode: "PAY" });
+  });
+
+  app.get("/api/hardware/status", (req, res) => {
+    if (linkModeUsername) {
+      res.json({ status: "LINK", username: linkModeUsername });
+      linkModeUsername = null; // Consume
+    } else if (payModeActive) {
+      res.json({ status: "PAY" });
+      payModeActive = false; // Consume
+    } else {
+      res.json({ status: "IDLE" });
+    }
+  });
+
+  app.post("/api/hardware/link-card", async (req, res) => {
+    const { username, uid } = req.body;
+    try {
+      const { db } = await import('./src/services/firebase');
+      const { collection, query, where, getDocs, updateDoc, doc, arrayUnion, addDoc } = await import('firebase/firestore');
+      
+      const q = query(collection(db, 'bank_accounts'), where('username', '==', username));
+      const querySnapshot = await getDocs(q);
+      
+      if (!querySnapshot.empty) {
+        const userDoc = querySnapshot.docs[0];
+        await updateDoc(doc(db, 'bank_accounts', userDoc.id), { 
+            card_uids: arrayUnion(uid) 
+        });
+        
+        // Log in Firebase
+        await addDoc(collection(db, 'pos_audit_logs'), {
+            action: 'NFC_LINK_SUCCESS',
+            user_name: username,
+            details: `Pas ${uid} gekoppeld`,
+            timestamp: new Date().toISOString()
+        });
+        
+        res.json({ status: "ok", message: `Pas ${uid} toegevoegd aan ${username}` });
+      } else {
+        await addDoc(collection(db, 'pos_audit_logs'), {
+            action: 'NFC_LINK_FAIL',
+            user_name: username,
+            details: `Gebruiker niet gevonden voor UID ${uid}`,
+            timestamp: new Date().toISOString()
+        });
+        res.status(404).json({ status: "fail", message: "Gebruiker niet gevonden" });
+      }
+    } catch (e: any) {
+      res.status(500).json({ status: "fail", message: e.message });
+    }
+  });
+  
+  app.post("/api/hardware/verify-payment", async (req, res) => {
+    const { uid, pin } = req.body;
+    try {
+      const { db } = await import('./src/services/firebase');
+      const { collection, query, where, getDocs } = await import('firebase/firestore');
+      
+      // Zoek naar bank_account waarbij card_uids (array) de uid bevat
+      const q = query(collection(db, 'bank_accounts'), where('card_uids', 'array-contains', uid));
+      const querySnapshot = await getDocs(q);
+      
+      if (!querySnapshot.empty) {
+        const userDoc = querySnapshot.docs[0].data();
+        if (userDoc.pin_code === pin) {
+          res.json({ status: "ok", message: "Betaling geautoriseerd" });
+        } else {
+          res.status(401).json({ status: "fail", message: "Onjuiste PIN" });
+        }
+      } else {
+        res.status(404).json({ status: "fail", message: "Kaart niet herkend" });
+      }
+    } catch (e) {
+      res.status(500).json({ status: "fail", message: "Server fout" });
+    }
+  });
+  
   // Vite middleware for development (runs live unless SERVE_DIST=true)
   if (process.env.SERVE_DIST !== "true") {
     const vite = await createViteServer({

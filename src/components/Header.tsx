@@ -4,8 +4,8 @@ import { euro } from '../services/store';
 import { AudioFX } from '../services/audio';
 import { PosScreenType } from '../types';
 import { showToast } from '../services/appToast';
-import { PosLoginModal } from './WerkdonaldsPOS/PosLoginModal';
-import { DiyTerminalModal } from './WerkdonaldsPOS/DiyTerminalModal';
+import { PosLoginModal } from './WerkPayPOS/PosLoginModal';
+import { DiyTerminalModal } from './WerkPayPOS/DiyTerminalModal';
 import { 
   Utensils, 
   CreditCard, 
@@ -190,7 +190,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
               <span className="hidden md:inline">Koekploeg</span>
             </button>
             <button
-              onClick={() => setActiveBrand('werkdonalds')}
+              onClick={() => setActiveBrand('werkpay')}
               className={`px-2 py-1 rounded-md text-xs font-bold flex items-center gap-1 transition-all ${
                 !isKoekploeg 
                   ? 'bg-blue-600 text-white shadow-sm' 
