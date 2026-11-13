@@ -50,6 +50,26 @@
         "name": { "type": "string" }
       },
       "required": ["id", "username", "name"]
+    },
+    "HardwareTerminal": {
+      "title": "HardwareTerminal",
+      "description": "Realtime state relay between WerkPay POS web app and Raspberry Pi Pico W hardware pinpad",
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["IDLE", "LINK", "CARD_SCANNED", "LINKED", "PAY", "SUBMITTED", "APPROVED", "DECLINED"],
+          "maxLength": 32
+        },
+        "username": { "type": "string", "maxLength": 100 },
+        "amount": { "type": "number" },
+        "orderNo": { "type": "number" },
+        "scannedUid": { "type": "string", "maxLength": 64 },
+        "enteredPin": { "type": "string", "maxLength": 16 },
+        "reason": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["status", "updatedAt"]
     }
   },
   "firestore": {
@@ -68,6 +88,10 @@
     "pos_users/{userId}": {
       "schema": "PosUser",
       "description": "Collection of POS users"
+    },
+    "hardware_terminals/{terminalId}": {
+      "schema": "HardwareTerminal",
+      "description": "Hardware pinpad terminal relay state documents"
     },
     "pos_settings/{settingId}": {
       "description": "Collection of POS settings"

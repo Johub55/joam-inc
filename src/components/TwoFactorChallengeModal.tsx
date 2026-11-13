@@ -22,8 +22,10 @@ export const TwoFactorChallengeModal: React.FC<TwoFactorChallengeModalProps> = (
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [verifying, setVerifying] = useState<boolean>(false);
 
-  const matchedUser = posUsers.find(u => u.username.toLowerCase() === username.toLowerCase()) ||
-                      bankAccounts.find(a => a.username.toLowerCase() === username.toLowerCase());
+  const matchedUser =
+    (pending2FALogin?.user?.username?.toLowerCase() === username.toLowerCase() ? pending2FALogin.user : null) ||
+    posUsers.find(u => u.username.toLowerCase() === username.toLowerCase()) ||
+    bankAccounts.find(a => a.username.toLowerCase() === username.toLowerCase());
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

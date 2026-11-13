@@ -26,6 +26,13 @@ export interface ProductOption {
   multipleSelection: boolean;
 }
 
+export interface ProductRecipeItem {
+  inventoryItemId?: number;
+  ingredientName: string;
+  amount: number;
+  unit?: string;
+}
+
 export interface Product {
   id: number;
   name: string;
@@ -36,6 +43,9 @@ export interface Product {
   emoji: string;
   inStock: boolean;
   options?: ProductOption[];
+  brand?: 'werkpay' | 'koekploeg' | 'both';
+  recipe?: ProductRecipeItem[];
+  recipeDescription?: string;
 }
 
 export interface CartItem {
@@ -103,12 +113,19 @@ export interface Order {
   updatedAt?: number;
 }
 
+export interface LinkedNfcTag {
+  uid: string;
+  label?: string;
+  linkedAt?: string;
+}
+
 export interface BankAccount {
   id: number | string;
   username: string;
   password?: string;
   account_holder: string;
   card_uid: string;
+  linked_uids?: LinkedNfcTag[];
   pin_code?: string;
   balance: number;
   is_admin: boolean;

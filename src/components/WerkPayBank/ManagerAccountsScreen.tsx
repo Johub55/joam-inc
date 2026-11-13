@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { euro, formatCardUid } from '../../services/store';
+import { euro, formatCardUid, isVirtualCardNumber, parseLinkedUids, accountMatchesUid, normalizeCardUid } from '../../services/store';
 import { BankAccount } from '../../types';
 import { showToast } from '../../services/appToast';
 import { 
@@ -15,9 +15,12 @@ import {
   CreditCard,
   Eye,
   EyeOff,
-  Lock
+  Lock,
+  Radio,
+  Tag
 } from 'lucide-react';
 import { LinkCardModal } from '../WerkPayPOS/LinkCardModal';
+import { UidManagerPanel } from '../WerkPayPOS/UidManagerPanel';
 
 
 export const ManagerAccountsScreen: React.FC = () => {
@@ -34,8 +37,7 @@ export const ManagerAccountsScreen: React.FC = () => {
   const [showPairingModal, setShowPairingModal] = useState<boolean>(false);
   const [pairingAcc, setPairingAcc] = useState<BankAccount | null>(null);
   const [showCreateModal, setShowCreateModal] = useState<boolean>(false);
-  // ...
-  // ... (no code here, moved to return)
+  const [activeSubView, setActiveSubView] = useState<'accounts' | 'uids'>('accounts');
   const [revealedPins, setRevealedPins] = useState<Record<string | number, boolean>>({});
   const [showEditSecrets, setShowEditSecrets] = useState<boolean>(false);
 
@@ -53,10 +55,13 @@ export const ManagerAccountsScreen: React.FC = () => {
 
   const filteredAccounts = bankAccounts.filter(a => {
     const q = search.toLowerCase();
+    if (!q) return true;
     return (
       a.username.toLowerCase().includes(q) ||
       a.account_holder.toLowerCase().includes(q) ||
-      a.card_uid.replace(/\s+/g, '').includes(q.replace(/\s+/g, ''))
+      a.card_uid.replace(/\s+/g, '').toLowerCase().includes(q.replace(/\s+/g, '')) ||
+      accountMatchesUid(a, search) ||
+      parseLinkedUids(a.linked_uids || []).some(t => (t.label || '').toLowerCase().includes(q))
     );
   });
 
@@ -117,13 +122,41 @@ export const ManagerAccountsScreen: React.FC = () => {
           </p>
         </div>
 
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-black bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg transition"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Nieuwe Bankrekening Openen</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex p-1 bg-slate-900 border border-slate-800 rounded-xl text-xs font-bold">
+            <button
+              type="button"
+              onClick={() => setActiveSubView('accounts')}
+              className={`px-3 py-1.5 rounded-lg transition ${
+                activeSubView === 'accounts'
+                  ? 'bg-cyan-500 text-slate-950 font-black'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              Bankrekeningen
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSubView('uids')}
+              className={`px-3 py-1.5 rounded-lg transition flex items-center gap-1.5 ${
+                activeSubView === 'uids'
+                  ? 'bg-purple-500 text-white font-black'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>Gekoppelde UID&apos;s Beheren</span>
+            </button>
+          </div>
+
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-black bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg transition"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Nieuwe Bankrekening Openen</span>
+          </button>
+        </div>
       </div>
 
       {/* KPI Stats */}
@@ -150,7 +183,12 @@ export const ManagerAccountsScreen: React.FC = () => {
         </div>
       </div>
 
-      {/* Search & List */}
+      {/* Search & List OR UID Manager */}
+      {activeSubView === 'uids' ? (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+          <UidManagerPanel />
+        </div>
+      ) : (
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
         <div className="p-4 border-b border-slate-800 bg-slate-950/40 flex flex-wrap items-center justify-between gap-3">
           <div className="relative flex-1 min-w-[200px] max-w-sm">
@@ -191,7 +229,31 @@ export const ManagerAccountsScreen: React.FC = () => {
                     <span>{acc.account_holder}</span>
                   </td>
                   <td className="p-3.5 font-mono text-cyan-300">@{acc.username}</td>
-                  <td className="p-3.5 font-mono text-slate-400">{formatCardUid(acc.card_uid)}</td>
+                  <td className="p-3.5 font-mono text-slate-300">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span
+                        className={`px-2 py-0.5 rounded text-[11px] ${
+                          !isVirtualCardNumber(acc.card_uid) && normalizeCardUid(acc.card_uid)
+                            ? 'bg-purple-500/20 text-purple-200 border border-purple-500/40 font-bold'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        {!isVirtualCardNumber(acc.card_uid) && normalizeCardUid(acc.card_uid)
+                          ? normalizeCardUid(acc.card_uid)
+                          : formatCardUid(acc.card_uid)}
+                      </span>
+                      {parseLinkedUids(acc.linked_uids || []).map(tag => (
+                        <span
+                          key={tag.uid}
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px]"
+                          title={tag.label || 'Extra NFC Tag'}
+                        >
+                          <Tag className="w-2.5 h-2.5" />
+                          {tag.label ? `${tag.label}: ` : ''}{tag.uid}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
                   <td className="p-3.5 font-mono text-slate-400">
                     <div className="flex items-center gap-1.5">
                       <span>{revealedPins[acc.id] ? (acc.pin_code || '1234') : '••••'}</span>
@@ -271,6 +333,7 @@ export const ManagerAccountsScreen: React.FC = () => {
           </table>
         </div>
       </div>
+      )}
 
       {/* MODAL: Create New Bank Account */}
       {showCreateModal && (
@@ -377,7 +440,6 @@ export const ManagerAccountsScreen: React.FC = () => {
 
       {/* MODAL: Edit Bank Account */}
       {editingAcc && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-3xl w-full max-w-md p-6 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
@@ -492,7 +554,6 @@ export const ManagerAccountsScreen: React.FC = () => {
               </div>
             </form>
           </div>
-        </div>
         </div>
       )}
 

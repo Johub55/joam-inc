@@ -42,7 +42,7 @@ export const ReceiptModal: React.FC = () => {
             <div className="w-8 h-8 mx-auto rounded-lg bg-amber-400 font-black text-slate-950 text-xl flex items-center justify-center mb-1">
               W
             </div>
-            <h2 className="font-extrabold text-sm tracking-wider uppercase">WERKDONALDS</h2>
+            <h2 className="font-extrabold text-sm tracking-wider uppercase">WERKPAY</h2>
             <p className="text-[10px] text-slate-500">Filiaal #1 · Kassa Systeem</p>
             <p className="text-[10px] text-slate-500">{activeReceiptOrder.time} · {new Date().toLocaleDateString('nl-NL')}</p>
           </div>
@@ -118,7 +118,7 @@ export const ReceiptModal: React.FC = () => {
               </div>
             )}
             <div className="text-center pt-3 text-[10px] text-slate-400">
-              Bedankt voor je bestelling bij Werkdonalds!
+              Bedankt voor je bestelling bij WerkPay!
             </div>
           </div>
         </div>

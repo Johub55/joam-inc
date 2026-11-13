@@ -51,7 +51,7 @@ export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess
               <ShieldCheck className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-base font-black text-white">Werkdonalds Medewerker Toegang</h2>
+              <h2 className="text-base font-black text-white">WerkPay Medewerker Toegang</h2>
               <p className="text-xs text-slate-400">
                 Log in voor beheer, contant-goedkeuring en voorraad.
               </p>

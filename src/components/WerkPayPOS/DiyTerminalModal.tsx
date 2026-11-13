@@ -42,7 +42,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   const [activeTab, setActiveTab] = useState<'connect' | 'code' | 'wiring' | 'guide' | 'simulator'>('wiring');
 
   // Simulator State
-  const [simLcdLine1, setSimLcdLine1] = useState<string>('Werkdonalds POS');
+  const [simLcdLine1, setSimLcdLine1] = useState<string>('WerkPay POS');
   const [simLcdLine2, setSimLcdLine2] = useState<string>('Klaar voor order');
   const [simUid, setSimUid] = useState<string>('4129883155049012');
   const [simPin, setSimPin] = useState<string>('');
@@ -141,7 +141,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
       setSimLcdLine1('Geannuleerd!');
       setSimLcdLine2('');
       setTimeout(() => {
-        setSimLcdLine1('Werkdonalds POS');
+        setSimLcdLine1('WerkPay POS');
         setSimLcdLine2('Klaar voor order');
       }, 1200);
       return;
@@ -159,7 +159,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           }
           setTimeout(() => {
             setSimState('idle');
-            setSimLcdLine1('Werkdonalds POS');
+            setSimLcdLine1('WerkPay POS');
             setSimLcdLine2('Klaar voor order');
             setSimPin('');
           }, 2500);
@@ -518,53 +518,53 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3 text-amber-400 font-sans font-bold" rowSpan={8}>
                               4x4 Matrix Keypad<br />
-                              <span className="text-[10px] text-slate-400 font-normal">(8 pinnen op een rij)</span>
+                              <span className="text-[10px] text-slate-400 font-normal">(Ghost-vrije pinout)</span>
                             </td>
                             <td className="py-2 px-3">Rij 1 (R1)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 9</td>
-                            <td className="py-2 px-3 text-amber-300">GP6</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 17</td>
+                            <td className="py-2 px-3 text-amber-300">GP13</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Rij 1 (toetsen 1, 2, 3, A)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Rij 2 (R2)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 10</td>
-                            <td className="py-2 px-3 text-amber-300">GP7</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 16</td>
+                            <td className="py-2 px-3 text-amber-300">GP12</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Rij 2 (toetsen 4, 5, 6, B)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Rij 3 (R3)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 11</td>
-                            <td className="py-2 px-3 text-amber-300">GP8</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 15</td>
+                            <td className="py-2 px-3 text-amber-300">GP11</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Rij 3 (toetsen 7, 8, 9, C)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Rij 4 (R4)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 12</td>
-                            <td className="py-2 px-3 text-amber-300">GP9</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 14</td>
+                            <td className="py-2 px-3 text-amber-300">GP10</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Rij 4 (toetsen *, 0, #, D)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Kolom 1 (C1)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 14</td>
-                            <td className="py-2 px-3 text-amber-300">GP10</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 12</td>
+                            <td className="py-2 px-3 text-amber-300">GP9</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Kolom 1 (toetsen 1, 4, 7, *)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Kolom 2 (C2)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 15</td>
-                            <td className="py-2 px-3 text-amber-300">GP11</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 11</td>
+                            <td className="py-2 px-3 text-amber-300">GP8</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Kolom 2 (toetsen 2, 5, 8, 0)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Kolom 3 (C3)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 16</td>
-                            <td className="py-2 px-3 text-amber-300">GP12</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 10</td>
+                            <td className="py-2 px-3 text-amber-300">GP7</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Kolom 3 (toetsen 3, 6, 9, #)</td>
                           </tr>
                           <tr className="bg-slate-900/40">
                             <td className="py-2 px-3">Kolom 4 (C4)</td>
-                            <td className="py-2 px-3 text-amber-300">Pin 17</td>
-                            <td className="py-2 px-3 text-amber-300">GP13</td>
+                            <td className="py-2 px-3 text-amber-300">Pin 9</td>
+                            <td className="py-2 px-3 text-amber-300">GP6</td>
                             <td className="py-2 px-3 text-slate-400 font-sans">Kolom 4 (toetsen A, B, C, D)</td>
                           </tr>
 
@@ -932,7 +932,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                     />
                   </div>
                   <p className="text-[11px] text-slate-400 leading-relaxed">
-                    Wanneer je op "Houd Pas Hier" klikt en 4 cijfers intoetst gevolgd door <strong># (OK)</strong>, wordt dit direct doorgestuurd naar de Werkdonalds kassa alsof de fysieke hardware verbonden is!
+                    Wanneer je op "Houd Pas Hier" klikt en 4 cijfers intoetst gevolgd door <strong># (OK)</strong>, wordt dit direct doorgestuurd naar de WerkPay kassa alsof de fysieke hardware verbonden is!
                   </p>
                 </div>
               </div>

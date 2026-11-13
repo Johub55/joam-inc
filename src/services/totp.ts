@@ -232,7 +232,7 @@ export async function verifyTotpCode(secret: string, inputCode: string, backupCo
 /**
  * Creates `otpauth://` URI for Authenticator apps (Google Authenticator, Authy, Apple Passwords)
  */
-export function getTotpUri(username: string, secret: string, issuer: string = 'Werkdonalds POS'): string {
+export function getTotpUri(username: string, secret: string, issuer: string = 'WerkPay POS'): string {
   const encodedIssuer = encodeURIComponent(issuer);
   const encodedUser = encodeURIComponent(username);
   return `otpauth://totp/${encodedIssuer}:${encodedUser}?secret=${secret}&issuer=${encodedIssuer}&algorithm=SHA1&digits=6&period=30`;
@@ -241,7 +241,7 @@ export function getTotpUri(username: string, secret: string, issuer: string = 'W
 /**
  * Creates QR code image URL for scanning in Google Authenticator or Apple Passwords
  */
-export function getTotpQrCodeUrl(username: string, secret: string, issuer: string = 'Werkdonalds POS'): string {
+export function getTotpQrCodeUrl(username: string, secret: string, issuer: string = 'WerkPay POS'): string {
   const otpUri = getTotpUri(username, secret, issuer);
   return `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(otpUri)}`;
 }

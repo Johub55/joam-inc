@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useCallback } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro, ORDER_KIOSK_USER } from '../../services/store';
 import { Product, CartItem } from '../../types';
@@ -44,6 +44,70 @@ import { showToast } from '../../services/appToast';
 interface PosScreenProps {
   onOpenPaymentModal: () => void;
 }
+
+const ProductGridCard: React.FC<{ prod: Product; onSelect: (prod: Product) => void }> = React.memo(({ prod, onSelect }) => {
+  const currentPrice = prod.onSale && prod.salePrice > 0 ? prod.salePrice : prod.price;
+
+  return (
+    <div
+      onClick={() => onSelect(prod)}
+      className={`group relative bg-slate-900 border rounded-2xl p-3.5 flex flex-col justify-between cursor-pointer transition-all duration-200 hover:-translate-y-1 hover:shadow-lg ${
+        prod.inStock 
+          ? 'border-slate-800 hover:border-blue-500/80 hover:shadow-blue-500/10' 
+          : 'border-slate-800/40 opacity-50 grayscale cursor-not-allowed'
+      }`}
+    >
+      {/* Badges */}
+      <div className="absolute top-2.5 left-2.5 right-2.5 flex justify-between items-start gap-1 pointer-events-none">
+        <div className="flex items-center gap-1 flex-wrap">
+          <span className="bg-slate-950/90 text-slate-400 border border-slate-800 text-[10px] font-mono font-bold px-1.5 py-0.5 rounded-md">
+            #{prod.id}
+          </span>
+          {prod.onSale && (
+            <span className="flex items-center gap-1 bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded-md shadow">
+              <Flame className="w-3 h-3 fill-white" /> ACTIE
+            </span>
+          )}
+          {prod.options && prod.options.length > 0 && (
+            <span className="bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 text-[10px] font-bold px-1.5 py-0.5 rounded-md">
+              Keuze
+            </span>
+          )}
+        </div>
+        {!prod.inStock && (
+          <span className="bg-rose-600 text-white text-[10px] font-black px-2 py-0.5 rounded-md ml-auto">
+            UITVERKOCHT
+          </span>
+        )}
+      </div>
+
+      <div className="text-center my-3">
+        <div className="text-4xl sm:text-5xl select-none group-hover:scale-110 transition duration-200">
+          {prod.emoji}
+        </div>
+        <h3 className="font-bold text-sm text-slate-200 mt-2 line-clamp-2 leading-snug">
+          {prod.name}
+        </h3>
+      </div>
+
+      <div className="mt-auto pt-2 border-t border-slate-800/60 flex items-baseline justify-between">
+        <span className="text-[11px] text-slate-500 font-medium">
+          {prod.cat.split(' ')[0]}
+        </span>
+        <div className="flex items-baseline gap-1.5">
+          {prod.onSale && prod.salePrice > 0 && (
+            <span className="text-xs text-slate-500 line-through">
+              {euro(prod.price)}
+            </span>
+          )}
+          <span className="font-black text-sm text-blue-400">
+            {euro(currentPrice)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
   const {
@@ -178,6 +242,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
 
   const [kioskSpecialNote, setKioskSpecialNote] = useState<string>('');
   const [kioskQty, setKioskQty] = useState<number>(1);
+  const [kioskSelectedOptions, setKioskSelectedOptions] = useState<Record<string, string[]>>({});
 
   // Burger Builder State
   const [showBuilderModal, setShowBuilderModal] = useState<boolean>(false);
@@ -208,9 +273,14 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
 
   // Filtered products
   const filteredProducts = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const idQuery = q.replace(/^#/, '');
     return displayProducts.filter(p => {
       const matchCat = selectedCat === 'Alles' || p.cat === selectedCat;
-      const matchQuery = !searchQuery.trim() || p.name.toLowerCase().includes(searchQuery.toLowerCase());
+      const matchQuery =
+        !q ||
+        p.name.toLowerCase().includes(q) ||
+        (idQuery.length > 0 && String(p.id).includes(idQuery));
       return matchCat && matchQuery;
     });
   }, [displayProducts, selectedCat, searchQuery]);
@@ -313,7 +383,24 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
 
     setKioskSpecialNote('');
     setKioskQty(1);
+    const initialOptions: Record<string, string[]> = {};
+    if (p.options && p.options.length > 0) {
+      p.options.forEach(opt => {
+        if (!opt.multipleSelection && opt.choices.length > 0) {
+          initialOptions[opt.id] = [opt.choices[0].name];
+        } else {
+          initialOptions[opt.id] = [];
+        }
+      });
+    }
+    setKioskSelectedOptions(initialOptions);
   };
+
+  const openKioskRef = useRef(openKiosk);
+  openKioskRef.current = openKiosk;
+  const handleSelectProduct = useCallback((p: Product) => {
+    openKioskRef.current(p);
+  }, []);
 
   // Calculate price for kiosk selection
   const singleKioskPrice = useMemo(() => {
@@ -390,12 +477,26 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
       if (kioskDessertExtra !== 'geen') base += 0.50;
     }
 
-    return base;
+    // 6. Product Specifieke Opties (Keuzemenu)
+    if (selectedProduct.options && selectedProduct.options.length > 0) {
+      selectedProduct.options.forEach(opt => {
+        const chosenNames = kioskSelectedOptions[opt.id] || [];
+        chosenNames.forEach(choiceName => {
+          const foundChoice = opt.choices.find(c => c.name === choiceName);
+          if (foundChoice && Number.isFinite(foundChoice.priceAdjustment)) {
+            base += foundChoice.priceAdjustment;
+          }
+        });
+      });
+    }
+
+    return Math.max(0, base);
   }, [
     selectedProduct,
     kioskMenuSize,
     kioskSide,
     kioskDrink,
+    kioskDrinkLemon,
     kioskDrinkIce,
     kioskMenuSauce,
     kioskMenuSecondSauce,
@@ -404,13 +505,15 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
     kioskBurgerSauce,
     kioskCustoms,
     directDrinkSize,
+    directDrinkLemon,
     directDrinkIce,
     directDrinkSyrup,
     directSideSize,
     directSideSauce,
     directSideSecondSauce,
     kioskDessertSauce,
-    kioskDessertExtra
+    kioskDessertExtra,
+    kioskSelectedOptions
   ]);
 
   const totalKioskPrice = singleKioskPrice * kioskQty;
@@ -556,6 +659,15 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
       if (kioskDessertExtra === 'mm') notesArr.push('M&M Crunch (+€0,50)');
       if (kioskDessertExtra === 'stroopwafel') notesArr.push('Stroopwafel Crunch (+€0,50)');
       if (kioskDessertExtra === 'slagroom') notesArr.push('Slagroom (+€0,50)');
+    }
+
+    if (selectedProduct.options && selectedProduct.options.length > 0) {
+      selectedProduct.options.forEach(opt => {
+        const chosenNames = kioskSelectedOptions[opt.id] || [];
+        if (chosenNames.length > 0) {
+          notesArr.push(`${opt.name}: ${chosenNames.join(', ')}`);
+        }
+      });
     }
 
     if (kioskSpecialNote.trim()) {
@@ -783,7 +895,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
               type="text"
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
-              placeholder={isKoekploeg ? "Zoek stroopwafel, koek, koffie of drankje..." : "Zoek burger, snack, drankje of ijsje..."}
+              placeholder={isKoekploeg ? "Zoek op #ID, stroopwafel, koek, koffie..." : "Zoek op #ID, burger, snack, drankje..."}
               className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-4 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-400"
             />
             {searchQuery && (
@@ -864,60 +976,9 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
 
         {/* Products Grid */}
         <div className="flex-1 overflow-y-auto p-4 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-3 xl:grid-cols-4 gap-3.5">
-          {filteredProducts.map(prod => {
-            const currentPrice = prod.onSale && prod.salePrice > 0 ? prod.salePrice : prod.price;
-
-            return (
-              <div
-                key={prod.id}
-                onClick={() => openKiosk(prod)}
-                className={`group relative bg-slate-900 border rounded-2xl p-3.5 flex flex-col justify-between cursor-pointer transition-all duration-200 hover:-translate-y-1 hover:shadow-lg ${
-                  prod.inStock 
-                    ? 'border-slate-800 hover:border-blue-500/80 hover:shadow-blue-500/10' 
-                    : 'border-slate-800/40 opacity-50 grayscale cursor-not-allowed'
-                }`}
-              >
-                {/* Badges */}
-                <div className="absolute top-2.5 left-2.5 right-2.5 flex justify-between items-start pointer-events-none">
-                  {prod.onSale && (
-                    <span className="flex items-center gap-1 bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded-md shadow">
-                      <Flame className="w-3 h-3 fill-white" /> ACTIE
-                    </span>
-                  )}
-                  {!prod.inStock && (
-                    <span className="bg-rose-600 text-white text-[10px] font-black px-2 py-0.5 rounded-md ml-auto">
-                      UITVERKOCHT
-                    </span>
-                  )}
-                </div>
-
-                <div className="text-center my-3">
-                  <div className="text-4xl sm:text-5xl select-none group-hover:scale-110 transition duration-200">
-                    {prod.emoji}
-                  </div>
-                  <h3 className="font-bold text-sm text-slate-200 mt-2 line-clamp-2 leading-snug">
-                    {prod.name}
-                  </h3>
-                </div>
-
-                <div className="mt-auto pt-2 border-t border-slate-800/60 flex items-baseline justify-between">
-                  <span className="text-[11px] text-slate-500 font-medium">
-                    {prod.cat.split(' ')[0]}
-                  </span>
-                  <div className="flex items-baseline gap-1.5">
-                    {prod.onSale && prod.salePrice > 0 && (
-                      <span className="text-xs text-slate-500 line-through">
-                        {euro(prod.price)}
-                      </span>
-                    )}
-                    <span className="font-black text-sm text-blue-400">
-                      {euro(currentPrice)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
+          {filteredProducts.map(prod => (
+            <ProductGridCard key={prod.id} prod={prod} onSelect={handleSelectProduct} />
+          ))}
         </div>
       </div>
 
@@ -1761,7 +1822,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
                         <span className="font-bold text-slate-300 text-xs block mb-1">🧊 IJs in drank</span>
                         {directDrinkLemon ? (
                           <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300 font-bold flex items-center justify-center text-center">
-                            <span>🔒 Geen keuze over ijs bij citroen (vast Werkdonalds recept)</span>
+                            <span>🔒 Geen keuze over ijs bij citroen (vast WerkPay recept)</span>
                           </div>
                         ) : (
                           <div className="grid grid-cols-3 gap-1">
@@ -2072,6 +2133,60 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
                       ))}
                     </div>
                   </div>
+                </div>
+              )}
+
+              {/* Product Specifieke Opties (Keuzemenu) */}
+              {selectedProduct.options && selectedProduct.options.length > 0 && (
+                <div className="space-y-3 pt-1">
+                  {selectedProduct.options.map(opt => {
+                    const selectedForGroup = kioskSelectedOptions[opt.id] || [];
+                    return (
+                      <div key={opt.id} className="p-3 rounded-xl bg-slate-950 border border-cyan-500/30 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h4 className="font-bold text-cyan-300 text-xs">{opt.name}</h4>
+                          <span className="text-[10px] text-slate-400">
+                            {opt.multipleSelection ? 'Meerdere keuzes mogelijk' : 'Kies 1 optie'}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {opt.choices.map(choice => {
+                            const isSelected = selectedForGroup.includes(choice.name);
+                            return (
+                              <button
+                                key={choice.name}
+                                type="button"
+                                onClick={() => {
+                                  setKioskSelectedOptions(prev => {
+                                    const current = prev[opt.id] || [];
+                                    if (opt.multipleSelection) {
+                                      const next = current.includes(choice.name)
+                                        ? current.filter(n => n !== choice.name)
+                                        : [...current, choice.name];
+                                      return { ...prev, [opt.id]: next };
+                                    }
+                                    return { ...prev, [opt.id]: [choice.name] };
+                                  });
+                                }}
+                                className={`p-2 rounded-lg border text-left font-bold text-[11px] transition flex items-center justify-between gap-1 ${
+                                  isSelected
+                                    ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200 ring-1 ring-cyan-400/30'
+                                    : 'border-slate-800 bg-slate-900 text-slate-300 hover:border-slate-700'
+                                }`}
+                              >
+                                <span className="truncate">{choice.name}</span>
+                                {choice.priceAdjustment !== 0 && (
+                                  <span className="text-[10px] text-amber-400 font-mono shrink-0">
+                                    {choice.priceAdjustment > 0 ? `+${euro(choice.priceAdjustment)}` : euro(choice.priceAdjustment)}
+                                  </span>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 

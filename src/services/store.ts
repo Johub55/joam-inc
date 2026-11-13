@@ -11,7 +11,8 @@ import {
   PosUser, 
   SupabaseConfig,
   BrandType,
-  BrandConfig
+  BrandConfig,
+  LinkedNfcTag
 } from '../types';
 import { DEFAULT_PRODUCTS, KOEKPLOEG_PRODUCTS, ALL_DEFAULT_PRODUCTS } from './defaultProducts';
 import { AudioFX } from './audio';
@@ -27,12 +28,12 @@ export const DEFAULT_SUPABASE_PAY_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ey
 export const BRAND_CONFIGS: Record<BrandType, BrandConfig> = {
   werkpay: {
     id: 'werkpay',
-    name: 'Werkdonalds',
+    name: 'WerkPay',
     tagline: 'Vers Bereid • Snelle Kassa & Keuken',
     logoEmoji: '🍔',
     themeColor: 'blue',
-    badgeText: 'WERKDONALDS POS',
-    kitchenTitle: 'Werkdonalds Keuken KDS',
+    badgeText: 'WERKPAY POS',
+    kitchenTitle: 'WerkPay Keuken KDS',
     primaryButtonClass: 'bg-blue-600 hover:bg-blue-500 text-white',
     accentBadgeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
     headerGradient: 'from-blue-600 via-blue-500 to-cyan-400'
@@ -112,6 +113,81 @@ export function formatCardUid(uid?: string): string {
   const raw = String(uid || '').replace(/\s+/g, '');
   if (!raw) return '•••• •••• •••• ••••';
   return raw.replace(/(.{4})/g, '$1 ').trim();
+}
+
+export function normalizeCardUid(uid?: string | null): string {
+  return String(uid || '').replace(/\s+/g, '').toUpperCase();
+}
+
+export function isVirtualCardNumber(uid?: string | null): boolean {
+  const clean = normalizeCardUid(uid);
+  if (!clean) return false;
+  return /^\d{16}$/.test(clean);
+}
+
+export function generateVirtualCardUid(): string {
+  const r1 = 4000;
+  const r2 = Math.floor(1000 + Math.random() * 9000);
+  const r3 = Math.floor(1000 + Math.random() * 9000);
+  const r4 = Math.floor(1000 + Math.random() * 9000);
+  return `${r1} ${r2} ${r3} ${r4}`;
+}
+
+export function parseLinkedUids(raw: unknown): LinkedNfcTag[] {
+  let list: any[] = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {
+      list = [];
+    }
+  }
+
+  const seen = new Set<string>();
+  const out: LinkedNfcTag[] = [];
+  for (const item of list) {
+    if (typeof item === 'string') {
+      const clean = normalizeCardUid(item);
+      if (clean && !seen.has(clean)) {
+        seen.add(clean);
+        out.push({ uid: clean });
+      }
+    } else if (item && typeof item === 'object' && typeof item.uid === 'string') {
+      const clean = normalizeCardUid(item.uid);
+      if (clean && !seen.has(clean)) {
+        seen.add(clean);
+        out.push({
+          uid: clean,
+          label: typeof item.label === 'string' && item.label.trim() ? item.label.trim() : undefined,
+          linkedAt: typeof item.linkedAt === 'string' ? item.linkedAt : undefined
+        });
+      }
+    }
+  }
+  return out;
+}
+
+export function getAccountAllUids(acc: Pick<BankAccount, 'card_uid' | 'linked_uids'>): string[] {
+  const seen = new Set<string>();
+  const primary = normalizeCardUid(acc.card_uid);
+  if (primary) seen.add(primary);
+  for (const tag of parseLinkedUids(acc.linked_uids)) {
+    if (tag.uid) seen.add(tag.uid);
+  }
+  return Array.from(seen);
+}
+
+export function accountMatchesUid(
+  acc: Pick<BankAccount, 'username' | 'card_uid' | 'linked_uids'>,
+  query: string
+): boolean {
+  const cleanQuery = normalizeCardUid(query);
+  if (!cleanQuery) return false;
+  if (acc.username.trim().toUpperCase() === cleanQuery) return true;
+  return getAccountAllUids(acc).includes(cleanQuery);
 }
 
 // Supabase Client Factory to prevent multiple instances

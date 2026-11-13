@@ -33,8 +33,8 @@ export const GiftCardModal: React.FC<GiftCardModalProps> = ({ isOpen, onClose })
   const [customAmount, setCustomAmount] = useState<string>('');
   const [recipientName, setRecipientName] = useState<string>('');
   const [recipientPhone, setRecipientPhone] = useState<string>('');
-  const [senderName, setSenderName] = useState<string>(user?.name || currentBankAccount?.account_holder || 'Werkdonalds Vriend');
-  const [message, setMessage] = useState<string>('Eet smakelijk bij Werkdonalds! 🍔🍟');
+  const [senderName, setSenderName] = useState<string>(user?.name || currentBankAccount?.account_holder || 'WerkPay Vriend');
+  const [message, setMessage] = useState<string>('Eet smakelijk bij WerkPay! 🍔🍟');
   const [cardDesign, setCardDesign] = useState<'gold' | 'neon' | 'classic'>('gold');
 
   const [createdCard, setCreatedCard] = useState<{
@@ -65,7 +65,7 @@ export const GiftCardModal: React.FC<GiftCardModalProps> = ({ isOpen, onClose })
       code: newCode,
       amount: finalAmount,
       recipient: recipientName.trim() || 'Lover of Burgers',
-      sender: senderName.trim() || 'Werkdonalds Fan',
+      sender: senderName.trim() || 'WerkPay Fan',
       message: message.trim()
     });
 
@@ -94,7 +94,7 @@ export const GiftCardModal: React.FC<GiftCardModalProps> = ({ isOpen, onClose })
             </div>
             <div>
               <h2 className="font-black text-lg text-white uppercase tracking-tight flex items-center gap-2">
-                <span>Werkdonalds Cadeaukaart</span>
+                <span>WerkPay Cadeaukaart</span>
                 <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-mono border border-amber-500/30">
                   GIFT CARDS
                 </span>
@@ -231,7 +231,7 @@ export const GiftCardModal: React.FC<GiftCardModalProps> = ({ isOpen, onClose })
               <div className="flex justify-between items-start">
                 <div>
                   <span className="text-[10px] font-black uppercase tracking-wider opacity-80 block">
-                    Werkdonalds Gift Card
+                    WerkPay Gift Card
                   </span>
                   <span className="text-xl font-black font-mono">
                     {euro(customAmount ? parseFloat(customAmount) || 0 : selectedAmount)}

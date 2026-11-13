@@ -30,7 +30,8 @@ import {
   Eye,
   Sliders,
   Megaphone,
-  Radio
+  Radio,
+  Palette
 } from 'lucide-react';
 import { getStatusMeta } from '../services/orderStatus';
 
@@ -52,6 +53,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
     customBranding,
     managerOverride,
     currentPosUser, 
+    updatePosUser,
     canAccess,
     logoutPos,
     currentBankAccount,
@@ -71,6 +73,16 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
   const [showPosLoginModal, setShowPosLoginModal] = useState(false);
   const [showPayLoginModal, setShowPayLoginModal] = useState(false);
   const [showDiyTerminalModal, setShowDiyTerminalModal] = useState(false);
+  const [showThemeMenu, setShowThemeMenu] = useState(false);
+
+  const USER_THEMES = [
+    { id: 'bg-slate-950', label: 'Standaard Donker', dot: 'bg-slate-600' },
+    { id: 'bg-blue-950', label: 'WerkPay Blauw', dot: 'bg-blue-500' },
+    { id: 'bg-amber-950', label: 'Koekploeg Goud', dot: 'bg-amber-500' },
+    { id: 'bg-emerald-950', label: 'Emerald Groen', dot: 'bg-emerald-500' },
+    { id: 'bg-purple-950', label: 'Paars Luxe', dot: 'bg-purple-500' },
+    { id: 'bg-rose-950', label: 'Rood Accent', dot: 'bg-rose-500' }
+  ];
 
   const activeKitchenCount = orders.filter(o => o.status === 'new').length;
   const cartItemCount = cart.reduce((sum, item) => sum + item.qty, 0);
@@ -196,10 +208,10 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
                   ? 'bg-blue-600 text-white shadow-sm' 
                   : 'text-slate-400 hover:text-blue-300'
               }`}
-              title="Wissel naar Werkdonalds (Burgers & Blauw thema)"
+              title="Wissel naar WerkPay (Burgers & Blauw thema)"
             >
               <span>🍔</span>
-              <span className="hidden md:inline">Werkdonalds</span>
+              <span className="hidden md:inline">WerkPay</span>
             </button>
           </div>
         </div>
@@ -217,7 +229,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
             }`}
           >
             <Utensils className="w-4 h-4" />
-            <span>{isKoekploeg ? 'De Koekploeg Kassa' : 'Werkdonalds POS'}</span>
+            <span>{isKoekploeg ? 'De Koekploeg Kassa' : 'WerkPay POS'}</span>
             {activeKitchenCount > 0 && (
               <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] font-black bg-rose-600 text-white animate-pulse">
                 {activeKitchenCount}
@@ -342,7 +354,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
 
           {/* POS Staff vs Customer / Not Logged In */}
           {currentPosUser ? (
-            <div className="flex items-center gap-1.5 text-xs text-slate-300 bg-slate-800 px-2.5 py-1 rounded-lg border border-slate-700">
+            <div className="relative flex items-center gap-1.5 text-xs text-slate-300 bg-slate-800 px-2.5 py-1 rounded-lg border border-slate-700">
               <User className="w-3.5 h-3.5 text-amber-400" />
               <span className="font-bold">{currentPosUser.name.split(' ')[0]}</span>
               <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
@@ -354,13 +366,48 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
               }`}>
                 {currentPosUser.is_admin ? 'Manager' : isCustomer ? 'Klant' : 'Medewerker'}
               </span>
+              <button
+                type="button"
+                onClick={() => setShowThemeMenu(prev => !prev)}
+                className="hover:text-cyan-400 p-0.5 ml-0.5 transition"
+                title="Persoonlijk kleurenthema kiezen"
+              >
+                <Palette className="w-3.5 h-3.5" />
+              </button>
               <button 
                 onClick={logoutPos} 
-                className="hover:text-rose-400 p-0.5 ml-1 transition" 
+                className="hover:text-rose-400 p-0.5 transition" 
                 title="Uitloggen van Kassa"
               >
                 <LogOut className="w-3.5 h-3.5" />
               </button>
+
+              {showThemeMenu && (
+                <div className="absolute right-0 top-full mt-2 w-48 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-2 z-50 space-y-1">
+                  <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    Thema (@{currentPosUser.username})
+                  </div>
+                  {USER_THEMES.map(t => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={async () => {
+                        setShowThemeMenu(false);
+                        await updatePosUser({ ...currentPosUser, theme: t.id });
+                        showToast(`Thema gewijzigd naar ${t.label}`, 'success');
+                      }}
+                      className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs font-bold transition ${
+                        (currentPosUser.theme || 'bg-slate-950') === t.id
+                          ? 'bg-blue-600/25 text-white border border-blue-500/40'
+                          : 'text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <span className={`w-3 h-3 rounded-full ${t.dot}`} />
+                      <span>{t.label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <button
@@ -457,7 +504,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
             }`}
             title="Open de OrderRadar live status voor jouw bestelling"
           >
-            <Radio className="w-4 h-4 text-amber-400 animate-spin" />
+            <Radio className="w-4 h-4 text-amber-400" />
             <span>📡 OrderRadar</span>
             {activeUserOrders.length > 0 && (
               <span className="px-1.5 py-0.2 rounded-full font-black text-[10px] bg-amber-400 text-slate-950">
@@ -546,7 +593,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
                 ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 animate-pulse' 
                 : 'text-slate-300 hover:bg-slate-800'
             }`}
-            title="Volg jouw Werkdonalds bestellingen live"
+            title="Volg jouw WerkPay bestellingen live"
           >
             <Eye className="w-4 h-4 text-amber-400" />
             <span>Mijn Bestelling Volgen</span>

@@ -159,7 +159,7 @@ export const OrderTrackingScreen: React.FC = () => {
                 <span className="p-1 rounded-lg bg-amber-500/20 text-amber-400 border border-amber-500/30">
                   <Radio className="w-5 h-5 animate-pulse" />
                 </span>
-                <span>📡 WERKDONALDS ORDER-RADAR</span>
+                <span>📡 WERKPAY ORDER-RADAR</span>
               </h1>
               <span className="text-xs px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-mono font-black border border-amber-500/40">
                 #{order.no}

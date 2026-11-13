@@ -100,7 +100,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({ onClose }) => {
       resetProductsToDefault();
       setSyncMsg({
         success: true,
-        text: `Alle ${DEFAULT_PRODUCTS.length} Werkdonalds artikelen zijn lokaal klaargezet en direct verzonden naar je Supabase database!`
+        text: `Alle ${DEFAULT_PRODUCTS.length} WerkPay POS artikelen zijn lokaal klaargezet en direct verzonden naar je Supabase database!`
       });
     } catch (err: any) {
       setSyncMsg({
@@ -146,7 +146,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({ onClose }) => {
                 )}
               </h2>
               <p className="text-xs text-slate-400">
-                Wat moet je doen in Supabase? Volg deze stappen om Werkdonalds en WerkPay te koppelen.
+                Wat moet je doen in Supabase? Volg deze stappen om WerkPay POS en WerkPay Bank te koppelen.
               </p>
             </div>
           </div>
@@ -182,7 +182,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({ onClose }) => {
               Waarom en hoe werken de twee apps samen in Supabase?
             </h3>
             <p className="leading-relaxed text-slate-300">
-              Voorheen waren Werkdonalds (kassa) en WerkPay (bank) twee losse systemen. Nu delen ze één centrale, veilige database:
+              Voorheen waren WerkPay POS (kassa) en WerkPay (bank) twee losse systemen. Nu delen ze één centrale, veilige database:
             </p>
             <ul className="list-disc pl-5 space-y-1 text-slate-300">
               <li>
@@ -192,7 +192,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({ onClose }) => {
                 <strong>Live Synchronisatie:</strong> Bestelt een klant aan de kassa of kiosk, dan ziet de keuken het direct op het Keukenscherm (KDS), en het Afhaalscherm (TV) roept het bestelnummer om zodra de keuken op gereed klikt.
               </li>
               <li>
-                <strong>Centraal Klant- &amp; Saldooverzicht:</strong> In WerkPay ziet de klant direct zijn betaling aan Werkdonalds in zijn rekeningoverzicht.
+                <strong>Centraal Klant- &amp; Saldooverzicht:</strong> In WerkPay ziet de klant direct zijn betaling aan WerkPay POS in zijn rekeningoverzicht.
               </li>
             </ul>
           </div>

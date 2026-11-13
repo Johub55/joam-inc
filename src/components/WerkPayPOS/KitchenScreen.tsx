@@ -676,7 +676,7 @@ export const KitchenScreen: React.FC = () => {
               {[
                 'Bestelling staat klaar bij de counter!',
                 'Even geduld alstublieft, we zijn ermee bezig.',
-                'Welkom bij Werkdonalds, u kunt bestellen via de kiosk of app.',
+                'Welkom bij WerkPay, u kunt bestellen via de kiosk of app.',
                 'Eet smakelijk en een fijne dag gewenst!',
                 'Beste gasten, we gaan over 10 minuten sluiten.'
               ].map((text) => (
@@ -1756,7 +1756,7 @@ export const KitchenScreen: React.FC = () => {
             {/* Modal Footer */}
             <div className="pt-2 flex justify-between items-center border-t border-slate-800">
               <span className="text-[11px] text-slate-400 italic">
-                Werkdonalds Kwaliteitstandaard v2.4
+                WerkPay Kwaliteitstandaard v2.4
               </span>
               <button
                 type="button"

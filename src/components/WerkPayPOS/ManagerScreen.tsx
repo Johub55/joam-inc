@@ -1,10 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro } from '../../services/store';
-import { Product, Coupon, GiftCard, PosUser } from '../../types';
+import { Product, ProductOption, Coupon, GiftCard, PosUser } from '../../types';
 import { DiyTerminalModal } from './DiyTerminalModal';
 import { LinkCardModal } from './LinkCardModal';
+import { UidManagerPanel } from './UidManagerPanel';
 import { VipWerkPaySubscriptionModal } from './VipWerkPaySubscriptionModal';
+import { ProductOptionsEditor } from './ProductOptionsEditor';
 import { TwoFactorSetupModal } from '../TwoFactorSetupModal';
 import { TwoFactorChallengeModal } from '../TwoFactorChallengeModal';
 import { generateTotpCode, verifyTotpCode } from '../../services/totp';
@@ -77,6 +79,33 @@ const QuickEmojiSelector: React.FC<{ onSelect: (emoji: string) => void; current?
     </div>
   );
 };
+
+const USER_THEME_OPTIONS = [
+  { id: 'bg-slate-950', label: 'Standaard Donker', swatch: 'bg-slate-800 border-slate-500' },
+  { id: 'bg-blue-950', label: 'WerkPay Blauw', swatch: 'bg-blue-700 border-blue-400' },
+  { id: 'bg-amber-950', label: 'Koekploeg Goud', swatch: 'bg-amber-600 border-amber-300' },
+  { id: 'bg-emerald-950', label: 'Emerald Groen', swatch: 'bg-emerald-700 border-emerald-400' },
+  { id: 'bg-purple-950', label: 'Paars Luxe', swatch: 'bg-purple-700 border-purple-400' },
+  { id: 'bg-rose-950', label: 'Rood Accent', swatch: 'bg-rose-700 border-rose-400' }
+];
+
+const ShiftElapsedBadge: React.FC<{ clockInTime: number }> = React.memo(({ clockInTime }) => {
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsedSec = Math.max(0, Math.floor((now - clockInTime) / 1000));
+  const hrs = Math.floor(elapsedSec / 3600);
+  const mins = Math.floor((elapsedSec % 3600) / 60);
+  const secs = elapsedSec % 60;
+  const durationStr = `${hrs > 0 ? `${hrs}u ` : ''}${mins}m ${secs}s`;
+  return (
+    <span className="text-[10px] font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-md">
+      ⏱️ {durationStr}
+    </span>
+  );
+});
 
 export const ManagerScreen: React.FC = () => {
   const {
@@ -159,7 +188,7 @@ export const ManagerScreen: React.FC = () => {
   const [stopIcon, setStopIcon] = useState<string>(orderStopConfig?.icon || '🛑');
 
   // Branding Customization States
-  const [brandName, setBrandName] = useState<string>(customBranding?.storeName || 'Werkdonalds');
+  const [brandName, setBrandName] = useState<string>(customBranding?.storeName || 'WerkPay');
   const [brandTagline, setBrandTagline] = useState<string>(customBranding?.tagline || 'Vers Bereid • Snelle Kassa & Keuken');
   const [brandEmoji, setBrandEmoji] = useState<string>(customBranding?.logoEmoji || '🍔');
   const [brandColor, setBrandColor] = useState<string>(customBranding?.primaryColor || '#2563eb');
@@ -200,9 +229,10 @@ export const ManagerScreen: React.FC = () => {
     }
   }, [customBranding]);
 
-  // Manager Menu 2FA Security Gate State
+  // Manager Menu 2FA Security Gate State (2FA is optional unless enabled on user account)
   const [managerUnlocked, setManagerUnlocked] = useState<boolean>(() => {
     if (!currentPosUser) return false;
+    if (!currentPosUser.is_2fa_enabled) return true;
     const sessionKey = `wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`;
     return sessionStorage.getItem(sessionKey) === 'true';
   });
@@ -211,10 +241,27 @@ export const ManagerScreen: React.FC = () => {
   const [verifyingManager2FA, setVerifyingManager2FA] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>(''); // Zoekfunctie
 
-  const filteredProducts = products.filter(p => 
-      p.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-      p.id.toString().includes(searchQuery)
-  );
+  useEffect(() => {
+    if (!currentPosUser) {
+      setManagerUnlocked(false);
+      return;
+    }
+    if (!currentPosUser.is_2fa_enabled) {
+      setManagerUnlocked(true);
+      return;
+    }
+    const sessionKey = `wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`;
+    setManagerUnlocked(sessionStorage.getItem(sessionKey) === 'true');
+  }, [currentPosUser?.username, currentPosUser?.is_2fa_enabled]);
+
+  const filteredProducts = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return products;
+    const idQ = q.replace(/^#/, '');
+    return products.filter(p =>
+      p.name.toLowerCase().includes(q) || (idQ.length > 0 && p.id.toString().includes(idQ))
+    );
+  }, [products, searchQuery]);
 
   const markManagerUnlocked = (method: string) => {
     setManagerUnlocked(true);
@@ -314,59 +361,12 @@ export const ManagerScreen: React.FC = () => {
 
   // Keuzemenu voor zelfgemaakte dingen
   const [showSelfMadeMenu, setShowSelfMadeMenu] = useState<boolean>(false);
-  const selfMadeItems = ['Hardware Diagnose', 'Server Logs', 'Database Beheer', 'Systeem Update'];
-  
-  // ... (inside the ManagerScreen component return)
-  
-  <div className="mt-4 bg-slate-900 border border-slate-800 rounded-2xl p-5">
-    <div className="flex items-center justify-between mb-4">
-        <h3 className="font-bold text-white">Medewerkers NFC Koppelen</h3>
-        <input 
-            type="text" 
-            placeholder="Zoek product op ID of naam..." 
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="text-xs bg-slate-950 p-2 rounded-lg text-white"
-        />
-        <button
-            onClick={() => setShowSelfMadeMenu(!showSelfMadeMenu)}
-            className="text-xs bg-cyan-600 px-3 py-1.5 rounded-lg text-white"
-        >
-            Zelfgemaakte Dingen
-        </button>
-    </div>
-    
-    {showSelfMadeMenu && (
-        <div className="mb-4 p-3 bg-slate-800 rounded-xl space-y-1">
-            {selfMadeItems.map(item => (
-                <button key={item} className="w-full text-left text-xs text-white p-2 hover:bg-slate-700 rounded-lg">
-                    {item}
-                </button>
-            ))}
-        </div>
-    )}
-
-    <div className="space-y-2">
-      {posUsers.map(user => (
-        <div key={user.username} className="flex items-center justify-between bg-slate-950 p-3 rounded-xl">
-          <span className="text-white text-sm">{user.name}</span>
-          <button 
-            onClick={() => { setPairingUser(user); setShowPairingModal(true); }}
-            className="text-xs bg-purple-600 px-3 py-1.5 rounded-lg text-white"
-          >
-            Koppel NFC Tag
-          </button>
-        </div>
-      ))}
-    </div>
-  </div>
-
-  {showPairingModal && pairingUser && (
-    <LinkCardModal 
-      onClose={() => setShowPairingModal(false)}
-      username={pairingUser.username}
-    />
-  )}
+  const selfMadeItems = [
+    { id: 'terminal', label: 'Hardware Diagnose & DIY Pinapparaat' },
+    { id: 'sync', label: 'Live Producten Synchroniseren' },
+    { id: 'snapshot', label: 'Noodherstel Snapshot Opslaan' },
+    { id: 'logs', label: 'Systeem Audit Info Tonen' }
+  ];
 
   // Active Manager Tab: 'dashboard' (General/Finance/Products/Coupons) | 'ops' (Manager Operations & Controls) | 'branding' (Customization)
   const [activeTab, setActiveTab] = useState<'dashboard' | 'ops' | 'branding'>('dashboard');
@@ -383,6 +383,9 @@ export const ManagerScreen: React.FC = () => {
   const [newProdSalePrice, setNewProdSalePrice] = useState<string>('');
   const [newProdCat, setNewProdCat] = useState<string>('Burgers & Wraps');
   const [newProdEmoji, setNewProdEmoji] = useState<string>('🍔');
+  const [newProdBrand, setNewProdBrand] = useState<'werkpay' | 'koekploeg' | 'both'>('both');
+  const [newProdRecipe, setNewProdRecipe] = useState<string>('');
+  const [newProdOptions, setNewProdOptions] = useState<ProductOption[]>([]);
 
   // Edit Product Modal State
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
@@ -449,6 +452,7 @@ export const ManagerScreen: React.FC = () => {
   const [newUserPass, setNewUserPass] = useState<string>('');
   const [newUserIsAdmin, setNewUserIsAdmin] = useState<boolean>(false);
   const [newUserPerms, setNewUserPerms] = useState<string[]>(['pos', 'kitchen', 'pickup', 'cash_pay']);
+  const [newUserTheme, setNewUserTheme] = useState<string>('bg-slate-950');
 
   // Edit Employee State
   const [editingUser, setEditingUser] = useState<PosUser | null>(null);
@@ -467,11 +471,6 @@ export const ManagerScreen: React.FC = () => {
     return [];
   });
 
-  const [nowTime, setNowTime] = useState<number>(Date.now());
-  React.useEffect(() => {
-    const t = setInterval(() => setNowTime(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
 
   const toggleClockIn = (username: string) => {
     let updated;
@@ -509,9 +508,9 @@ export const ManagerScreen: React.FC = () => {
 
   const workPayRevenue = validOrders.filter(o => o.paymentMethod === 'workpay').reduce((sum, o) => sum + o.total, 0);
   const cashRevenue = validOrders.filter(o => o.paymentMethod === 'cash').reduce((sum, o) => sum + o.total, 0);
-  const pinRevenue = validOrders.filter(o => o.paymentMethod === 'pin' || o.paymentMethod === 'card').reduce((sum, o) => sum + o.total, 0);
+  const pinRevenue = validOrders.filter(o => (o.paymentMethod as string) === 'pin' || (o.paymentMethod as string) === 'card').reduce((sum, o) => sum + o.total, 0);
   const giftCardRevenue = validOrders.filter(o => o.paymentMethod === 'giftcard').reduce((sum, o) => sum + o.total, 0);
-  const idealRevenue = validOrders.filter(o => o.paymentMethod === 'ideal' || o.paymentMethod === 'online').reduce((sum, o) => sum + o.total, 0);
+  const idealRevenue = validOrders.filter(o => (o.paymentMethod as string) === 'ideal' || (o.paymentMethod as string) === 'online').reduce((sum, o) => sum + o.total, 0);
 
   // Top 5 Selling Products Calculation
   const productSalesMap: Record<string, { name: string; emoji: string; qty: number; totalRev: number }> = {};
@@ -541,7 +540,7 @@ export const ManagerScreen: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `werkdonalds_orders_${new Date().toISOString().slice(0,10)}.csv`;
+    link.download = `werkpay_orders_${new Date().toISOString().slice(0,10)}.csv`;
     link.click();
   };
 
@@ -553,6 +552,17 @@ export const ManagerScreen: React.FC = () => {
       return;
     }
     const sale = parseFloat(newProdSalePrice) || 0;
+    const cleanedOptions = newProdOptions
+      .filter(opt => opt.name.trim())
+      .map(opt => ({
+        ...opt,
+        name: opt.name.trim(),
+        choices: opt.choices.filter(c => c.name.trim()).map(c => ({
+          name: c.name.trim(),
+          priceAdjustment: Number(c.priceAdjustment) || 0
+        }))
+      }));
+
     createProduct({
       name: newProdName.trim(),
       price: pr,
@@ -560,18 +570,36 @@ export const ManagerScreen: React.FC = () => {
       onSale: sale > 0,
       cat: newProdCat,
       emoji: newProdEmoji || '🍔',
-      inStock: true
+      inStock: true,
+      brand: newProdBrand,
+      recipeDescription: newProdRecipe.trim() || undefined,
+      options: cleanedOptions.length > 0 ? cleanedOptions : undefined
     });
     setNewProdName('');
     setNewProdPrice('');
     setNewProdSalePrice('');
+    setNewProdRecipe('');
+    setNewProdOptions([]);
     showToast(`Product ${newProdName} toegevoegd!`, 'success');
   };
 
   const handleSaveEditProduct = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingProduct) return;
-    updateProduct(editingProduct);
+    const cleanedOptions = (editingProduct.options || [])
+      .filter(opt => opt.name.trim())
+      .map(opt => ({
+        ...opt,
+        name: opt.name.trim(),
+        choices: opt.choices.filter(c => c.name.trim()).map(c => ({
+          name: c.name.trim(),
+          priceAdjustment: Number(c.priceAdjustment) || 0
+        }))
+      }));
+    updateProduct({
+      ...editingProduct,
+      options: cleanedOptions.length > 0 ? cleanedOptions : undefined
+    });
     setEditingProduct(null);
   };
 
@@ -643,13 +671,15 @@ export const ManagerScreen: React.FC = () => {
       username: newUserUsername.trim().toLowerCase(),
       password: newUserPass.trim(),
       perms: effectivePerms,
-      is_admin: newUserIsAdmin
+      is_admin: newUserIsAdmin,
+      theme: newUserTheme
     });
     setNewUserName('');
     setNewUserUsername('');
     setNewUserPass('');
     setNewUserIsAdmin(false);
     setNewUserPerms(['pos', 'kitchen', 'pickup', 'cash_pay']);
+    setNewUserTheme('bg-slate-950');
     showToast(res.message, res.success ? 'success' : 'error');
   };
 
@@ -733,7 +763,7 @@ export const ManagerScreen: React.FC = () => {
               
               <button
                 type="button"
-                onClick={markManagerUnlocked}
+                onClick={() => markManagerUnlocked('SKIP')}
                 className="w-full py-3.5 rounded-2xl font-black text-sm bg-slate-800 hover:bg-slate-700 text-white transition shadow-lg shadow-slate-600/25 flex items-center justify-center gap-2"
               >
                 <span>🚀 Overslaan (2FA optioneel)</span>
@@ -1083,6 +1113,55 @@ export const ManagerScreen: React.FC = () => {
                 <span>Open Pinapparaat Terminal</span>
               </button>
             </div>
+          </div>
+
+          {/* Gekoppelde NFC UID's & Zelfgemaakte Hardware Tools Card */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="font-bold text-white text-sm flex items-center gap-2">
+                  <Radio className="w-4 h-4 text-purple-400" />
+                  <span>Gekoppelde NFC Pasjes &amp; UID&apos;s Beheren (Cloud + Pico W)</span>
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Bekijk alle gekoppelde UID&apos;s, koppel nieuwe hoofdpassen of extra tags via de Pico W, bewerk handmatig of ontkoppel direct.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowSelfMadeMenu(prev => !prev)}
+                className="text-xs bg-cyan-600 hover:bg-cyan-500 font-bold px-3 py-1.5 rounded-xl text-white transition"
+              >
+                Zelfgemaakte Dingen
+              </button>
+            </div>
+
+            {showSelfMadeMenu && (
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {selfMadeItems.map(item => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={async () => {
+                      if (item.id === 'terminal') setShowDiyTerminalModal(true);
+                      if (item.id === 'sync') await syncProducts();
+                      if (item.id === 'snapshot') {
+                        const res = await saveDisasterRecoverySnapshot();
+                        showToast(res.message, res.success ? 'success' : 'error');
+                      }
+                      if (item.id === 'logs') {
+                        showToast(`Actieve sessies: ${activeSessions.length} • Audit logs: ${auditLogs.length}`, 'info');
+                      }
+                    }}
+                    className="w-full text-left text-xs text-white font-semibold p-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <UidManagerPanel compact />
           </div>
 
           {/* 🛡️ Tamper-Proof Veiligheid, Audit Trail & Noodherstel Card */}
@@ -1687,7 +1766,7 @@ export const ManagerScreen: React.FC = () => {
                       value={brandName}
                       onChange={e => setBrandName(e.target.value)}
                       className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-white text-sm focus:border-blue-500 outline-none transition"
-                      placeholder="Bijv. Werkdonalds"
+                      placeholder="Bijv. WerkPay"
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -1865,12 +1944,12 @@ export const ManagerScreen: React.FC = () => {
                 <h3 className="text-lg font-black text-white leading-tight">Hoe werkt branding?</h3>
                 <div className="space-y-4 text-sm text-slate-400 leading-relaxed">
                   <p>
-                    Wanneer je <strong>"Activeer Aangepaste Branding"</strong> inschakelt, zal de applicatie niet langer kijken naar het geselecteerde merk (Werkdonalds of Koekploeg) voor het uiterlijk.
+                    Wanneer je <strong>"Activeer Aangepaste Branding"</strong> inschakelt, zal de applicatie niet langer kijken naar het geselecteerde merk (WerkPay of Koekploeg) voor het uiterlijk.
                   </p>
                   <ul className="space-y-3">
                     <li className="flex gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-blue-500 mt-2 shrink-0" />
-                      <span><strong>Kassa Header:</strong> De naam en tagline worden overal bovenaan getoond.</span>
+                      <span><strong>Kassa Header:</strong> De naam en tagline worden overal bovenaan getond.</span>
                     </li>
                     <li className="flex gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-blue-500 mt-2 shrink-0" />
@@ -1892,7 +1971,7 @@ export const ManagerScreen: React.FC = () => {
                  <div className="grid grid-cols-1 gap-2">
                     <button 
                       onClick={() => {
-                        setBrandName('Werkdonalds');
+                        setBrandName('WerkPay');
                         setBrandTagline('Vers Bereid • Snelle Kassa & Keuken');
                         setBrandEmoji('🍔');
                         setBrandColor('#2563eb');
@@ -1900,7 +1979,7 @@ export const ManagerScreen: React.FC = () => {
                       }}
                       className="p-2 rounded-lg bg-slate-950 border border-slate-800 text-left hover:border-blue-500 transition flex items-center justify-between"
                     >
-                      <span className="text-[11px] font-bold text-slate-300">Zet terug naar Werkdonalds Blauw</span>
+                      <span className="text-[11px] font-bold text-slate-300">Zet terug naar WerkPay Blauw</span>
                       <span className="text-xs">🍔</span>
                     </button>
                     <button 
@@ -2018,7 +2097,7 @@ export const ManagerScreen: React.FC = () => {
                         const pin = prompt('Voer de Master Security PIN in om globale override te activeren:');
                         if (pin) {
                           const res = activateManagerOverride(pin);
-                          if (!res.success) alert(res.message);
+                          if (!res.success) showToast(res.message, 'error');
                         }
                       } else if (canAccess('manager_override')) {
                         showToast('Manager Override is al actief via jouw gebruikersrechten.', 'info');
@@ -2800,7 +2879,7 @@ export const ManagerScreen: React.FC = () => {
           </div>
           <button
             onClick={() => {
-              if (confirm('Menulijst herstellen naar standaard 67 Werkdonalds gerechten?')) {
+              if (confirm('Menulijst herstellen naar de standaard WerkPay & Koekploeg gerechten?')) {
                 resetProductsToDefault();
               }
             }}
@@ -2821,61 +2900,150 @@ export const ManagerScreen: React.FC = () => {
         </div>
 
         {/* Add Product Form */}
-        <form onSubmit={handleCreateProduct} className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 grid grid-cols-1 sm:grid-cols-5 gap-2 text-xs">
+        <form onSubmit={handleCreateProduct} className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3.5 text-xs">
+          <div className="grid grid-cols-1 sm:grid-cols-6 gap-2.5">
+            <div className="sm:col-span-2">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Productnaam
+              </label>
+              <input
+                type="text"
+                required
+                value={newProdName}
+                onChange={e => setNewProdName(e.target.value)}
+                placeholder="Bijv. Dubbele Kaasburger"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white placeholder:text-slate-400/45"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Prijs (€)
+              </label>
+              <input
+                type="number"
+                required
+                step="0.05"
+                value={newProdPrice}
+                onChange={e => setNewProdPrice(e.target.value)}
+                placeholder="Bijv. 5.95"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white placeholder:text-slate-400/45"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Actieprijs (optioneel)
+              </label>
+              <input
+                type="number"
+                step="0.05"
+                value={newProdSalePrice}
+                onChange={e => setNewProdSalePrice(e.target.value)}
+                placeholder="Bijv. 3.95"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white placeholder:text-slate-400/45"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Categorie
+              </label>
+              <select
+                value={newProdCat}
+                onChange={e => setNewProdCat(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+              >
+                <option value="Burgers & Wraps">Burgers &amp; Wraps</option>
+                <option value="Chicken & Snacks">Chicken &amp; Snacks</option>
+                <option value="Friet & Sides">Friet &amp; Sides</option>
+                <option value="Koude Dranken & WerkShakes">Koude Dranken &amp; WerkShakes</option>
+                <option value="Warme Dranken & Koffie">Warme Dranken &amp; Koffie</option>
+                <option value="Desserts & IJs">Desserts &amp; IJs</option>
+                <option value="WerkMeal Kids">WerkMeal Kids</option>
+                <option value="Sauzen & Dips">Sauzen &amp; Dips</option>
+                <option value="Stroopwafels & Koeken">Stroopwafels &amp; Koeken</option>
+                <option value="Bakkerij Specialiteiten">Bakkerij Specialiteiten</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Merk / Winkel
+              </label>
+              <select
+                value={newProdBrand}
+                onChange={e => setNewProdBrand(e.target.value as any)}
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+              >
+                <option value="both">Allebei (WerkPay + Koekploeg)</option>
+                <option value="werkpay">Alleen WerkPay</option>
+                <option value="koekploeg">Alleen Koekploeg</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+            <div className="sm:col-span-2">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Icoon (Emoji)
+              </label>
+              <input
+                type="text"
+                value={newProdEmoji}
+                onChange={e => setNewProdEmoji(e.target.value)}
+                placeholder="🍔"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2 py-1.5 text-center text-base text-white placeholder:text-slate-400/45"
+              />
+            </div>
+            <div className="sm:col-span-7">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                Recept / Ingrediënten (optioneel)
+              </label>
+              <input
+                type="text"
+                value={newProdRecipe}
+                onChange={e => setNewProdRecipe(e.target.value)}
+                placeholder="Bijv. 1x Sesam Bun, 1x Burger, 1x Cheddar Kaas"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white placeholder:text-slate-400/45"
+              />
+            </div>
+            <button
+              type="submit"
+              className="sm:col-span-3 py-2 rounded-lg font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 flex items-center justify-center gap-1"
+            >
+              <Plus className="w-3.5 h-3.5" /> Product Toevoegen
+            </button>
+          </div>
+
+          {/* Optional Keuzemenu Builder with Presets for New Product */}
+          <div className="pt-3 border-t border-slate-800/80">
+            <ProductOptionsEditor
+              options={newProdOptions}
+              onChange={setNewProdOptions}
+            />
+          </div>
+        </form>
+
+        {/* Product Search */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <input
             type="text"
-            required
-            value={newProdName}
-            onChange={e => setNewProdName(e.target.value)}
-            placeholder="Naam gerecht"
-            className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+            placeholder="🔍 Zoek product op #ID of naam..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="flex-1 min-w-[220px] bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-400"
           />
-          <input
-            type="number"
-            required
-            step="0.05"
-            value={newProdPrice}
-            onChange={e => setNewProdPrice(e.target.value)}
-            placeholder="Prijs (€ 5.95)"
-            className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
-          />
-          <input
-            type="number"
-            step="0.05"
-            value={newProdSalePrice}
-            onChange={e => setNewProdSalePrice(e.target.value)}
-            placeholder="Actie (€ 3.95)"
-            className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
-          />
-          <select
-            value={newProdCat}
-            onChange={e => setNewProdCat(e.target.value)}
-            className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
-          >
-            <option value="Burgers & Wraps">Burgers & Wraps</option>
-            <option value="Chicken & Snacks">Chicken & Snacks</option>
-            <option value="Friet & Sides">Friet & Sides</option>
-            <option value="Dranken & McCafé">Dranken & McCafé</option>
-            <option value="Desserts & IJs">Desserts & IJs</option>
-            <option value="Happy Meal">Happy Meal</option>
-            <option value="Sauzen & Dips">Sauzen & Dips</option>
-          </select>
-          <button
-            type="submit"
-            className="py-1.5 rounded-lg font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 flex items-center justify-center gap-1"
-          >
-            <Plus className="w-3.5 h-3.5" /> Toevoegen
-          </button>
-        </form>
+          <span className="text-[11px] text-slate-400 font-mono">
+            {filteredProducts.length} / {products.length} producten
+          </span>
+        </div>
 
         {/* Product Table */}
         <div className="overflow-x-auto max-h-72 border border-slate-800 rounded-xl">
           <table className="w-full text-left text-xs text-slate-300">
             <thead className="bg-slate-950 text-slate-400 font-mono text-[11px] sticky top-0 border-b border-slate-800">
               <tr>
+                <th className="p-2.5">ID</th>
                 <th className="p-2.5">Emoji</th>
                 <th className="p-2.5">Product</th>
-                <th className="p-2.5">Categorie</th>
+                <th className="p-2.5">Categorie &amp; Merk</th>
                 <th className="p-2.5">Regulier</th>
                 <th className="p-2.5">Actieprijs</th>
                 <th className="p-2.5">Actie Status</th>
@@ -2883,11 +3051,34 @@ export const ManagerScreen: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60">
-              {products.map(p => (
+              {filteredProducts.map(p => (
                 <tr key={p.id} className="hover:bg-slate-800/30">
+                  <td className="p-2.5 text-xs text-slate-500 font-mono">#{p.id}</td>
                   <td className="p-2.5 text-base">{p.emoji}</td>
-                  <td className="p-2.5 font-bold text-white">{p.name}</td>
-                  <td className="p-2.5 text-slate-400">{p.cat}</td>
+                  <td className="p-2.5 font-bold text-white">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span>{p.name}</span>
+                      {p.options && p.options.length > 0 && (
+                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-bold">
+                          Keuzemenu ({p.options.length})
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="p-2.5 text-slate-400">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span>{p.cat}</span>
+                      <span className={`text-[9px] px-1.5 py-0.2 rounded border font-bold ${
+                        p.brand === 'koekploeg'
+                          ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                          : p.brand === 'werkpay'
+                          ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                          : 'bg-slate-800 text-slate-400 border-slate-700'
+                      }`}>
+                        {p.brand === 'koekploeg' ? 'Koekploeg' : p.brand === 'werkpay' ? 'WerkPay' : 'Beide'}
+                      </span>
+                    </div>
+                  </td>
                   <td className="p-2.5 font-mono">{euro(p.price)}</td>
                   <td className="p-2.5 font-mono">{p.salePrice > 0 ? euro(p.salePrice) : '—'}</td>
                   <td className="p-2.5">
@@ -2902,7 +3093,10 @@ export const ManagerScreen: React.FC = () => {
                   </td>
                   <td className="p-2.5 text-right flex items-center justify-end gap-1">
                     <button
-                      onClick={() => setEditingProduct({ ...p })}
+                      onClick={() => setEditingProduct({
+                        ...p,
+                        options: p.options ? p.options.map(o => ({ ...o, choices: o.choices.map(c => ({ ...c })) })) : []
+                      })}
                       className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
                       title="Bewerken"
                     >
@@ -3207,18 +3401,11 @@ export const ManagerScreen: React.FC = () => {
                     {u.username !== 'bestel_kassa' && u.username !== 'klant' && (() => {
                       const clockRecord = clockedInStaff.find(c => c.username.toLowerCase() === u.username.toLowerCase());
                       const isClockedIn = !!clockRecord;
-                      const elapsedSec = clockRecord ? Math.floor((nowTime - clockRecord.clockInTime) / 1000) : 0;
-                      const hrs = Math.floor(elapsedSec / 3600);
-                      const mins = Math.floor((elapsedSec % 3600) / 60);
-                      const secs = elapsedSec % 60;
-                      const durationStr = `${hrs > 0 ? `${hrs}u ` : ''}${mins}m ${secs}s`;
 
                       return (
                         <div className="flex items-center gap-2">
-                          {isClockedIn && (
-                            <span className="text-[10px] font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded-md animate-pulse">
-                              ⏱️ {durationStr}
-                            </span>
+                          {isClockedIn && clockRecord && (
+                            <ShiftElapsedBadge clockInTime={clockRecord.clockInTime} />
                           )}
                           <button
                             type="button"
@@ -3330,6 +3517,27 @@ export const ManagerScreen: React.FC = () => {
                       </label>
                     );
                   })}
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <span className="font-bold text-slate-300 block">🎨 Persoonlijk Thema (achtergrond):</span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {USER_THEME_OPTIONS.map(t => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setNewUserTheme(t.id)}
+                      className={`flex items-center gap-2 p-2 rounded-lg border text-[11px] font-bold transition ${
+                        newUserTheme === t.id
+                          ? 'bg-blue-500/15 border-blue-500/40 text-white'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <span className={`w-3 h-3 rounded-full border ${t.swatch}`} />
+                      <span className="truncate">{t.label}</span>
+                    </button>
+                  ))}
                 </div>
               </div>
 
@@ -3457,6 +3665,27 @@ export const ManagerScreen: React.FC = () => {
                 </div>
               </div>
 
+              <div className="space-y-2">
+                <span className="font-bold text-slate-200 block">🎨 Persoonlijk Thema:</span>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {USER_THEME_OPTIONS.map(t => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setEditingUser({ ...editingUser, theme: t.id })}
+                      className={`flex items-center gap-2 p-2.5 rounded-xl border text-xs font-bold transition ${
+                        (editingUser.theme || 'bg-slate-950') === t.id
+                          ? 'bg-blue-500/15 border-blue-500/40 text-white'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <span className={`w-3.5 h-3.5 rounded-full border ${t.swatch}`} />
+                      <span className="truncate">{t.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="flex items-center gap-3 pt-3 border-t border-slate-800">
                 <button
                   type="button"
@@ -3480,24 +3709,41 @@ export const ManagerScreen: React.FC = () => {
       {/* Edit Product Modal */}
       {editingProduct && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-5 space-y-4 shadow-2xl">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-              <h3 className="font-bold text-white text-sm">✏️ Product Bewerken</h3>
+              <h3 className="font-bold text-white text-sm">✏️ Product Bewerken (#{editingProduct.id})</h3>
               <button onClick={() => setEditingProduct(null)} className="text-slate-400 hover:text-white">
                 <X className="w-4 h-4" />
               </button>
             </div>
             <form onSubmit={handleSaveEditProduct} className="space-y-3 text-xs">
-              <div>
-                <label className="text-slate-400 block mb-1">Productnaam</label>
-                <input
-                  type="text"
-                  required
-                  value={editingProduct.name}
-                  onChange={e => setEditingProduct({ ...editingProduct, name: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
-                />
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-slate-400 block mb-1">Productnaam</label>
+                  <input
+                    type="text"
+                    required
+                    value={editingProduct.name}
+                    onChange={e => setEditingProduct({ ...editingProduct, name: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-slate-400 block mb-1">Emoji (Icoon)</label>
+                  <input
+                    type="text"
+                    value={editingProduct.emoji}
+                    onChange={e => setEditingProduct({ ...editingProduct, emoji: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+                  />
+                </div>
               </div>
+
+              <QuickEmojiSelector
+                current={editingProduct.emoji}
+                onSelect={(emoji) => setEditingProduct({ ...editingProduct, emoji })}
+              />
+
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="text-slate-400 block mb-1">Regulier (€)</label>
@@ -3521,6 +3767,41 @@ export const ManagerScreen: React.FC = () => {
                   />
                 </div>
               </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-slate-400 block mb-1">Categorie</label>
+                  <select
+                    value={editingProduct.cat}
+                    onChange={e => setEditingProduct({ ...editingProduct, cat: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+                  >
+                    <option value="Burgers & Wraps">Burgers &amp; Wraps</option>
+                    <option value="Chicken & Snacks">Chicken &amp; Snacks</option>
+                    <option value="Friet & Sides">Friet &amp; Sides</option>
+                    <option value="Koude Dranken & WerkShakes">Koude Dranken &amp; WerkShakes</option>
+                    <option value="Warme Dranken & Koffie">Warme Dranken &amp; Koffie</option>
+                    <option value="Desserts & IJs">Desserts &amp; IJs</option>
+                    <option value="WerkMeal Kids">WerkMeal Kids</option>
+                    <option value="Sauzen & Dips">Sauzen &amp; Dips</option>
+                    <option value="Stroopwafels & Koeken">Stroopwafels &amp; Koeken</option>
+                    <option value="Bakkerij Specialiteiten">Bakkerij Specialiteiten</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-slate-400 block mb-1">Beschikbaar in</label>
+                  <select
+                    value={editingProduct.brand || 'both'}
+                    onChange={e => setEditingProduct({ ...editingProduct, brand: e.target.value as any })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
+                  >
+                    <option value="werkpay">WerkPay</option>
+                    <option value="koekploeg">Koekploeg</option>
+                    <option value="both">Allebei (WerkPay + Koekploeg)</option>
+                  </select>
+                </div>
+              </div>
+
               <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-950 border border-slate-800 cursor-pointer">
                 <input
                   type="checkbox"
@@ -3530,6 +3811,14 @@ export const ManagerScreen: React.FC = () => {
                 />
                 <span className="font-bold text-slate-300">🔥 Actieprijs Activeren</span>
               </label>
+
+              {/* Product Opties Aanpassen (Volledig Keuzemenu Editor + Presets) */}
+              <div className="pt-3 border-t border-slate-800">
+                <ProductOptionsEditor
+                  options={editingProduct.options || []}
+                  onChange={nextOptions => setEditingProduct(prev => prev ? { ...prev, options: nextOptions } : null)}
+                />
+              </div>
 
               {/* Recept & Ingrediënten Aanpassen */}
               <div className="space-y-1.5 pt-1 border-t border-slate-800">
@@ -3580,7 +3869,7 @@ export const ManagerScreen: React.FC = () => {
 
             <div className="p-5 bg-white text-slate-950 font-mono text-xs space-y-2 select-text">
               <div className="text-center pb-2 border-b-2 border-dashed border-slate-300">
-                <h3 className="font-black text-base">WERKDONALDS POS</h3>
+                <h3 className="font-black text-base">WERKPAY POS</h3>
                 <p className="text-[10px] text-slate-500">Z-RAPPORT / FINANCIËLE DAGAFSLUITING</p>
                 <p className="text-[10px] text-slate-500">{new Date().toLocaleString('nl-NL')}</p>
               </div>
@@ -3652,6 +3941,13 @@ export const ManagerScreen: React.FC = () => {
 
       {showDiyTerminalModal && (
         <DiyTerminalModal onClose={() => setShowDiyTerminalModal(false)} />
+      )}
+
+      {showPairingModal && pairingUser && (
+        <LinkCardModal
+          onClose={() => setShowPairingModal(false)}
+          username={pairingUser.username}
+        />
       )}
 
       {vipModalCustomer && (

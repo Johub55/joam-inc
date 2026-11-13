@@ -183,7 +183,7 @@ export const LoyaltyLevelCard: React.FC<LoyaltyLevelCardProps> = ({ customer, on
           <div>
             <div className="flex items-center gap-2 justify-center md:justify-start">
               <h3 className="font-black text-white text-base uppercase tracking-tight">
-                Werkdonalds VIP Club Maandabonnement
+                WerkPay VIP Club Maandabonnement
               </h3>
               {customer.vipSubscriptionActive && (
                 <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[10px] border border-emerald-500/30">

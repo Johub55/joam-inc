@@ -94,21 +94,24 @@ export const DigitalPhone: React.FC = () => {
   const [isTvModeActive, setIsTvModeActive] = useState<boolean>(false);
 
   useEffect(() => {
+    if (typeof document === 'undefined') return;
     const checkTvMode = () => {
-      if (typeof document !== 'undefined') {
-        const active = document.body.classList.contains('tv-mode-active') || !!document.getElementById('werkpay-tv-mode-root');
-        setIsTvModeActive(active);
-      }
+      const active = document.body.classList.contains('tv-mode-active') || Boolean(document.getElementById('werkpay-tv-mode-root'));
+      setIsTvModeActive(prev => (prev !== active ? active : prev));
     };
 
     checkTvMode();
-    const interval = setInterval(checkTvMode, 300);
-    return () => clearInterval(interval);
+    const observer = new MutationObserver(checkTvMode);
+    observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['class']
+    });
+    return () => observer.disconnect();
   }, []);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // Apps: 'home', 'werkpay', 'phone', 'messages', 'settings', 'werkpay', 'loyalty'
-  const [activeApp, setActiveApp] = useState<'home' | 'werkpay' | 'phone' | 'messages' | 'settings' | 'werkpay' | 'loyalty'>('home');
+  // Apps: 'home', 'werkpay', 'phone', 'messages', 'settings', 'loyalty'
+  const [activeApp, setActiveApp] = useState<'home' | 'werkpay' | 'phone' | 'messages' | 'settings' | 'loyalty'>('home');
   const [time, setTime] = useState<string>('12:00');
   const [notification, setNotification] = useState<{ title: string; body: string } | null>(null);
 

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS public.bank_accounts (
   password TEXT NOT NULL,
   account_holder TEXT NOT NULL,
   card_uid TEXT UNIQUE NOT NULL,
+  linked_uids JSONB NOT NULL DEFAULT '[]'::jsonb,
   pin_code TEXT NOT NULL DEFAULT '1234',
   balance NUMERIC(12, 2) NOT NULL DEFAULT 25.00,
   is_admin BOOLEAN NOT NULL DEFAULT FALSE,
@@ -252,6 +253,8 @@ ALTER TABLE public.loyalty_customers ADD COLUMN IF NOT EXISTS vouchers JSONB DEF
 ALTER TABLE public.loyalty_customers ADD COLUMN IF NOT EXISTS last_spin_date TEXT;
 ALTER TABLE public.loyalty_customers ADD COLUMN IF NOT EXISTS orders_today_count INT DEFAULT 0;
 
+ALTER TABLE public.bank_accounts ADD COLUMN IF NOT EXISTS card_uid TEXT;
+ALTER TABLE public.bank_accounts ADD COLUMN IF NOT EXISTS linked_uids JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE public.bank_accounts ADD COLUMN IF NOT EXISTS pin_code TEXT NOT NULL DEFAULT '1234';
 ALTER TABLE public.bank_accounts ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE public.bank_accounts ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE;
@@ -303,6 +306,7 @@ ALTER TABLE public.cash_requests ADD COLUMN IF NOT EXISTS rejected_reason TEXT;
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON public.orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bank_accounts_uid ON public.bank_accounts(card_uid);
+CREATE INDEX IF NOT EXISTS idx_bank_accounts_linked_uids ON public.bank_accounts USING GIN (linked_uids);
 CREATE INDEX IF NOT EXISTS idx_bank_accounts_username ON public.bank_accounts(username);
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_created ON public.bank_transactions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_phone_messages_contact ON public.phone_messages(contact_id);
@@ -432,7 +436,7 @@ DECLARE
   v_to_merchant TEXT;
   v_tx_label TEXT;
 BEGIN
-  v_clean_uid := REPLACE(p_card_uid, ' ', '');
+  v_clean_uid := UPPER(REPLACE(TRIM(p_card_uid), ' ', ''));
 
   IF p_brand ILIKE '%koek%' OR p_reference ILIKE '%koek%' OR p_cashier ILIKE '%koek%' THEN
     v_brand_name := 'De Koekploeg';
@@ -444,7 +448,14 @@ BEGIN
   v_tx_label := 'Pasbetaling ' || v_brand_name || ' #' || COALESCE(p_order_no::text, '?');
 
   SELECT * INTO v_acc FROM public.bank_accounts 
-  WHERE REPLACE(card_uid, ' ', '') = v_clean_uid AND (pin_code = p_pin OR password = p_pin)
+  WHERE (
+    UPPER(REPLACE(card_uid, ' ', '')) = v_clean_uid
+    OR EXISTS (
+      SELECT 1 FROM jsonb_array_elements(COALESCE(linked_uids, '[]'::jsonb)) AS elem
+      WHERE UPPER(REPLACE(COALESCE(elem->>'uid', TRIM(BOTH '"' FROM elem::text)), ' ', '')) = v_clean_uid
+    )
+  )
+    AND (pin_code = p_pin OR password = p_pin)
   FOR UPDATE;
 
   IF NOT FOUND THEN
@@ -678,6 +689,7 @@ CREATE TABLE IF NOT EXISTS public.bank_accounts (
   password TEXT NOT NULL,
   account_holder TEXT NOT NULL,
   card_uid TEXT UNIQUE NOT NULL,
+  linked_uids JSONB NOT NULL DEFAULT '[]'::jsonb,
   pin_code TEXT NOT NULL DEFAULT '1234',
   balance NUMERIC(12, 2) NOT NULL DEFAULT 25.00,
   is_admin BOOLEAN NOT NULL DEFAULT FALSE,
@@ -756,6 +768,8 @@ CREATE TABLE IF NOT EXISTS public.pos_settings (
 INSERT INTO public.pos_settings (id, order_stop_active, pickup_closed)
 VALUES ('default', FALSE, FALSE)
 ON CONFLICT (id) DO NOTHING;
+
+ALTER TABLE public.bank_accounts ADD COLUMN IF NOT EXISTS linked_uids JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 ALTER TABLE public.bank_accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.bank_transactions ENABLE ROW LEVEL SECURITY;

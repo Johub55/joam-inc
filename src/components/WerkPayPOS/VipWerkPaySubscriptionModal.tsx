@@ -6,7 +6,7 @@ import {
   saveVipSubscriberRecord, 
   normalizePhone 
 } from '../../services/loyalty';
-import { euro } from '../../services/store';
+import { euro, accountMatchesUid, normalizeCardUid } from '../../services/store';
 import { showToast } from '../../services/appToast';
 import { AudioFX } from '../../services/audio';
 import { 
@@ -137,12 +137,11 @@ export const VipWerkPaySubscriptionModal: React.FC<VipWerkPaySubscriptionModalPr
           return;
         }
       } else if (paymentTab === 'card') {
-        const cleanUid = cardUidInput.replace(/\s+/g, '').toUpperCase();
+        const cleanUid = normalizeCardUid(cardUidInput);
         const p = cardPinInput.trim();
 
         targetAccount = bankAccounts.find(a => {
-          const aUid = String(a.card_uid || '').replace(/\s+/g, '').toUpperCase();
-          const matchUid = (aUid === cleanUid) || (a.username.toUpperCase() === cleanUid);
+          const matchUid = accountMatchesUid(a, cleanUid);
           const matchPin = (a.pin_code === p || a.password === p);
           return matchUid && matchPin;
         });
@@ -171,9 +170,9 @@ export const VipWerkPaySubscriptionModal: React.FC<VipWerkPaySubscriptionModalPr
       const tx = {
         id: Date.now(),
         from_account: targetAccount.username,
-        to_account: 'WerkDonalds VIP Subscriptions',
+        to_account: 'WerkPay VIP Subscriptions',
         amount: planAmount,
-        label: `WerkDonalds ${planLabel}`,
+        label: `WerkPay ${planLabel}`,
         note: `Maandelijkse automatische VIP afschrijving via WerkPay (${targetAccount.username})`,
         order_no: Math.floor(1000 + Math.random() * 9000),
         when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
@@ -225,7 +224,7 @@ export const VipWerkPaySubscriptionModal: React.FC<VipWerkPaySubscriptionModalPr
             </div>
             <div>
               <h2 className="font-black text-lg text-white flex items-center gap-2">
-                <span>👑 WerkDonalds VIP Maandabonnement</span>
+                <span>👑 WerkPay VIP Maandabonnement</span>
               </h2>
               <p className="text-xs text-amber-300 font-bold">
                 Afrekenen via je WerkPay Bankrekening

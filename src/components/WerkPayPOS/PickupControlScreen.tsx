@@ -453,7 +453,7 @@ export const PickupControlScreen: React.FC = () => {
                 <option value="NOS Binnenland">NOS Binnenland</option>
                 <option value="NOS Sport">NOS Sport</option>
                 <option value="NOS Economie">NOS Economie</option>
-                <option value="Werkdonalds Actie">Werkdonalds Actie</option>
+                <option value="WerkPay Actie">WerkPay Actie</option>
               </select>
               <button
                 type="submit"

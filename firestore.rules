@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Global Default Deny
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidHardwareTerminal(data) {
+      return data.keys().hasAll(['status', 'updatedAt'])
+        && data.keys().hasOnly([
+          'status',
+          'username',
+          'amount',
+          'orderNo',
+          'scannedUid',
+          'enteredPin',
+          'reason',
+          'updatedAt'
+        ])
+        && data.status is string
+        && data.status.size() <= 32
+        && data.status in ['IDLE', 'LINK', 'CARD_SCANNED', 'LINKED', 'PAY', 'SUBMITTED', 'APPROVED', 'DECLINED']
+        && data.updatedAt is string
+        && data.updatedAt.size() <= 64
+        && (!('username' in data) || (data.username is string && data.username.size() <= 100))
+        && (!('amount' in data) || (data.amount is number && data.amount >= 0 && data.amount <= 100000))
+        && (!('orderNo' in data) || ((data.orderNo is number && data.orderNo >= 0) || (data.orderNo is string && data.orderNo.size() <= 64)))
+        && (!('scannedUid' in data) || (data.scannedUid is string && data.scannedUid.size() <= 64))
+        && (!('enteredPin' in data) || (data.enteredPin is string && data.enteredPin.size() <= 16))
+        && (!('reason' in data) || (data.reason is string && data.reason.size() <= 128));
+    }
+
+    function isValidPosSetting(data) {
+      return data.keys().hasAll(['updated_at'])
+        && data.keys().hasOnly(['news_config', 'custom_news_items', 'updated_at'])
+        && data.updated_at is string
+        && data.updated_at.size() <= 64
+        && (!('news_config' in data) || data.news_config is map)
+        && (!('custom_news_items' in data) || (data.custom_news_items is list && data.custom_news_items.size() <= 100));
+    }
+
+    // ===============================================================
+    // Hardware Terminal Relay (POS <-> Raspberry Pi Pico W REST API)
+    // ===============================================================
+    match /hardware_terminals/{terminalId} {
+      allow get: if isValidId(terminalId);
+      allow list: if false;
+      allow create: if isValidId(terminalId) && isValidHardwareTerminal(incoming());
+      allow update: if isValidId(terminalId)
+        && isValidHardwareTerminal(incoming())
+        && incoming().diff(resource.data).affectedKeys().hasOnly([
+          'status',
+          'username',
+          'amount',
+          'orderNo',
+          'scannedUid',
+          'enteredPin',
+          'reason',
+          'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // POS News & Ticker Settings Relay
+    // ===============================================================
+    match /pos_settings/{settingId} {
+      allow get: if isValidId(settingId);
+      allow list: if false;
+      allow create: if isValidId(settingId) && isValidPosSetting(incoming());
+      allow update: if isValidId(settingId)
+        && isValidPosSetting(incoming())
+        && incoming().diff(resource.data).affectedKeys().hasOnly([
+          'news_config',
+          'custom_news_items',
+          'updated_at'
+        ]);
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // Supabase-backed Collections (Locked on Firestore Client SDK)
+    // ===============================================================
+    match /products/{productId} { allow read, write: if false; }
+    match /orders/{orderId} { allow read, write: if false; }
+    match /bank_accounts/{accountId} { allow read, write: if false; }
+    match /pos_users/{userId} { allow read, write: if false; }
+    match /bank_transactions/{transactionId} { allow read, write: if false; }
+    match /cash_requests/{requestId} { allow read, write: if false; }
+    match /chat_groups/{groupId} { allow read, write: if false; }
+    match /coupons/{couponId} { allow read, write: if false; }
+    match /gift_cards/{cardId} { allow read, write: if false; }
+    match /group_members/{memberId} { allow read, write: if false; }
+    match /group_messages/{messageId} { allow read, write: if false; }
+    match /inventory/{itemId} { allow read, write: if false; }
+    match /loyalty_customers/{customerId} { allow read, write: if false; }
+    match /phone_messages/{messageId} { allow read, write: if false; }
+    match /pos_audit_logs/{logId} { allow read, write: if false; }
+    match /pos_sessions/{sessionId} { allow read, write: if false; }
+    match /tv_presets/{presetId} { allow read, write: if false; }
+  }
+}

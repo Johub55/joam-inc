@@ -89,6 +89,15 @@ async function startServer() {
   let linkModeUsername: string | null = null;
   let payModeActive: boolean = false;
 
+  // Middleware voor debuggen van hardware API verzoeken
+  app.use((req, res, next) => {
+    if (req.url.startsWith('/api/hardware/')) {
+      console.log(`[Hardware API] Request: ${req.method} ${req.url}`);
+    }
+    next();
+  });
+
+  // Hardware routes - EXPLICIT PUBLIC en ZONDER REDIRECTS
   app.post("/api/hardware/set-link-mode", (req, res) => {
     linkModeUsername = req.body.username;
     res.json({ status: "ok", mode: "LINK", username: linkModeUsername });

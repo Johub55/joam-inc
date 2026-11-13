@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, ReactNode } from 'react';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type {
   AppMode,
@@ -21,7 +21,8 @@ import type {
   BrandType,
   BrandConfig,
   OrderStopConfig,
-  CustomBrandingConfig
+  CustomBrandingConfig,
+  LinkedNfcTag
 } from '../types';
 import { showToast } from '../services/appToast';
 import {
@@ -37,7 +38,12 @@ import {
   ORDER_KIOSK_USER,
   RPI_KIOSK_USER,
   BRAND_CONFIGS,
-  getSupabaseClient
+  getSupabaseClient,
+  normalizeCardUid,
+  parseLinkedUids,
+  accountMatchesUid,
+  generateVirtualCardUid,
+  isVirtualCardNumber
 } from '../services/store';
 import { DEFAULT_PRODUCTS, ALL_DEFAULT_PRODUCTS, KOEKPLOEG_PRODUCTS } from '../services/defaultProducts';
 import { AudioFX } from '../services/audio';
@@ -212,7 +218,7 @@ interface AppContextType {
   topUpWerkPay: (amount: number) => Promise<{ success: boolean; message: string }>;
   transferWerkPay: (to: string, amount: number, note?: string) => Promise<{ success: boolean; message: string }>;
   changeWerkPayPin: (newPin: string) => Promise<{ success: boolean; message: string }>;
-  saveBankAccount: (acc: Partial<BankAccount> & { id?: number | string }) => Promise<void>;
+  saveBankAccount: (acc: Partial<BankAccount> & { id?: number | string }) => Promise<{ success: boolean; message?: string }>;
   deleteBankAccount: (id: number | string) => Promise<void>;
   quickMoneyAccount: (id: number | string, delta: number) => Promise<void>;
 
@@ -327,12 +333,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
   };
 
-  // Helper: Encode security flags inside existing JSONB `perms` array so Supabase sync works 100% WITHOUT needing new SQL columns!
+  // Helper: Encode security & theme flags inside existing JSONB `perms` array so Supabase sync works 100% WITHOUT needing new SQL columns!
   const buildDbPermsForUser = (u: PosUser, overrideFreeze?: boolean): string[] => {
     const cleanPerms = (u.perms || ['pos', 'pickup']).filter(p => !p.startsWith('__'));
     const out = [...cleanPerms];
     if (u.is_shadowbanned) out.push('__shadowban__');
     if (u.is_banned || u.is_suspended) out.push('__banned__');
+    if (u.theme && u.theme.trim()) {
+      out.push(`__theme:${u.theme.trim()}__`);
+    }
     if (u.is_2fa_enabled && u.totp_secret) {
       out.push(`__2fa_enabled:${u.totp_secret}__`);
       if (u.backup_codes && u.backup_codes.length > 0) {
@@ -355,6 +364,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     const hasShadowMarker = rawPerms.includes('__shadowban__') || u.session_token === 'SHADOWBANNED';
     const hasBanMarker = rawPerms.includes('__banned__') || u.session_token === 'BANNED';
+
+    const themeMarker = rawPerms.find(p => p.startsWith('__theme:'));
+    const themeFromMarker = themeMarker ? themeMarker.replace('__theme:', '').replace(/__/g, '') : undefined;
 
     const has2faMarker = rawPerms.find(p => p.startsWith('__2fa_enabled:'));
     const secretFromMarker = has2faMarker ? has2faMarker.replace('__2fa_enabled:', '').replace(/__/g, '') : '';
@@ -379,7 +391,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       is_shadowbanned: Boolean(u.is_shadowbanned) || hasShadowMarker,
       is_2fa_enabled: is2faActive,
       totp_secret: totpSecret,
-      backup_codes: backupCodes
+      backup_codes: backupCodes,
+      theme: u.theme || themeFromMarker
     };
   };
 
@@ -670,7 +683,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     if (currentPosUser && currentPosUser.username.toLowerCase() === cleanU) {
       setCurrentPosUser(prev => prev ? { ...prev, is_2fa_enabled: true, totp_secret: secret, backup_codes: backupCodes } : null);
-      sessionStorage.removeItem(`wd_manager_unlocked_${cleanU}`);
     }
 
     const existingUser = posUsers.find(u => u.username.toLowerCase() === cleanU);
@@ -741,29 +753,100 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return { success: true, message: `2FA uitgeschakeld voor @${cleanU}.` };
   };
 
+  const resolveUser2FACredentials = async (username: string): Promise<{ is_2fa_enabled: boolean; totp_secret: string; backup_codes: string[] } | null> => {
+    const cleanU = username.trim().toLowerCase();
+    const pendingMatch = pending2FALogin?.user?.username?.toLowerCase() === cleanU ? pending2FALogin.user : null;
+    const currentMatch = currentPosUser?.username?.toLowerCase() === cleanU ? currentPosUser : null;
+    const posMatch = posUsers.find(u => u.username.toLowerCase() === cleanU);
+    const bankMatch = bankAccounts.find(a => a.username.toLowerCase() === cleanU);
+
+    const candidates = [pendingMatch, currentMatch, posMatch, bankMatch].filter(Boolean) as Array<PosUser | BankAccount>;
+    const enabledWithSecret = candidates.find(c => Boolean(c.totp_secret) && (c.is_2fa_enabled !== false));
+    if (enabledWithSecret?.totp_secret) {
+      return {
+        is_2fa_enabled: true,
+        totp_secret: enabledWithSecret.totp_secret,
+        backup_codes: enabledWithSecret.backup_codes || []
+      };
+    }
+
+    // Fallback: check live Supabase in case 2FA was just toggled on another device or before initial poll finished
+    if (posClient) {
+      try {
+        const { data: dbU } = await posClient.from('pos_users').select('*').ilike('username', cleanU).maybeSingle();
+        if (dbU) {
+          const parsed = parsePosUserFromDb(dbU);
+          if (parsed.is_2fa_enabled && parsed.totp_secret) {
+            return {
+              is_2fa_enabled: true,
+              totp_secret: parsed.totp_secret,
+              backup_codes: parsed.backup_codes || []
+            };
+          }
+        }
+      } catch {}
+    }
+    const targetPay = payClient || posClient;
+    if (targetPay) {
+      try {
+        const { data: dbA } = await targetPay.from('bank_accounts').select('is_2fa_enabled, totp_secret, backup_codes').ilike('username', cleanU).maybeSingle();
+        if (dbA && dbA.is_2fa_enabled && dbA.totp_secret) {
+          return {
+            is_2fa_enabled: true,
+            totp_secret: dbA.totp_secret,
+            backup_codes: Array.isArray(dbA.backup_codes) ? dbA.backup_codes : []
+          };
+        }
+      } catch {}
+    }
+
+    return null;
+  };
+
   const verify2FACodeForUser = async (username: string, code: string): Promise<boolean> => {
     const cleanU = username.trim().toLowerCase();
-    const targetUser = posUsers.find(u => u.username.toLowerCase() === cleanU) ||
-                       bankAccounts.find(a => a.username.toLowerCase() === cleanU);
+    const pendingMatch = pending2FALogin?.user?.username?.toLowerCase() === cleanU ? pending2FALogin.user : null;
+    const currentMatch = currentPosUser?.username?.toLowerCase() === cleanU ? currentPosUser : null;
+    const posMatch = posUsers.find(u => u.username.toLowerCase() === cleanU);
+    const bankMatch = bankAccounts.find(a => a.username.toLowerCase() === cleanU);
 
-    if (!targetUser || !targetUser.totp_secret) return false;
-    return await verifyTotpCode(targetUser.totp_secret, code, targetUser.backup_codes);
+    const candidates = [pendingMatch, currentMatch, posMatch, bankMatch].filter(Boolean) as Array<PosUser | BankAccount>;
+    let targetSecret = candidates.find(c => Boolean(c.totp_secret))?.totp_secret || '';
+    let targetBackups = candidates.find(c => Array.isArray(c.backup_codes) && c.backup_codes.length > 0)?.backup_codes || [];
+
+    if (!targetSecret) {
+      const live2FA = await resolveUser2FACredentials(cleanU);
+      if (live2FA) {
+        targetSecret = live2FA.totp_secret;
+        targetBackups = live2FA.backup_codes;
+      }
+    }
+
+    if (!targetSecret) return false;
+    return await verifyTotpCode(targetSecret, code, targetBackups);
   };
 
   const confirm2FALogin = async (code: string): Promise<{ success: boolean; message: string }> => {
     if (!pending2FALogin) return { success: false, message: 'Geen inlogverzoek in behandeling.' };
 
     const { user, loginType } = pending2FALogin;
-    const isValid = await verify2FACodeForUser(user.username, code);
+    const cleanU = user.username.trim().toLowerCase();
+    const isValid = await verify2FACodeForUser(cleanU, code);
 
     if (!isValid) {
       logAuditAction('2FA_LOGIN_MISLUKT', `Ongeldige 2FA poging voor @${user.username}`);
       return { success: false, message: 'Ongeldige 2FA Authenticator code of Noodcode.' };
     }
 
+    try {
+      sessionStorage.removeItem(`wd_manager_unlocked_${cleanU}`);
+    } catch {}
+
     if (loginType === 'pos') {
-      setCurrentPosUser(user as PosUser);
-      setPosScreen('kassa');
+      const posUser = user as PosUser;
+      setCurrentPosUser(posUser);
+      setPosUsers(prev => [posUser, ...prev.filter(u => u.username.toLowerCase() !== cleanU)]);
+      setPosScreen(prev => (prev === 'pickup_control' ? 'pickup_control' : 'kassa'));
     } else {
       setCurrentBankAccount(user as BankAccount);
     }
@@ -898,13 +981,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return ALL_DEFAULT_PRODUCTS;
   });
 
-  // Filtered products for active brand
-  const brandProducts = products.filter(p => {
-    if (activeBrand === 'koekploeg') {
-      return p.id >= 200;
-    }
-    return p.id < 200;
-  });
+  // Filtered products for active brand (respects explicit product.brand: 'werkpay' | 'koekploeg' | 'both')
+  const brandProducts = useMemo(() => {
+    return products.filter(p => {
+      if (p.brand) {
+        return p.brand === 'both' || p.brand === activeBrand;
+      }
+      if (activeBrand === 'koekploeg') {
+        return p.id >= 200;
+      }
+      return p.id < 200;
+    });
+  }, [products, activeBrand]);
 
   const [cart, setCart] = useState<CartItem[]>([]);
   const [orders, setOrders] = useState<Order[]>(() => {
@@ -998,12 +1086,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } catch {}
     }
     return {
-      storeName: 'Werkdonalds',
+      storeName: 'WerkPay',
       tagline: 'Vers Bereid • Snelle Kassa & Keuken',
       logoEmoji: '🍔',
       primaryColor: '#2563eb', // blue-600
       headerGradient: 'from-blue-600 via-blue-500 to-cyan-400',
-      useCustomBranding: false
+      useCustomBranding: false,
+      tvAutoStart: false,
+      tvStartTime: '08:00',
+      tvWidgets: {
+        prep: true, ready: true, menu: true, ticker: true, deal: true, waitTime: true, stats: true
+      },
+      tvLayout: 'split_50',
+      nosCategory: 'general'
     };
   });
 
@@ -1072,7 +1167,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try { return JSON.parse(saved); } catch {}
     }
     return [
-      { id: 1, from_account: 'klant01', to_account: 'Werkdonalds Kassa', amount: 14.50, label: 'Werkdonalds Bestelling #1000', when: 'Vandaag 12:30', timestamp: Date.now() - 3600000 },
+      { id: 1, from_account: 'klant01', to_account: 'WerkPay Kassa', amount: 14.50, label: 'WerkPay Bestelling #1000', when: 'Vandaag 12:30', timestamp: Date.now() - 3600000 },
       { id: 2, from_account: 'joas', to_account: 'emma', amount: 25.00, label: 'Overboeking naar emma', when: 'Gisteren', timestamp: Date.now() - 86400000 }
     ];
   });
@@ -1274,12 +1369,50 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   };
 };
 
+  const currentPosUserRef = useRef(currentPosUser);
+  currentPosUserRef.current = currentPosUser;
+  const currentBankAccountRef = useRef(currentBankAccount);
+  currentBankAccountRef.current = currentBankAccount;
+  const tablesFrozenRef = useRef(tablesFrozen);
+  tablesFrozenRef.current = tablesFrozen;
+  const isRealtimeActiveRef = useRef(isRealtimeActive);
+  isRealtimeActiveRef.current = isRealtimeActive;
+
+  const cloudSnapshotsRef = useRef<{
+    bank: string;
+    users: string;
+    coupons: string;
+    giftCards: string;
+    cashReqs: string;
+    loyalty: string;
+    sessions: string;
+    blocked: string;
+    news: string;
+  }>({
+    bank: '',
+    users: '',
+    coupons: '',
+    giftCards: '',
+    cashReqs: '',
+    loyalty: '',
+    sessions: '',
+    blocked: '',
+    news: ''
+  });
+
   // Unified cloud data fetch
   const fetchCloudData = useCallback(async (isBackground = false) => {
     if (!posClient) return;
+    if (isBackground && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
     if (!isBackground) {
       setSyncStatus('syncing');
     }
+
+    const activePosUser = currentPosUserRef.current;
+    const activeBankAcc = currentBankAccountRef.current;
+    const isShadowbanned = Boolean(activePosUser?.is_shadowbanned);
 
     try {
       // 1. Fetch orders (unless current user is shadowbanned so their fake local changes stay visible to them)
@@ -1289,7 +1422,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         .order('created_at', { ascending: false })
         .limit(60);
 
-      if (!orderErr && dbOrders && !currentPosUser?.is_shadowbanned) {
+      if (!orderErr && dbOrders && !isShadowbanned) {
         const parsed: Order[] = dbOrders.map(formatDbOrder);
         setOrders(prev => {
           const { merged, hasNewRemoteOrder } = mergeOrders(prev, parsed);
@@ -1301,23 +1434,58 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
         const highest = Math.max(0, ...parsed.map(x => x.no));
         if (highest >= 1000) {
-          setOrderNo(prev => Math.max(prev, highest + 1));
+          setOrderNo(prev => (prev >= highest + 1 ? prev : Math.max(prev, highest + 1)));
         }
       }
 
-      // 2. Fetch bank accounts
+      // 2. Fetch bank accounts (preserving local linked_uids if SQL column doesn't exist yet)
       const targetPay = payClient || posClient;
       const { data: dbAccounts, error: payErr } = await targetPay
         .from('bank_accounts')
         .select('*');
 
-      if (!payErr && dbAccounts && dbAccounts.length > 0 && !currentPosUser?.is_shadowbanned) {
-        setBankAccounts(dbAccounts);
-        if (currentBankAccount) {
-          const found = dbAccounts.find(
-            a => a.id === currentBankAccount.id || a.username.toLowerCase() === currentBankAccount.username.toLowerCase()
+      let mergedDbAccounts: BankAccount[] | null = null;
+      if (!payErr && dbAccounts && dbAccounts.length > 0 && !isShadowbanned) {
+        const localBankMap = new Map<string, BankAccount>();
+        try {
+          const savedRaw = localStorage.getItem('wd_bank_accounts');
+          if (savedRaw) {
+            for (const la of JSON.parse(savedRaw)) {
+              if (la?.username) localBankMap.set(String(la.username).toLowerCase(), la);
+            }
+          }
+        } catch {}
+
+        mergedDbAccounts = dbAccounts.map((row: any) => {
+          const localMatch = localBankMap.get(String(row.username || '').toLowerCase());
+          const hasRemoteLinkedCol = row.linked_uids !== undefined;
+          return {
+            ...row,
+            balance: Number(row.balance || 0),
+            is_admin: Boolean(row.is_admin),
+            linked_uids: hasRemoteLinkedCol
+              ? parseLinkedUids(row.linked_uids)
+              : parseLinkedUids(localMatch?.linked_uids || [])
+          } as BankAccount;
+        });
+
+        const bankSnap = JSON.stringify(mergedDbAccounts);
+        if (bankSnap !== cloudSnapshotsRef.current.bank) {
+          cloudSnapshotsRef.current.bank = bankSnap;
+          setBankAccounts(mergedDbAccounts);
+          localStorage.setItem('wd_bank_accounts', bankSnap);
+        }
+        if (activeBankAcc) {
+          const found = mergedDbAccounts.find(
+            a => a.id === activeBankAcc.id || a.username.toLowerCase() === activeBankAcc.username.toLowerCase()
           );
-          if (found && found.balance !== currentBankAccount.balance) {
+          if (
+            found &&
+            (found.balance !== activeBankAcc.balance ||
+              found.is_2fa_enabled !== activeBankAcc.is_2fa_enabled ||
+              found.card_uid !== activeBankAcc.card_uid ||
+              JSON.stringify(found.linked_uids || []) !== JSON.stringify(activeBankAcc.linked_uids || []))
+          ) {
             setCurrentBankAccount(found);
           }
         }
@@ -1336,26 +1504,55 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         });
 
         const parsedUsers: PosUser[] = dbUsers.map(u => parsePosUserFromDb(u));
-        setPosUsers(parsedUsers);
-        localStorage.setItem('wd_pos_users', JSON.stringify(parsedUsers));
+        const usersSnap = JSON.stringify(parsedUsers);
+        if (usersSnap !== cloudSnapshotsRef.current.users) {
+          cloudSnapshotsRef.current.users = usersSnap;
+          setPosUsers(parsedUsers);
+          localStorage.setItem('wd_pos_users', usersSnap);
+        }
 
-        if (currentPosUser) {
-          const syncedMe = parsedUsers.find(pu => pu.username.toLowerCase() === currentPosUser.username.toLowerCase());
+        if (activePosUser) {
+          const syncedMe = parsedUsers.find(pu => pu.username.toLowerCase() === activePosUser.username.toLowerCase());
           if (syncedMe) {
             if (syncedMe.is_banned || syncedMe.is_suspended) {
               logoutPos();
-            } else if (
-              syncedMe.is_shadowbanned !== currentPosUser.is_shadowbanned ||
-              syncedMe.is_2fa_enabled !== currentPosUser.is_2fa_enabled ||
-              syncedMe.totp_secret !== currentPosUser.totp_secret ||
-              JSON.stringify(syncedMe.perms) !== JSON.stringify(currentPosUser.perms)
-            ) {
-              setCurrentPosUser(syncedMe);
+            } else {
+              const cleanMe = syncedMe.username.toLowerCase();
+              const syncedBankMe = mergedDbAccounts
+                ? mergedDbAccounts.find(a => a.username.toLowerCase() === cleanMe)
+                : undefined;
+              const merged2faEnabled = Boolean(
+                (syncedMe.is_2fa_enabled && syncedMe.totp_secret) ||
+                (syncedBankMe?.is_2fa_enabled && syncedBankMe?.totp_secret)
+              );
+              const mergedSecret = syncedMe.totp_secret || syncedBankMe?.totp_secret || '';
+              const mergedBackups =
+                (syncedMe.backup_codes && syncedMe.backup_codes.length > 0 ? syncedMe.backup_codes : undefined) ||
+                syncedBankMe?.backup_codes ||
+                [];
+              const enrichedSyncedMe: PosUser = {
+                ...syncedMe,
+                is_2fa_enabled: merged2faEnabled,
+                totp_secret: mergedSecret || undefined,
+                backup_codes: mergedBackups
+              };
+
+              if (
+                enrichedSyncedMe.is_shadowbanned !== activePosUser.is_shadowbanned ||
+                enrichedSyncedMe.is_2fa_enabled !== activePosUser.is_2fa_enabled ||
+                enrichedSyncedMe.totp_secret !== activePosUser.totp_secret ||
+                JSON.stringify(enrichedSyncedMe.perms) !== JSON.stringify(activePosUser.perms)
+              ) {
+                if (enrichedSyncedMe.is_2fa_enabled && !activePosUser.is_2fa_enabled) {
+                  try { sessionStorage.removeItem(`wd_manager_unlocked_${cleanMe}`); } catch {}
+                }
+                setCurrentPosUser(enrichedSyncedMe);
+              }
             }
           }
         }
 
-        if (remoteFreezeFromPerms !== tablesFrozen) {
+        if (remoteFreezeFromPerms !== tablesFrozenRef.current) {
           setTablesFrozenState(remoteFreezeFromPerms);
           localStorage.setItem('wd_tables_frozen', String(remoteFreezeFromPerms));
         }
@@ -1365,7 +1562,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       const { data: dbCoupons, error: couponErr } = await posClient
         .from('coupons')
         .select('*');
-      if (!couponErr && dbCoupons && !currentPosUser?.is_shadowbanned) {
+      if (!couponErr && dbCoupons && !isShadowbanned) {
         const parsedCoupons: Coupon[] = dbCoupons.map(c => ({
           id: Number(c.id),
           code: c.code,
@@ -1375,15 +1572,19 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           target_product_name: c.target_product_name || undefined,
           is_active: Boolean(c.is_active)
         }));
-        setCoupons(parsedCoupons);
-        localStorage.setItem('wd_coupons', JSON.stringify(parsedCoupons));
+        const couponsSnap = JSON.stringify(parsedCoupons);
+        if (couponsSnap !== cloudSnapshotsRef.current.coupons) {
+          cloudSnapshotsRef.current.coupons = couponsSnap;
+          setCoupons(parsedCoupons);
+          localStorage.setItem('wd_coupons', couponsSnap);
+        }
       }
 
       // 5. Fetch gift cards from Supabase
       const { data: dbGiftCards, error: gcErr } = await posClient
         .from('gift_cards')
         .select('*');
-      if (!gcErr && dbGiftCards && !currentPosUser?.is_shadowbanned) {
+      if (!gcErr && dbGiftCards && !isShadowbanned) {
         const parsedGiftCards: GiftCard[] = dbGiftCards.map(g => ({
           id: Number(g.id),
           code: g.code,
@@ -1391,8 +1592,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           current_balance: Number(g.current_balance),
           is_active: Boolean(g.is_active)
         }));
-        setGiftCards(parsedGiftCards);
-        localStorage.setItem('wd_gift_cards', JSON.stringify(parsedGiftCards));
+        const gcSnap = JSON.stringify(parsedGiftCards);
+        if (gcSnap !== cloudSnapshotsRef.current.giftCards) {
+          cloudSnapshotsRef.current.giftCards = gcSnap;
+          setGiftCards(parsedGiftCards);
+          localStorage.setItem('wd_gift_cards', gcSnap);
+        }
       }
 
       // 6. Fetch pos_settings from Supabase
@@ -1406,8 +1611,6 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       const localOrderStop = localStorage.getItem('wd_order_stop') === 'true';
 
       if (!settingsErr && dbSettings) {
-        // Only update from DB if DB explicitly turns it off AND we didn't just have it active locally,
-        // or just apply DB state but prioritize user's last known 'true' state.
         setOrderStopActive(localOrderStop || Boolean(dbSettings.order_stop_active));
         setPickupClosed(Boolean(dbSettings.pickup_closed));
 
@@ -1439,12 +1642,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
         if (dbSettings.tables_frozen !== undefined) {
           const isFrz = Boolean(dbSettings.tables_frozen);
-          setTablesFrozenState(isFrz);
-          localStorage.setItem('wd_tables_frozen', String(isFrz));
+          if (isFrz !== tablesFrozenRef.current) {
+            setTablesFrozenState(isFrz);
+            localStorage.setItem('wd_tables_frozen', String(isFrz));
+          }
         } else if (dbSettings.news_config && typeof dbSettings.news_config === 'object' && dbSettings.news_config.tables_frozen !== undefined) {
           const isFrz = Boolean(dbSettings.news_config.tables_frozen);
-          setTablesFrozenState(isFrz);
-          localStorage.setItem('wd_tables_frozen', String(isFrz));
+          if (isFrz !== tablesFrozenRef.current) {
+            setTablesFrozenState(isFrz);
+            localStorage.setItem('wd_tables_frozen', String(isFrz));
+          }
         }
 
         if (dbSettings.news_config && typeof dbSettings.news_config === 'object') {
@@ -1453,23 +1660,31 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           let currentNewsCfg: any = null;
           try { if (currentNewsCfgRaw) currentNewsCfg = JSON.parse(currentNewsCfgRaw); } catch {}
 
-          if (!currentNewsCfg || !currentNewsCfg.lastUpdated || (remoteNewsCfg.lastUpdated && remoteNewsCfg.lastUpdated > currentNewsCfg.lastUpdated)) {
-            localStorage.setItem('wd_pickup_news_config_v2', JSON.stringify(remoteNewsCfg));
+          const remoteNewsStr = JSON.stringify(remoteNewsCfg);
+          if (remoteNewsStr !== cloudSnapshotsRef.current.news && (!currentNewsCfg || !currentNewsCfg.lastUpdated || (remoteNewsCfg.lastUpdated && remoteNewsCfg.lastUpdated > currentNewsCfg.lastUpdated))) {
+            cloudSnapshotsRef.current.news = remoteNewsStr;
+            localStorage.setItem('wd_pickup_news_config_v2', remoteNewsStr);
             window.dispatchEvent(new Event('wd_news_config_updated'));
           }
         }
 
         if (dbSettings.custom_news_items && Array.isArray(dbSettings.custom_news_items)) {
-          localStorage.setItem('wd_pickup_custom_items_v2', JSON.stringify(dbSettings.custom_news_items));
-          window.dispatchEvent(new Event('wd_news_config_updated'));
+          const itemsStr = JSON.stringify(dbSettings.custom_news_items);
+          if (localStorage.getItem('wd_pickup_custom_items_v2') !== itemsStr) {
+            localStorage.setItem('wd_pickup_custom_items_v2', itemsStr);
+            window.dispatchEvent(new Event('wd_news_config_updated'));
+          }
         }
 
         if (dbSettings.blocked_devices && Array.isArray(dbSettings.blocked_devices)) {
-          setBlockedDevices(dbSettings.blocked_devices);
-          localStorage.setItem('wd_blocked_devices', JSON.stringify(dbSettings.blocked_devices));
+          const blockedSnap = JSON.stringify(dbSettings.blocked_devices);
+          if (blockedSnap !== cloudSnapshotsRef.current.blocked) {
+            cloudSnapshotsRef.current.blocked = blockedSnap;
+            setBlockedDevices(dbSettings.blocked_devices);
+            localStorage.setItem('wd_blocked_devices', blockedSnap);
+          }
         }
       } else if (!settingsErr && !dbSettings) {
-        // Create initial row if missing
         await posClient.from('pos_settings').insert({ id: 'default', order_stop_active: false, pickup_closed: false });
       }
 
@@ -1481,8 +1696,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         .limit(50);
       if (!cashErr && dbCashReqs) {
         const parsedCashReqs = dbCashReqs.map(formatDbCashRequest);
-        setCashRequests(parsedCashReqs);
-        localStorage.setItem('wd_cash_requests', JSON.stringify(parsedCashReqs));
+        const cashSnap = JSON.stringify(parsedCashReqs);
+        if (cashSnap !== cloudSnapshotsRef.current.cashReqs) {
+          cloudSnapshotsRef.current.cashReqs = cashSnap;
+          setCashRequests(parsedCashReqs);
+          localStorage.setItem('wd_cash_requests', cashSnap);
+        }
       }
 
       // 8. Fetch loyalty_customers from Supabase (for WerkLoyalty cross-terminal sync)
@@ -1517,9 +1736,13 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
             joinedDate: c.joined_date || new Date().toISOString().split('T')[0]
           };
         });
-        localStorage.setItem('wd_loyalty_customers_db', JSON.stringify(parsedLoyalty));
-        localStorage.setItem('wd_loyalty_ts', Date.now().toString());
-        window.dispatchEvent(new Event('wd_loyalty_updated'));
+        const loyaltySnap = JSON.stringify(parsedLoyalty);
+        if (loyaltySnap !== cloudSnapshotsRef.current.loyalty) {
+          cloudSnapshotsRef.current.loyalty = loyaltySnap;
+          localStorage.setItem('wd_loyalty_customers_db', loyaltySnap);
+          localStorage.setItem('wd_loyalty_ts', Date.now().toString());
+          window.dispatchEvent(new Event('wd_loyalty_updated'));
+        }
       }
 
       // 9. Fetch active connected pos_sessions
@@ -1542,7 +1765,11 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           user_agent: String(s.user_agent || 'Browser'),
           last_seen: String(s.last_seen)
         }));
-        setActiveSessions(recent);
+        const sessSnap = JSON.stringify(recent.map(s => `${s.device_id}:${s.user_name}:${s.pos_screen}:${s.app_mode}`));
+        if (sessSnap !== cloudSnapshotsRef.current.sessions) {
+          cloudSnapshotsRef.current.sessions = sessSnap;
+          setActiveSessions(recent);
+        }
       }
 
       setSyncStatus('synced');
@@ -1555,7 +1782,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         setSyncStatus('error');
       }
     }
-  }, [posClient, payClient, currentBankAccount]);
+  }, [posClient, payClient]);
 
   const forceSyncNow = async () => {
     await fetchCloudData(false);
@@ -1576,16 +1803,29 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         console.log("DEBUG: Fetched products from DB:", dbProds?.length || 0);
 
         if (dbProds && dbProds.length >= 1) { // Changed threshold to 1 for safer testing
-          setProducts(dbProds.map(p => ({
-            id: p.id,
-            name: p.name,
-            price: Number(p.price),
-            salePrice: Number(p.sale_price || 0),
-            onSale: Boolean(p.on_sale),
-            cat: p.cat,
-            emoji: p.emoji,
-            inStock: Boolean(p.in_stock)
-          })));
+          let localList: Product[] = [];
+          try {
+            const rawLocal = localStorage.getItem('wd_products');
+            if (rawLocal) localList = JSON.parse(rawLocal);
+          } catch {}
+          setProducts(dbProds.map(p => {
+            const defP = ALL_DEFAULT_PRODUCTS.find(d => d.id === p.id);
+            const locP = localList.find(l => l.id === p.id);
+            return {
+              id: p.id,
+              name: p.name,
+              price: Number(p.price),
+              salePrice: Number(p.sale_price || 0),
+              onSale: Boolean(p.on_sale),
+              cat: p.cat,
+              emoji: p.emoji,
+              inStock: Boolean(p.in_stock),
+              options: p.options || locP?.options || defP?.options,
+              brand: p.brand || locP?.brand || defP?.brand,
+              recipe: p.recipe || locP?.recipe || defP?.recipe,
+              recipeDescription: p.recipe_description || locP?.recipeDescription || defP?.recipeDescription
+            };
+          }));
           console.log("DEBUG: Successfully set products from DB");
         } else {
           console.log("DEBUG: No products found, upserting defaults...");
@@ -1614,15 +1854,17 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     initProducts();
   }, [posClient]);
 
-  // Continuous Adaptive Polling (every 3 seconds) + Focus/Visibility refresh
+  // Continuous Adaptive Polling (pauses when tab hidden, slower when Realtime WebSocket is live)
   useEffect(() => {
     if (!posClient) return;
 
     fetchCloudData(false);
 
+    const pollMs = isRealtimeActive ? 15000 : 6000;
     const intervalId = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       fetchCloudData(true);
-    }, 5000);
+    }, pollMs);
 
     const onVisibilityOrFocus = () => {
       if (document.visibilityState === 'visible') {
@@ -1638,13 +1880,14 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       document.removeEventListener('visibilitychange', onVisibilityOrFocus);
       window.removeEventListener('focus', onVisibilityOrFocus);
     };
-  }, [fetchCloudData, posClient]);
+  }, [fetchCloudData, posClient, isRealtimeActive]);
 
-  // Active Device Heartbeat to pos_sessions
+  // Active Device Heartbeat to pos_sessions (lightweight 12s heartbeat, skips hidden tabs)
   useEffect(() => {
     if (!posClient || !deviceId) return;
 
     const sendHeartbeat = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       try {
         const userLabel = currentPosUser
           ? `${currentPosUser.name} (@${currentPosUser.username})`
@@ -1665,13 +1908,13 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           user_agent: deviceType,
           last_seen: new Date().toISOString()
         });
-      } catch (e) {
+      } catch {
         // silent
       }
     };
 
     sendHeartbeat();
-    const interval = setInterval(sendHeartbeat, 5000);
+    const interval = setInterval(sendHeartbeat, 12000);
     return () => clearInterval(interval);
   }, [posClient, deviceId, clientIp, currentPosUser, currentBankAccount, appMode, posScreen]);
 
@@ -1686,6 +1929,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     let gcChannel: any = null;
     let settingsChannel: any = null;
     let cashReqChannel: any = null;
+    let broadcastChannelRef: any = null;
 
     try {
       // 1. Orders Realtime
@@ -1774,19 +2018,30 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           (payload) => {
             if (!isMounted) return;
             if (payload.eventType === 'UPDATE' || payload.eventType === 'INSERT') {
-              const acc = payload.new as BankAccount;
+              const rawAcc = payload.new as any;
+              const parsedLinked = rawAcc.linked_uids !== undefined ? parseLinkedUids(rawAcc.linked_uids) : undefined;
               setBankAccounts(prev => {
-                const idx = prev.findIndex(a => a.id === acc.id || a.username.toLowerCase() === acc.username.toLowerCase());
+                const idx = prev.findIndex(a => a.id === rawAcc.id || a.username.toLowerCase() === String(rawAcc.username || '').toLowerCase());
                 if (idx !== -1) {
                   const copy = [...prev];
-                  copy[idx] = { ...copy[idx], ...acc };
+                  copy[idx] = {
+                    ...copy[idx],
+                    ...rawAcc,
+                    balance: Number(rawAcc.balance ?? copy[idx].balance),
+                    linked_uids: parsedLinked !== undefined ? parsedLinked : (copy[idx].linked_uids || [])
+                  };
                   return copy;
                 }
-                return [...prev, acc];
+                return [...prev, { ...rawAcc, balance: Number(rawAcc.balance || 0), linked_uids: parsedLinked || [] }];
               });
               setCurrentBankAccount(prev => {
-                if (prev && (prev.id === acc.id || prev.username.toLowerCase() === acc.username.toLowerCase())) {
-                  return { ...prev, balance: Number(acc.balance) };
+                if (prev && (prev.id === rawAcc.id || prev.username.toLowerCase() === String(rawAcc.username || '').toLowerCase())) {
+                  return {
+                    ...prev,
+                    balance: Number(rawAcc.balance ?? prev.balance),
+                    card_uid: rawAcc.card_uid ?? prev.card_uid,
+                    linked_uids: parsedLinked !== undefined ? parsedLinked : prev.linked_uids
+                  };
                 }
                 return prev;
               });
@@ -1994,6 +2249,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
       // 8. Global Announcement Broadcast Channel
       const broadcastChannel = posClient.channel('global_audio_broadcast');
+      broadcastChannelRef = broadcastChannel;
       broadcastChannel
         .on('broadcast', { event: 'speak_order' }, (payload: any) => {
           if (!isMounted) return;
@@ -2076,11 +2332,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       if (gcChannel && posClient) posClient.removeChannel(gcChannel);
       if (settingsChannel && posClient) posClient.removeChannel(settingsChannel);
       if (cashReqChannel && posClient) posClient.removeChannel(cashReqChannel);
-      if (posClient) {
-        try {
-          posClient.channel('global_audio_broadcast').unsubscribe();
-        } catch {}
-      }
+      if (broadcastChannelRef && posClient) posClient.removeChannel(broadcastChannelRef);
     };
   }, [posClient, payClient]);
 
@@ -2325,7 +2577,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   // Process Checkout (POS + WerkPay)
   const processCheckout = async (
     method: 'workpay' | 'cash' | 'giftcard',
-    orderType: 'dine_in' | 'takeaway',
+    orderType: 'dine_in' | 'takeaway' | 'delivery',
     identifier: string,
     paymentMeta: any
   ): Promise<{ success: boolean; message: string; order?: Order }> => {
@@ -2401,7 +2653,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           } catch {}
         }
       } else if (mode === 'card' || mode === 'terminal') {
-        const cleanUid = String(paymentMeta.cardUid || '').replace(/\s+/g, '').toUpperCase();
+        const cleanUid = normalizeCardUid(paymentMeta.cardUid);
         const pin = String(paymentMeta.pin || '').trim();
         if (!cleanUid) {
           return { success: false, message: 'Geen pasnummer of RFID/NFC kaart gescand!' };
@@ -2411,30 +2663,42 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
 
         chargedAccount = bankAccounts.find(a => {
-          const aUid = String(a.card_uid || '').replace(/\s+/g, '').toUpperCase();
-          const matchUid = (aUid === cleanUid) || (a.username.toUpperCase() === cleanUid);
+          const matchUid = accountMatchesUid(a, cleanUid);
           const matchPin = (a.pin_code === pin || a.password === pin);
           return matchUid && matchPin;
         }) || null;
 
-        // Try Supabase if not found locally
+        // Try Supabase if not found locally (supports spaces, casing & linked_uids)
         if (!chargedAccount && targetClient) {
           try {
-            const { data } = await targetClient
+            const { data: allDbAccs } = await targetClient
               .from('bank_accounts')
-              .select('*')
-              .ilike('card_uid', `%${cleanUid}%`)
-              .or(`pin_code.eq.${pin},password.eq.${pin}`)
-              .single();
-            if (data) {
+              .select('*');
+            const matchedRow = (allDbAccs || []).find((row: any) => {
+              const candidate: BankAccount = {
+                id: row.id,
+                username: row.username,
+                account_holder: row.account_holder,
+                card_uid: row.card_uid,
+                linked_uids: parseLinkedUids(row.linked_uids),
+                pin_code: row.pin_code,
+                password: row.password,
+                balance: Number(row.balance),
+                is_admin: Boolean(row.is_admin)
+              };
+              const matchPin = candidate.pin_code === pin || candidate.password === pin;
+              return matchPin && accountMatchesUid(candidate, cleanUid);
+            });
+            if (matchedRow) {
               chargedAccount = {
-                id: data.id,
-                username: data.username,
-                account_holder: data.account_holder,
-                card_uid: data.card_uid,
-                pin_code: data.pin_code,
-                balance: Number(data.balance),
-                is_admin: Boolean(data.is_admin)
+                id: matchedRow.id,
+                username: matchedRow.username,
+                account_holder: matchedRow.account_holder,
+                card_uid: matchedRow.card_uid,
+                linked_uids: parseLinkedUids(matchedRow.linked_uids),
+                pin_code: matchedRow.pin_code,
+                balance: Number(matchedRow.balance),
+                is_admin: Boolean(matchedRow.is_admin)
               };
             }
           } catch {}
@@ -2464,7 +2728,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       // Determine brand for proper transaction logging
       const currentBrandKey = activeBrand || 'koekploeg';
       const isKoekploegBrand = currentBrandKey === 'koekploeg';
-      const brandName = isKoekploegBrand ? 'De Koekploeg' : 'Werkdonalds';
+      const brandName = isKoekploegBrand ? 'De Koekploeg' : 'WerkPay';
       const toMerchant = `${brandName} Kassa`;
       const txLabel = `${brandName} Bestelling #${orderNo}`;
 
@@ -2487,7 +2751,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         try {
           if (mode === 'card' || mode === 'terminal') {
             await targetClient.rpc('werkpay_charge_by_card', {
-              p_card_uid: paymentMeta.cardUid,
+              p_card_uid: chargedAccount.card_uid || paymentMeta.cardUid,
               p_pin: paymentMeta.pin,
               p_amount: finalTotal,
               p_reference: `${isKoekploegBrand ? 'KP' : 'WD'}-ORD-${orderNo}`,
@@ -3156,6 +3420,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: false, message: `Ongeldige gebruikersnaam of ${mode === 'pin' ? 'pincode' : 'wachtwoord'}.` };
     }
 
+    // Normale WerkPay login vraagt geen 2FA; 2FA wordt alleen gevraagd bij toegang tot het Manager Menu.
+    setPending2FALogin(null);
     setCurrentBankAccount(acc);
     return { success: true, message: `Welkom terug, ${acc.account_holder}!` };
   };
@@ -3382,9 +3648,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     if (!currentBankAccount) return { success: false, message: 'Niet ingelogd bij WerkPay.' };
     if (amount <= 0) return { success: false, message: 'Ongeldig bedrag.' };
 
-    const cleanQuery = to.trim().toLowerCase();
+    const cleanQuery = to.trim();
     const recipient = bankAccounts.find(
-      a => a.username.toLowerCase() === cleanQuery || a.card_uid.replace(/\s+/g, '') === cleanQuery.replace(/\s+/g, '')
+      a => accountMatchesUid(a, cleanQuery)
     );
 
     if (!recipient) {
@@ -3461,91 +3727,228 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     return { success: true, message: 'Pincode succesvol gewijzigd!' };
   };
 
-  const saveBankAccount = async (acc: Partial<BankAccount> & { id?: number | string }) => {
-    let updatedAcc: BankAccount | null = null;
-    if (acc.id) {
-      setBankAccounts(prev => {
-        const next = prev.map(a => {
-          if (a.id === acc.id) {
-            updatedAcc = { ...a, ...acc } as BankAccount;
-            return updatedAcc;
-          }
-          return a;
-        });
-        return next;
-      });
-      if (currentBankAccount && currentBankAccount.id === acc.id) {
-        setCurrentBankAccount(prev => prev ? { ...prev, ...acc } as BankAccount : null);
-      }
+  const saveBankAccount = async (
+    acc: Partial<BankAccount> & { id?: number | string }
+  ): Promise<{ success: boolean; message?: string }> => {
+    const cleanTargetUsername = acc.username ? acc.username.trim().toLowerCase() : '';
+    const existingAcc = bankAccounts.find(
+      a => (acc.id !== undefined && a.id === acc.id) || (cleanTargetUsername && a.username.toLowerCase() === cleanTargetUsername)
+    );
 
-      // Sync with Supabase
-      if (shouldBlockTableWrite(`Bankrekening @${(updatedAcc as BankAccount)?.username || acc.username} bewerken`)) return;
-      const client = payClient || posClient;
-      if (client && updatedAcc) {
-        try {
-          const dbPayload = {
-            username: (updatedAcc as BankAccount).username,
-            account_holder: (updatedAcc as BankAccount).account_holder,
-            card_uid: (updatedAcc as BankAccount).card_uid,
-            pin_code: (updatedAcc as BankAccount).pin_code,
-            balance: Number((updatedAcc as BankAccount).balance),
-            is_admin: Boolean((updatedAcc as BankAccount).is_admin)
-          };
-          if (typeof (updatedAcc as BankAccount).id === 'number' && ((updatedAcc as BankAccount).id as number) < 10000000000) {
-            await client.from('bank_accounts').update(dbPayload).eq('id', (updatedAcc as BankAccount).id);
-          } else {
-            await client.from('bank_accounts').update(dbPayload).eq('username', (updatedAcc as BankAccount).username);
-          }
-        } catch {}
-      }
+    const normalizeAccountUidField = (raw?: string): string => {
+      const trimmed = String(raw || '').trim();
+      if (!trimmed) return generateVirtualCardUid();
+      return isVirtualCardNumber(trimmed)
+        ? normalizeCardUid(trimmed).replace(/(.{4})/g, '$1 ').trim()
+        : normalizeCardUid(trimmed);
+    };
+
+    const client = payClient || posClient;
+    let nextAccounts: BankAccount[] = [...bankAccounts];
+    let savedRecord: BankAccount;
+
+    if (existingAcc) {
+      const mergedCardUid =
+        acc.card_uid !== undefined ? normalizeAccountUidField(acc.card_uid) : existingAcc.card_uid;
+      const mergedLinkedUids: LinkedNfcTag[] =
+        acc.linked_uids !== undefined
+          ? parseLinkedUids(acc.linked_uids)
+          : parseLinkedUids(existingAcc.linked_uids || []);
+
+      savedRecord = {
+        ...existingAcc,
+        ...acc,
+        id: existingAcc.id,
+        card_uid: mergedCardUid,
+        linked_uids: mergedLinkedUids,
+      };
     } else {
-      const newAcc: BankAccount = {
+      const newCardUid = normalizeAccountUidField(acc.card_uid);
+      const newLinkedUids = parseLinkedUids(acc.linked_uids || []);
+      savedRecord = {
         id: Date.now(),
-        username: acc.username || `klant_${Date.now()}`,
+        username: acc.username?.trim() || `klant_${Date.now()}`,
         password: acc.password || '1234',
-        account_holder: acc.account_holder || 'Nieuwe Klant',
-        card_uid: acc.card_uid || `4000 ${Math.floor(1000 + Math.random() * 9000)} ${Math.floor(1000 + Math.random() * 9000)} ${Math.floor(1000 + Math.random() * 9000)}`,
+        account_holder: acc.account_holder?.trim() || 'Nieuwe Klant',
+        card_uid: newCardUid,
+        linked_uids: newLinkedUids,
         pin_code: acc.pin_code || '1234',
         balance: Number(acc.balance || 0),
-        is_admin: Boolean(acc.is_admin)
+        is_admin: Boolean(acc.is_admin),
       };
-      setBankAccounts(prev => [...prev, newAcc]);
-
-      // Sync with Supabase
-      if (shouldBlockTableWrite(`Nieuwe bankrekening @${newAcc.username} aanmaken`)) return;
-      const client = payClient || posClient;
-      if (client) {
-        try {
-          const { data, error } = await client.from('bank_accounts').insert({
-            username: newAcc.username,
-            password: newAcc.password,
-            account_holder: newAcc.account_holder,
-            card_uid: newAcc.card_uid,
-            pin_code: newAcc.pin_code,
-            balance: newAcc.balance,
-            is_admin: newAcc.is_admin
-          }).select('*');
-          if (!error && data && data.length > 0) {
-            const dbAcc = data[0];
-            setBankAccounts(prev => prev.map(a => a.username === newAcc.username ? { ...a, id: dbAcc.id } : a));
-          }
-        } catch {}
-      }
     }
-    // Sync cross-tab
-    setTimeout(() => {
-      broadcastSync('SYNC_BANK_ACCOUNTS', bankAccounts);
-    }, 200);
+
+    // Verzamel alle UID's van dit account om eventuele dubbele koppelingen bij andere accounts netjes over te zetten
+    const claimedPhysicalUids = new Set<string>();
+    const primClean = normalizeCardUid(savedRecord.card_uid);
+    if (primClean && !isVirtualCardNumber(primClean)) claimedPhysicalUids.add(primClean);
+    for (const tag of savedRecord.linked_uids || []) {
+      if (tag.uid) claimedPhysicalUids.add(tag.uid);
+    }
+
+    const displacedAccounts: BankAccount[] = [];
+    nextAccounts = nextAccounts.map((other) => {
+      if (other.id === savedRecord.id || other.username.toLowerCase() === savedRecord.username.toLowerCase()) {
+        return other;
+      }
+      let changed = false;
+      let nextOtherCard = other.card_uid;
+      if (claimedPhysicalUids.has(normalizeCardUid(other.card_uid))) {
+        nextOtherCard = generateVirtualCardUid();
+        changed = true;
+      }
+      const otherTags = parseLinkedUids(other.linked_uids || []);
+      const filteredTags = otherTags.filter((t) => !claimedPhysicalUids.has(t.uid));
+      if (filteredTags.length !== otherTags.length) {
+        changed = true;
+      }
+      if (!changed) return other;
+      const updatedOther: BankAccount = { ...other, card_uid: nextOtherCard, linked_uids: filteredTags };
+      displacedAccounts.push(updatedOther);
+      return updatedOther;
+    });
+
+    if (existingAcc) {
+      nextAccounts = nextAccounts.map((a) =>
+        a.id === savedRecord.id || a.username.toLowerCase() === savedRecord.username.toLowerCase()
+          ? savedRecord
+          : a
+      );
+    } else {
+      nextAccounts = [...nextAccounts, savedRecord];
+    }
+
+    // Direct React state + localStorage + cross-tab bijwerken (GEEN async updater bug!)
+    setBankAccounts(nextAccounts);
+    if (
+      currentBankAccount &&
+      (currentBankAccount.id === savedRecord.id ||
+        currentBankAccount.username.toLowerCase() === savedRecord.username.toLowerCase())
+    ) {
+      setCurrentBankAccount(savedRecord);
+    }
+    try {
+      const snap = JSON.stringify(nextAccounts);
+      cloudSnapshotsRef.current.bank = snap;
+      localStorage.setItem('wd_bank_accounts', snap);
+    } catch {}
+    broadcastSync('SYNC_BANK_ACCOUNTS', nextAccounts);
+
+    const actionLabel = existingAcc
+      ? `Bankrekening @${savedRecord.username} bewerken`
+      : `Nieuwe bankrekening @${savedRecord.username} aanmaken`;
+    if (shouldBlockTableWrite(actionLabel)) {
+      return { success: false, message: 'Tabellen zijn vergrendeld (freeze modus).' };
+    }
+
+    if (!client) {
+      return { success: true, message: 'Lokaal opgeslagen (offline modus).' };
+    }
+
+    // Helper voor veilige Supabase write (valt terug zonder linked_uids als oude SQL nog draait)
+    const persistAccountToSupabase = async (record: BankAccount, isInsert: boolean) => {
+      const basePayload: Record<string, any> = {
+        username: record.username,
+        account_holder: record.account_holder,
+        card_uid: record.card_uid,
+        pin_code: record.pin_code || '1234',
+        balance: Number(record.balance || 0),
+        is_admin: Boolean(record.is_admin),
+      };
+      if (record.password) basePayload.password = record.password;
+
+      const withLinkedPayload = {
+        ...basePayload,
+        linked_uids: parseLinkedUids(record.linked_uids || []),
+      };
+
+      const runWrite = async (payload: Record<string, any>) => {
+        if (isInsert) {
+          return await client.from('bank_accounts').insert({
+            ...payload,
+            password: record.password || '1234',
+          }).select('*');
+        }
+        if (typeof record.id === 'number' && record.id < 10000000000) {
+          const res = await client.from('bank_accounts').update(payload).eq('id', record.id).select('*');
+          if (!res.error && (!res.data || res.data.length === 0)) {
+            return await client.from('bank_accounts').update(payload).ilike('username', record.username).select('*');
+          }
+          return res;
+        }
+        return await client.from('bank_accounts').update(payload).ilike('username', record.username).select('*');
+      };
+
+      let res = await runWrite(withLinkedPayload);
+      if (
+        res.error &&
+        (String(res.error.code) === 'PGRST204' ||
+          String(res.error.code) === '42703' ||
+          String(res.error.message || '').toLowerCase().includes('linked_uids'))
+      ) {
+        res = await runWrite(basePayload);
+      }
+      return res;
+    };
+
+    try {
+      // 1. Eerst oude houders van dezelfde fysieke UID vrijmaken in Supabase om UNIQUE conflicten te voorkomen
+      for (const oldAcc of displacedAccounts) {
+        await persistAccountToSupabase(oldAcc, false);
+      }
+
+      // 2. Daarna het doelaccount opslaan (insert of update)
+      const res = await persistAccountToSupabase(savedRecord, !existingAcc);
+      if (res.error) {
+        console.error('Supabase saveBankAccount error:', res.error);
+        showToast(`Fout bij opslaan naar Supabase: ${res.error.message}`, 'error');
+        return { success: false, message: res.error.message };
+      }
+
+      if (res.data && res.data.length > 0) {
+        const dbRow = res.data[0];
+        setBankAccounts((prev) => {
+          const synced = prev.map((a) =>
+            a.username.toLowerCase() === savedRecord.username.toLowerCase()
+              ? {
+                  ...a,
+                  id: dbRow.id,
+                  card_uid: dbRow.card_uid ?? a.card_uid,
+                  linked_uids: dbRow.linked_uids !== undefined ? parseLinkedUids(dbRow.linked_uids) : a.linked_uids,
+                }
+              : a
+          );
+          try {
+            const snap = JSON.stringify(synced);
+            cloudSnapshotsRef.current.bank = snap;
+            localStorage.setItem('wd_bank_accounts', snap);
+          } catch {}
+          return synced;
+        });
+      }
+
+      return { success: true, message: 'Opgeslagen in Supabase & lokaal.' };
+    } catch (err: any) {
+      console.error('Unexpected saveBankAccount error:', err);
+      showToast(`Kon bankaccount/UID niet opslaan: ${err?.message || 'onbekende fout'}`, 'error');
+      return { success: false, message: err?.message || 'Opslaan mislukt' };
+    }
   };
 
   const deleteBankAccount = async (id: number | string) => {
     const accountToDelete = bankAccounts.find(a => a.id === id);
     if (!accountToDelete) return;
 
-    setBankAccounts(prev => prev.filter(a => a.id !== id));
+    const remainingAccounts = bankAccounts.filter(a => a.id !== id);
+    setBankAccounts(remainingAccounts);
     if (currentBankAccount && currentBankAccount.id === id) {
       setCurrentBankAccount(null);
     }
+    try {
+      const snap = JSON.stringify(remainingAccounts);
+      cloudSnapshotsRef.current.bank = snap;
+      localStorage.setItem('wd_bank_accounts', snap);
+    } catch {}
 
     if (shouldBlockTableWrite(`Bankrekening @${accountToDelete.username} verwijderen`)) return;
 
@@ -3559,10 +3962,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       } catch {}
     }
-    // Sync cross-tab
-    setTimeout(() => {
-      broadcastSync('SYNC_BANK_ACCOUNTS', bankAccounts.filter(a => a.id !== id));
-    }, 200);
+    broadcastSync('SYNC_BANK_ACCOUNTS', remainingAccounts);
   };
 
   const quickMoneyAccount = async (id: number | string, delta: number) => {
@@ -3578,6 +3978,51 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   };
 
   // POS Auth
+  const finalizeOrChallengePosLogin = async (candidateUser: PosUser, keepPickupControl = true): Promise<{ success: boolean; message: string }> => {
+    const cleanU = candidateUser.username.trim().toLowerCase();
+    try {
+      sessionStorage.removeItem(`wd_manager_unlocked_${cleanU}`);
+    } catch {}
+
+    const posMatch = posUsers.find(u => u.username.toLowerCase() === cleanU);
+    const bankMatch = bankAccounts.find(a => a.username.toLowerCase() === cleanU);
+
+    let is2faEnabled = Boolean(
+      (candidateUser.is_2fa_enabled && candidateUser.totp_secret) ||
+      (posMatch?.is_2fa_enabled && posMatch?.totp_secret) ||
+      (bankMatch?.is_2fa_enabled && bankMatch?.totp_secret)
+    );
+    let totpSecret = candidateUser.totp_secret || posMatch?.totp_secret || bankMatch?.totp_secret || '';
+    let backupCodes =
+      (candidateUser.backup_codes && candidateUser.backup_codes.length > 0 ? candidateUser.backup_codes : undefined) ||
+      (posMatch?.backup_codes && posMatch.backup_codes.length > 0 ? posMatch.backup_codes : undefined) ||
+      bankMatch?.backup_codes ||
+      [];
+
+    if (!is2faEnabled || !totpSecret) {
+      const live2FA = await resolveUser2FACredentials(cleanU);
+      if (live2FA?.is_2fa_enabled && live2FA.totp_secret) {
+        is2faEnabled = true;
+        totpSecret = live2FA.totp_secret;
+        if (live2FA.backup_codes.length > 0) backupCodes = live2FA.backup_codes;
+      }
+    }
+
+    const enrichedUser: PosUser = {
+      ...candidateUser,
+      is_2fa_enabled: Boolean(is2faEnabled && totpSecret),
+      totp_secret: totpSecret || undefined,
+      backup_codes: backupCodes
+    };
+
+    // Normale POS-login gaat direct door zonder 2FA; het Manager Menu vraagt wel consequent om 2FA zodra dit aanstaat.
+    setPending2FALogin(null);
+    setCurrentPosUser(enrichedUser);
+    setPosUsers(prev => [enrichedUser, ...prev.filter(u => u.username.toLowerCase() !== cleanU)]);
+    setPosScreen(prev => (keepPickupControl && prev === 'pickup_control' ? 'pickup_control' : 'kassa'));
+    return { success: true, message: `Welkom, ${enrichedUser.name}!` };
+  };
+
   const loginPos = async (username: string, pass: string): Promise<{ success: boolean; message: string }> => {
     const cleanU = username.trim().toLowerCase();
     const cleanPass = pass.trim();
@@ -3601,38 +4046,25 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     // 1. Check live in Supabase pos_users table first
     if (posClient) {
       try {
-        console.log('Login attempt: Checking Supabase pos_users for', cleanU);
         const { data, error } = await posClient
           .from('pos_users')
           .select('*')
           .ilike('username', cleanU)
           .single();
 
-        if (error) {
-          console.warn('Supabase pos_users login fetch error:', error);
-        }
-
         if (data && !error) {
-          console.log('Login attempt: User found in Supabase pos_users');
           const parsedDbUser = parsePosUserFromDb(data);
           if (parsedDbUser.is_banned || parsedDbUser.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
             logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
             return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
           }
           if (data.password === cleanPass || data.password === pass) {
-            setCurrentPosUser(parsedDbUser);
-            setPosScreen('kassa');
-            setPosUsers(prev => [parsedDbUser, ...prev.filter(u => u.username.toLowerCase() !== cleanU)]);
-            return { success: true, message: `Welkom, ${parsedDbUser.name}!` };
-          } else {
-            console.warn('Login attempt: Supabase pos_users found user, but password mismatch');
+            return await finalizeOrChallengePosLogin(parsedDbUser);
           }
         }
       } catch (err) {
         console.warn('Supabase pos_users login error:', err);
       }
-    } else {
-      console.warn('Login attempt: posClient is null');
     }
 
     // 2. Check live in Supabase bank_accounts (if changed there)
@@ -3662,6 +4094,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
               id: typeof bankData.id === 'number' ? bankData.id : Date.now(),
               name: bankData.account_holder,
               username: bankData.username,
+              password: bankData.password,
               perms: matchingPosRecord?.perms || (bankData.is_admin 
                 ? ['pos', 'kitchen', 'pickup', 'voorraad', 'manager', 'medewerkers', 'producten', 'coupons_giftcards', 'cash_pay']
                 : ['pos', 'pickup']),
@@ -3669,11 +4102,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
               is_shadowbanned: Boolean(bankData.is_shadowbanned || matchingPosRecord?.is_shadowbanned),
               is_2fa_enabled: Boolean(bankData.is_2fa_enabled || matchingPosRecord?.is_2fa_enabled),
               totp_secret: bankData.totp_secret || matchingPosRecord?.totp_secret,
-              backup_codes: bankData.backup_codes || matchingPosRecord?.backup_codes
+              backup_codes: bankData.backup_codes || matchingPosRecord?.backup_codes,
+              theme: matchingPosRecord?.theme
             };
-            setCurrentPosUser(bankUser);
-            setPosScreen('kassa');
-            return { success: true, message: `Welkom, ${bankUser.name}!` };
+            return await finalizeOrChallengePosLogin(bankUser);
           }
         }
       } catch (err) {
@@ -3691,9 +4123,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
         return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
       }
-      setCurrentPosUser(user);
-      setPosScreen('kassa');
-      return { success: true, message: `Welkom, ${user.name}!` };
+      return await finalizeOrChallengePosLogin(user);
     }
 
     // 4. Try local Bank Accounts
@@ -3701,39 +4131,41 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       a => a.username.toLowerCase() === cleanU && (a.password === cleanPass || a.pin_code === cleanPass)
     );
     if (bankAcc) {
+      const matchingPosRecord = posUsers.find(u => u.username.toLowerCase() === cleanU);
       const bankUser: PosUser = {
         id: typeof bankAcc.id === 'number' ? bankAcc.id : Date.now(),
         name: bankAcc.account_holder,
         username: bankAcc.username,
-        perms: bankAcc.is_admin 
+        password: bankAcc.password,
+        perms: matchingPosRecord?.perms || (bankAcc.is_admin 
           ? ['pos', 'kitchen', 'pickup', 'voorraad', 'manager', 'medewerkers', 'producten', 'coupons_giftcards', 'cash_pay']
-          : ['pos', 'pickup'],
+          : ['pos', 'pickup']),
         is_admin: bankAcc.is_admin,
-        is_2fa_enabled: Boolean(bankAcc.is_2fa_enabled),
-        totp_secret: bankAcc.totp_secret,
-        backup_codes: bankAcc.backup_codes
+        is_2fa_enabled: Boolean(bankAcc.is_2fa_enabled || matchingPosRecord?.is_2fa_enabled),
+        totp_secret: bankAcc.totp_secret || matchingPosRecord?.totp_secret,
+        backup_codes: bankAcc.backup_codes || matchingPosRecord?.backup_codes,
+        theme: matchingPosRecord?.theme
       };
-      setCurrentPosUser(bankUser);
-      setPosScreen('kassa');
-      return { success: true, message: `Welkom, ${bankUser.name}!` };
+      return await finalizeOrChallengePosLogin(bankUser);
     }
 
     // 5. Manager / Joas PIN fallback
     if ((cleanU === 'manager' || cleanU === 'admin' || cleanU === 'joas') && (cleanPass === '1234' || cleanPass === 'admin123' || cleanPass === '0000')) {
       const matchedLocal = posUsers.find(u => u.username.toLowerCase() === 'joas');
+      const matchedBank = bankAccounts.find(a => a.username.toLowerCase() === 'joas');
       const managerUser: PosUser = {
         id: matchedLocal?.id || 1,
         name: matchedLocal?.name || 'Joas Thorig',
         username: 'joas',
+        password: matchedLocal?.password || cleanPass,
         perms: ['pos', 'kitchen', 'pickup', 'voorraad', 'manager', 'medewerkers', 'producten', 'coupons_giftcards', 'cash_pay'],
         is_admin: true,
-        is_2fa_enabled: Boolean(matchedLocal?.is_2fa_enabled),
-        totp_secret: matchedLocal?.totp_secret || '',
-        backup_codes: matchedLocal?.backup_codes || []
+        is_2fa_enabled: Boolean(matchedLocal?.is_2fa_enabled || matchedBank?.is_2fa_enabled),
+        totp_secret: matchedLocal?.totp_secret || matchedBank?.totp_secret || '',
+        backup_codes: matchedLocal?.backup_codes || matchedBank?.backup_codes || [],
+        theme: matchedLocal?.theme
       };
-      setCurrentPosUser(managerUser);
-      setPosScreen('kassa');
-      return { success: true, message: 'Welkom, Joas!' };
+      return await finalizeOrChallengePosLogin(managerUser);
     }
 
     return { success: false, message: 'Onjuiste gebruikersnaam of wachtwoord! Controleer je invoer.' };
@@ -3748,6 +4180,13 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   };
 
   const logoutPos = () => {
+    try {
+      Object.keys(sessionStorage).forEach(k => {
+        if (k.startsWith('wd_manager_unlocked_')) {
+          sessionStorage.removeItem(k);
+        }
+      });
+    } catch {}
     setCurrentPosUser(null);
     sessionStorage.removeItem('wd_pos_user');
     setAppMode('pos');
@@ -3930,15 +4369,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
   const resetProductsToDefault = () => {
     if (shouldBlockTableWrite('Menulijst resetten')) {
-      setProducts(DEFAULT_PRODUCTS);
+      setProducts(ALL_DEFAULT_PRODUCTS);
       return;
     }
     saveDisasterRecoverySnapshot();
-    localStorage.setItem('wd_products', JSON.stringify(DEFAULT_PRODUCTS));
-    localStorage.setItem('wd_products_version', 'v6_werk_only_138');
-    setProducts(DEFAULT_PRODUCTS);
+    localStorage.setItem('wd_products', JSON.stringify(ALL_DEFAULT_PRODUCTS));
+    localStorage.setItem('wd_products_version', 'v8_koekploeg_and_werkpay');
+    setProducts(ALL_DEFAULT_PRODUCTS);
     if (posClient) {
-      const rows = DEFAULT_PRODUCTS.map(p => ({
+      const rows = ALL_DEFAULT_PRODUCTS.map(p => ({
         id: p.id,
         name: p.name,
         price: p.price,
@@ -3948,8 +4387,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         emoji: p.emoji,
         in_stock: p.inStock
       }));
-      posClient.from('products').upsert(rows).catch(err => {
-        console.error('Supabase sync error on reset:', err);
+      posClient.from('products').upsert(rows).then(({ error }) => {
+        if (error) console.error('Supabase sync error on reset:', error);
       });
     }
   };
@@ -3964,16 +4403,29 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       const { data, error } = await posClient.from('products').select('*').order('id', { ascending: true });
       if (error) throw error;
       if (data && data.length > 0) {
-        const parsed = data.map(p => ({
-          id: p.id,
-          name: p.name,
-          price: Number(p.price),
-          salePrice: Number(p.sale_price || 0),
-          onSale: Boolean(p.on_sale),
-          cat: p.cat,
-          emoji: p.emoji,
-          inStock: Boolean(p.in_stock)
-        }));
+        let localList: Product[] = [];
+        try {
+          const rawLocal = localStorage.getItem('wd_products');
+          if (rawLocal) localList = JSON.parse(rawLocal);
+        } catch {}
+        const parsed = data.map(p => {
+          const defP = ALL_DEFAULT_PRODUCTS.find(d => d.id === p.id);
+          const locP = localList.find(l => l.id === p.id);
+          return {
+            id: p.id,
+            name: p.name,
+            price: Number(p.price),
+            salePrice: Number(p.sale_price || 0),
+            onSale: Boolean(p.on_sale),
+            cat: p.cat,
+            emoji: p.emoji,
+            inStock: Boolean(p.in_stock),
+            options: p.options || locP?.options || defP?.options,
+            brand: p.brand || locP?.brand || defP?.brand,
+            recipe: p.recipe || locP?.recipe || defP?.recipe,
+            recipeDescription: p.recipe_description || locP?.recipeDescription || defP?.recipeDescription
+          };
+        });
         setProducts(parsed);
         localStorage.setItem('wd_products', JSON.stringify(parsed));
         showToast(`📦 ${data.length} producten succesvol gesynchroniseerd met online database!`, 'success');

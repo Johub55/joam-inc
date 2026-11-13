@@ -1,9 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro, formatCardUid } from '../../services/store';
 import { CashApprovalModal } from './CashApprovalModal';
 import { DiyTerminalModal } from './DiyTerminalModal';
 import { terminalManager, TerminalCallbacks } from '../../services/terminalService';
+import {
+  setHardwareTerminalPayMode,
+  setHardwareTerminalResult,
+  setHardwareTerminalIdle,
+  subscribeHardwareTerminal,
+} from '../../services/firebase';
 import { CashPaymentRequest } from '../../types';
 import { 
   LoyaltyCustomer, 
@@ -36,7 +42,8 @@ import {
   Star,
   Award,
   Search,
-  UserPlus
+  UserPlus,
+  Receipt
 } from 'lucide-react';
 
 interface PaymentModalProps {
@@ -102,6 +109,8 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   const [showDiyTerminalModal, setShowDiyTerminalModal] = useState<boolean>(false);
   const [terminalConnected, setTerminalConnected] = useState<boolean>(terminalManager.getIsConnected());
   const [terminalWaitingCard, setTerminalWaitingCard] = useState<boolean>(false);
+  const [terminalCloudWaiting, setTerminalCloudWaiting] = useState<boolean>(false);
+  const handledCloudSubmitRef = useRef<string>('');
 
   // Feedback & Loading
   const [errorMessage, setErrorMessage] = useState<string>('');
@@ -166,7 +175,37 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   const activeBal = currentBankAccount ? (currentBankAccount.is_admin ? 999999 : currentBankAccount.balance) : 0;
   const hasEnoughQuickBalance = activeBal >= finalTotal;
 
-  // Listen to DIY Pinapparaat callbacks
+  const executeTerminalCheckout = async (uid: string, pin: string) => {
+    setIsProcessing(true);
+    setErrorMessage('');
+    try {
+      const targetIdentifier = identifier.trim() || (orderType === 'dine_in' ? 'Terminal Tafel' : 'Terminal Klant');
+      const meta = { mode: 'terminal', cardUid: uid, pin };
+      const res = await processCheckout('workpay', orderType, targetIdentifier, meta);
+      if (res.success) {
+        try { await setHardwareTerminalResult('APPROVED', 'Eet smakelijk!'); } catch {}
+        if (terminalManager.getIsConnected()) {
+          await terminalManager.notifyApproved('Eet smakelijk!');
+        }
+        onClose();
+      } else {
+        try { await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16)); } catch {}
+        if (terminalManager.getIsConnected()) {
+          await terminalManager.notifyDeclined(res.message.slice(0, 16));
+        }
+        setErrorMessage(res.message);
+      }
+    } catch (e: any) {
+      setErrorMessage(e?.message || 'Terminal betaling mislukt.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const executeTerminalCheckoutRef = useRef(executeTerminalCheckout);
+  executeTerminalCheckoutRef.current = executeTerminalCheckout;
+
+  // Listen to DIY Pinapparaat callbacks (USB Web Serial + Firebase Cloud Relay)
   useEffect(() => {
     const callbacks: TerminalCallbacks = {
       onStatusChange: (status) => {
@@ -176,43 +215,118 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       onPaymentData: async (data) => {
         setWpCardUid(data.uid);
         setWpPin(data.pin);
-        // Automatically trigger checkout with scanned card
-        await executeTerminalCheckout(data.uid, data.pin);
+        await executeTerminalCheckoutRef.current(data.uid, data.pin);
       }
     };
     terminalManager.setCallbacks(callbacks);
-  }, [finalTotal, orderType, identifier]);
+  }, []);
 
-  const handleStartTerminalPayment = async () => {
-    if (!terminalManager.getIsConnected()) {
-      setShowDiyTerminalModal(true);
-      return;
+  const terminalCloudWaitingRef = useRef<boolean>(false);
+  terminalCloudWaitingRef.current = terminalCloudWaiting;
+
+  const handleCancelTerminalPayment = async (notifyIdle = true) => {
+    setTerminalCloudWaiting(false);
+    setTerminalWaitingCard(false);
+    if (terminalManager.getIsConnected()) {
+      terminalManager.cancel().catch(() => {});
     }
-    setErrorMessage('');
-    const simOrderNo = Math.floor(1000 + Math.random() * 9000);
-    const sent = await terminalManager.startPayment(finalTotal, simOrderNo);
-    if (sent) {
-      setTerminalWaitingCard(true);
+    if (notifyIdle) {
+      setHardwareTerminalIdle().catch(() => {});
     }
   };
 
-  const executeTerminalCheckout = async (uid: string, pin: string) => {
-    setIsProcessing(true);
-    setErrorMessage('');
-    try {
-      const meta = { mode: 'terminal', cardUid: uid, pin };
-      const res = await processCheckout('workpay', orderType, identifier, meta);
-      if (res.success) {
-        await terminalManager.notifyApproved('Eet smakelijk!');
-        onClose();
-      } else {
-        await terminalManager.notifyDeclined(res.message.slice(0, 16));
-        setErrorMessage(res.message);
+  useEffect(() => {
+    if (!terminalCloudWaiting) return;
+    let sawActiveCloudState = false;
+    const unsub = subscribeHardwareTerminal(
+      async (state) => {
+        if (!state) return;
+        if (state.status !== 'IDLE') {
+          sawActiveCloudState = true;
+        }
+        if (state.status === 'SUBMITTED' && state.scannedUid && state.enteredPin) {
+          const submitSig = `${state.scannedUid}:${state.enteredPin}:${state.updatedAt}`;
+          if (handledCloudSubmitRef.current === submitSig) return;
+          handledCloudSubmitRef.current = submitSig;
+
+          setWpCardUid(state.scannedUid);
+          setWpPin(state.enteredPin);
+          setTerminalCloudWaiting(false);
+          setTerminalWaitingCard(false);
+          await executeTerminalCheckoutRef.current(state.scannedUid, state.enteredPin);
+        } else if (
+          state.status === 'IDLE' &&
+          (sawActiveCloudState ||
+            state.updatedAt?.startsWith('pico-') ||
+            state.reason?.toLowerCase().includes('geannuleerd') ||
+            state.reason?.toLowerCase().includes('timeout'))
+        ) {
+          setTerminalCloudWaiting(false);
+          setTerminalWaitingCard(false);
+          setErrorMessage(state.reason || 'Betaling geannuleerd op het pinapparaat.');
+        }
+      },
+      (err) => {
+        console.error('Firebase terminal listener error:', err);
+        setTerminalCloudWaiting(false);
+        setTerminalWaitingCard(false);
+        setErrorMessage('Verbinding met Firebase terminal relay onderbroken. Probeer opnieuw.');
       }
+    );
+    return () => unsub();
+  }, [terminalCloudWaiting]);
+
+  // If user switches payment method/mode or closes modal while waiting on Pico W, reset terminal to IDLE immediately
+  useEffect(() => {
+    if (terminalCloudWaiting && (paymentMethod !== 'workpay' || werkpayMode !== 'terminal')) {
+      handleCancelTerminalPayment(true);
+    }
+  }, [paymentMethod, werkpayMode, terminalCloudWaiting]);
+
+  useEffect(() => {
+    return () => {
+      if (terminalCloudWaitingRef.current) {
+        setHardwareTerminalIdle().catch(() => {});
+      }
+    };
+  }, []);
+
+  const handleStartTerminalPayment = async () => {
+    setErrorMessage('');
+    const simOrderNo = Number.isFinite(Number(orderNo)) && Number(orderNo) > 0
+      ? Math.floor(Number(orderNo))
+      : Math.floor(1000 + Math.random() * 9000);
+    handledCloudSubmitRef.current = '';
+
+    let cloudActivated = false;
+    let usbActivated = false;
+    let cloudErrMessage = '';
+
+    // 1. Always activate Firebase Cloud Relay for Pico W (works wirelessly without USB or cookies!)
+    try {
+      await setHardwareTerminalPayMode(finalTotal, simOrderNo);
+      cloudActivated = true;
+      setTerminalCloudWaiting(true);
+      setTerminalWaitingCard(true);
     } catch (e: any) {
-      setErrorMessage(e?.message || 'Terminal betaling mislukt.');
-    } finally {
-      setIsProcessing(false);
+      console.warn('Firebase terminal relay warning:', e);
+      cloudErrMessage = e?.message || 'Firebase terminal niet bereikbaar.';
+    }
+
+    // 2. Also send over USB Web Serial if connected
+    if (terminalManager.getIsConnected()) {
+      try {
+        usbActivated = await terminalManager.startPayment(finalTotal, simOrderNo);
+        if (usbActivated) {
+          setTerminalWaitingCard(true);
+        }
+      } catch (e) {
+        console.warn('USB terminal warning:', e);
+      }
+    }
+
+    if (!cloudActivated && !usbActivated) {
+      setErrorMessage(`Pinapparaat kon niet worden geactiveerd: ${cloudErrMessage || 'geen Firebase- of USB-verbinding.'}`);
     }
   };
 
@@ -340,8 +454,6 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
           return;
         }
         meta = { code: giftCardCode.trim().toUpperCase() };
-      } else if (paymentMethod === 'sumup') {
-        meta = { sumup: true, transaction_id: 'SUMUP-' + Math.random().toString(36).substring(2, 10).toUpperCase() };
       }
 
       if (activeLoyaltyCustomer) {
@@ -390,80 +502,117 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto">
-      <div className="bg-slate-900 border border-slate-800 w-full max-w-xl rounded-3xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[95vh]">
+    <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      <div className="bg-slate-900 border border-slate-700/80 w-[96vw] max-w-6xl rounded-3xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[94vh]">
         
         {/* Header */}
-        <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
+        <div className="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between bg-slate-950/80 shrink-0">
           <div>
-            <h2 className="text-lg font-black text-white flex items-center gap-2">
+            <h2 className="text-lg sm:text-xl font-black text-white flex items-center gap-2.5">
               <span>Bestelling Afrekenen</span>
               {managerOverride && (
-                <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/20 text-[10px] text-emerald-400 border border-emerald-500/30 animate-pulse font-black">
+                <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/20 text-[10px] text-emerald-400 border border-emerald-500/30 font-black">
                   <ShieldCheck className="w-3 h-3" />
                   <span>OVERRIDE</span>
                 </span>
               )}
               <span className="text-xs px-2.5 py-0.5 rounded-full font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                {cart.length} {cart.length === 1 ? 'item' : 'items'}
+                {cart.reduce((s, it) => s + it.qty, 0)} {cart.reduce((s, it) => s + it.qty, 0) === 1 ? 'item' : 'items'}
               </span>
             </h2>
             <p className="text-xs text-slate-400">
-              Kies je gewenste betaalmethode en rond de transactie veilig af.
+              Controleer de bestelling, koppel korting/WerkLoyalty en rond de betaling direct links of rechts af.
             </p>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition"
+            className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition"
+            title="Sluiten"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Scrollable Content */}
-        <div className="p-4 sm:p-5 space-y-4 overflow-y-auto">
-          
-          {/* Order Details & Dining Mode */}
-          <div>
-            <label className="text-xs text-slate-400 font-semibold block mb-1.5">
-              Kies Besteltype:
-            </label>
-            <div className="grid grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => setOrderType('dine_in')}
-                className={`py-2 px-2.5 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                  orderType === 'dine_in'
-                    ? 'bg-blue-600 border-blue-500 text-white shadow'
-                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
-                }`}
-              >
-                <span>🍽️ Opeten</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setOrderType('takeaway')}
-                className={`py-2 px-2.5 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                  orderType === 'takeaway'
-                    ? 'bg-blue-600 border-blue-500 text-white shadow'
-                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
-                }`}
-              >
-                <span>🥡 Afhaal</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setOrderType('delivery')}
-                className={`py-2 px-2.5 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                  orderType === 'delivery'
-                    ? 'bg-amber-600 border-amber-500 text-white shadow'
-                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
-                }`}
-              >
-                <span>🛵 Bezorgen</span>
-              </button>
-            </div>
-          </div>
+        {/* Scrollable 2-Column Content */}
+        <div className="p-4 sm:p-5 overflow-y-auto flex-1">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+            {/* LINKER KOLOM: Bestelling, Type/Tafel, WerkLoyalty & Coupons */}
+            <div className="lg:col-span-6 space-y-3.5">
+              {/* Compact Besteloverzicht */}
+              <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-2xl space-y-2">
+                <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                  <span className="text-xs font-black text-slate-200 flex items-center gap-1.5">
+                    <Receipt className="w-4 h-4 text-blue-400" />
+                    <span>Overzicht Bestelling</span>
+                  </span>
+                  <span className="text-[11px] font-mono font-bold text-slate-400">
+                    Order #{orderNo}
+                  </span>
+                </div>
+                <div className="max-h-36 overflow-y-auto pr-1 space-y-1.5 custom-scrollbar">
+                  {cart.map((item) => (
+                    <div key={item.id} className="flex items-start justify-between gap-2 text-xs py-1 border-b border-slate-900 last:border-b-0">
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-100 truncate">
+                          <span className="text-amber-400 font-mono mr-1.5">{item.qty}×</span>
+                          {item.name}
+                        </div>
+                        {item.itemNote && (
+                          <div className="text-[10px] text-cyan-300/90 truncate pl-5">
+                            {item.itemNote}
+                          </div>
+                        )}
+                      </div>
+                      <span className="font-mono font-bold text-slate-300 shrink-0">
+                        {euro(item.price * item.qty)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Order Details & Dining Mode */}
+              <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
+                <div>
+                  <label className="text-xs text-slate-400 font-semibold block mb-1.5">
+                    Kies Besteltype:
+                  </label>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setOrderType('dine_in')}
+                      className={`py-2 px-2.5 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                        orderType === 'dine_in'
+                          ? 'bg-blue-600 border-blue-500 text-white shadow'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      <span>🍽️ Opeten</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setOrderType('takeaway')}
+                      className={`py-2 px-2.5 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                        orderType === 'takeaway'
+                          ? 'bg-blue-600 border-blue-500 text-white shadow'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      <span>🥡 Afhaal</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setOrderType('delivery')}
+                      className={`py-2 px-2.5 rounded-xl border text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                        orderType === 'delivery'
+                          ? 'bg-amber-600 border-amber-500 text-white shadow'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      <span>🛵 Bezorgen</span>
+                    </button>
+                  </div>
+                </div>
 
           <div>
             <label className="text-xs text-slate-400 font-semibold block mb-1 flex items-center justify-between">
@@ -475,7 +624,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                   : 'Klantnaam of Bestelcode'}
               </span>
               <span className="text-rose-400 text-[10px] font-black uppercase flex items-center gap-0.5">
-                <span className="animate-ping w-1.5 h-1.5 bg-rose-400 rounded-full inline-block mr-1" />
+                <span className="w-1.5 h-1.5 bg-rose-400 rounded-full inline-block mr-1" />
                 * Verplicht veld
               </span>
             </label>
@@ -495,7 +644,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                   ? 'bijv. Dorpsstraat 12 (Jan)'
                   : 'bijv. Afhaal Jan'
               }
-              className={`w-full bg-slate-950 border rounded-xl px-3.5 py-2 text-xs text-slate-200 focus:outline-none transition ${
+              className={`w-full bg-slate-900 border rounded-xl px-3.5 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none transition ${
                 identifierError 
                   ? 'border-rose-500 ring-2 ring-rose-500/20 focus:border-rose-500' 
                   : 'border-slate-800 focus:border-blue-500'
@@ -506,6 +655,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                 ℹ️ Bezorgbestellingen worden niet omgeroepen via de speakers en niet op het afhaalscherm getoond.
               </p>
             )}
+          </div>
           </div>
 
           {/* WerkLoyalty Spaarprogramma Card */}
@@ -631,125 +781,6 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
             )}
           </div>
 
-          {/* Split Bill / Groepsbestelling Toggle & Mode */}
-          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
-                <Users className="w-4 h-4 text-cyan-400" />
-                <span>Rekening Splitsen &amp; Groepsbestellingen</span>
-              </span>
-              <button
-                type="button"
-                onClick={() => setIsSplitMode(!isSplitMode)}
-                className={`px-3 py-1 rounded-xl text-xs font-black transition ${
-                  isSplitMode
-                    ? 'bg-cyan-500 text-slate-950 shadow-lg'
-                    : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white'
-                }`}
-              >
-                {isSplitMode ? 'SPLITSEN AAN ✓' : 'Splitsen Inschakelen'}
-              </button>
-            </div>
-
-            {isSplitMode && (
-              <div className="space-y-3 pt-2 border-t border-slate-900 animate-in fade-in duration-200">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-slate-400 font-bold">Aantal personen in groep:</span>
-                  <div className="flex gap-1.5">
-                    {[2, 3, 4, 5, 6].map(num => (
-                      <button
-                        key={num}
-                        type="button"
-                        onClick={() => setSplitPersonsCount(num)}
-                        className={`w-7 h-7 rounded-lg text-xs font-bold transition ${
-                          splitPersonsCount === num
-                            ? 'bg-cyan-500 text-slate-950 font-black'
-                            : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
-                        }`}
-                      >
-                        {num}x
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between text-[11px] text-slate-400 font-bold px-1">
-                    <span>Verdeling per persoon ({euro(finalTotal)} totaal):</span>
-                    <span className="text-cyan-400 font-mono">
-                      €{(finalTotal / splitPersonsCount).toFixed(2)} p.p.
-                    </span>
-                  </div>
-
-                  <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1 custom-scrollbar">
-                    {splitPayments.map((p) => (
-                      <div
-                        key={p.id}
-                        className={`p-2.5 rounded-xl border flex items-center justify-between text-xs transition ${
-                          p.paid
-                            ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300'
-                            : 'bg-slate-900 border-slate-800 text-slate-200'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2">
-                          <span className="w-5 h-5 rounded-full bg-slate-800 text-slate-300 text-[10px] font-mono font-black flex items-center justify-center">
-                            #{p.id}
-                          </span>
-                          <span className="font-bold">Persoon {p.id}</span>
-                          <span className="font-mono font-black text-cyan-300">
-                            {euro(p.amount)}
-                          </span>
-                        </div>
-
-                        <div className="flex items-center gap-1.5">
-                          {p.paid ? (
-                            <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
-                              <Check className="w-3 h-3" /> Betaald
-                            </span>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSplitPayments(prev =>
-                                  prev.map(item => (item.id === p.id ? { ...item, paid: true } : item))
-                                );
-                              }}
-                              className="px-2.5 py-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-black text-[10px] transition"
-                            >
-                              Markeer als Betaald
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Split summary progress */}
-                  {(() => {
-                    const paidTotal = splitPayments.filter(sp => sp.paid).reduce((s, sp) => s + sp.amount, 0);
-                    const remaining = Math.max(0, finalTotal - paidTotal);
-
-                    return (
-                      <div className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs font-bold">
-                        <span className="text-slate-400">Status voldaan:</span>
-                        <div className="text-right font-mono">
-                          <span className={remaining <= 0.01 ? 'text-emerald-400 font-black' : 'text-amber-400'}>
-                            {euro(paidTotal)} / {euro(finalTotal)}
-                          </span>
-                          {remaining > 0.01 && (
-                            <span className="block text-[10px] text-rose-400">
-                              (Nog {euro(remaining)} te voldoen)
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })()}
-                </div>
-              </div>
-            )}
-          </div>
-
           {/* Universal Coupon & Kortingscode Section inside PaymentModal */}
           <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
             <span className="text-xs text-slate-300 font-bold block flex items-center gap-1.5">
@@ -869,9 +900,9 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                             const val = e.target.value;
                             setCouponUnlockPin(val);
                             setCouponUnlockError('');
-                            
+
                             if (val.length >= 4) {
-                              const validUser = posUsers.find(u => 
+                              const validUser = posUsers.find(u =>
                                 (u.password === val || (u as any).pin_code === val) &&
                                 (u.is_admin || u.perms?.includes('coupons_giftcards'))
                               );
@@ -887,7 +918,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                           type="button"
                           onClick={() => {
                             const val = couponUnlockPin.trim();
-                            const validUser = posUsers.find(u => 
+                            const validUser = posUsers.find(u =>
                               (u.password === val || (u as any).pin_code === val) &&
                               (u.is_admin || u.perms?.includes('coupons_giftcards'))
                             );
@@ -935,23 +966,144 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
               </div>
             )}
           </div>
+            </div>
 
+            {/* RECHTER KOLOM: Totaalbedrag, Betaalwijze, Details & Splitsen */}
+            <div className="lg:col-span-6 space-y-3.5">
           {/* Amount Overview */}
-          <div className="p-4 bg-slate-950 border border-slate-800 rounded-2xl flex items-center justify-between">
+          <div className="p-4 bg-gradient-to-br from-slate-950 to-slate-900 border border-blue-500/30 rounded-2xl flex items-center justify-between shadow-inner">
             <div>
               <span className="text-xs text-slate-400 block font-medium">Te betalen bedrag:</span>
-              <span className="text-2xl font-black text-white tracking-tight">
+              <span className="text-3xl font-black text-white tracking-tight font-mono">
                 {euro(finalTotal)}
               </span>
             </div>
-            {discountAmount > 0 && (
-              <div className="text-right">
-                <span className="text-xs text-emerald-400 font-bold block">
+            <div className="text-right">
+              <span className="text-[11px] text-slate-400 block">
+                Subtotaal: <strong className="text-slate-200 font-mono">{euro(rawSubtotal)}</strong>
+              </span>
+              {discountAmount > 0 && (
+                <span className="text-xs text-emerald-400 font-bold block mt-0.5">
                   Korting: -{euro(discountAmount)}
                 </span>
-                <span className="text-[11px] text-slate-500 line-through">
-                  {euro(rawSubtotal)}
-                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Split Bill / Groepsbestelling Toggle & Mode */}
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                <Users className="w-4 h-4 text-cyan-400" />
+                <span>Rekening Splitsen &amp; Groepsbestellingen</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsSplitMode(!isSplitMode)}
+                className={`px-3 py-1 rounded-xl text-xs font-black transition ${
+                  isSplitMode
+                    ? 'bg-cyan-500 text-slate-950 shadow-lg'
+                    : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white'
+                }`}
+              >
+                {isSplitMode ? 'SPLITSEN AAN ✓' : 'Splitsen Inschakelen'}
+              </button>
+            </div>
+
+            {isSplitMode && (
+              <div className="space-y-3 pt-2 border-t border-slate-900 animate-in fade-in duration-200">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-slate-400 font-bold">Aantal personen in groep:</span>
+                  <div className="flex gap-1.5">
+                    {[2, 3, 4, 5, 6].map(num => (
+                      <button
+                        key={num}
+                        type="button"
+                        onClick={() => setSplitPersonsCount(num)}
+                        className={`w-7 h-7 rounded-lg text-xs font-bold transition ${
+                          splitPersonsCount === num
+                            ? 'bg-cyan-500 text-slate-950 font-black'
+                            : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
+                        }`}
+                      >
+                        {num}x
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 font-bold px-1">
+                    <span>Verdeling per persoon ({euro(finalTotal)} totaal):</span>
+                    <span className="text-cyan-400 font-mono">
+                      €{(finalTotal / splitPersonsCount).toFixed(2)} p.p.
+                    </span>
+                  </div>
+
+                  <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
+                    {splitPayments.map((p) => (
+                      <div
+                        key={p.id}
+                        className={`p-2 rounded-xl border flex items-center justify-between text-xs transition ${
+                          p.paid
+                            ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300'
+                            : 'bg-slate-900 border-slate-800 text-slate-200'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="w-5 h-5 rounded-full bg-slate-800 text-slate-300 text-[10px] font-mono font-black flex items-center justify-center">
+                            #{p.id}
+                          </span>
+                          <span className="font-bold">Persoon {p.id}</span>
+                          <span className="font-mono font-black text-cyan-300">
+                            {euro(p.amount)}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          {p.paid ? (
+                            <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
+                              <Check className="w-3 h-3" /> Betaald
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSplitPayments(prev =>
+                                  prev.map(item => (item.id === p.id ? { ...item, paid: true } : item))
+                                );
+                              }}
+                              className="px-2.5 py-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-black text-[10px] transition"
+                            >
+                              Markeer als Betaald
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {(() => {
+                    const paidTotal = splitPayments.filter(sp => sp.paid).reduce((s, sp) => s + sp.amount, 0);
+                    const remaining = Math.max(0, finalTotal - paidTotal);
+
+                    return (
+                      <div className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs font-bold">
+                        <span className="text-slate-400">Status voldaan:</span>
+                        <div className="text-right font-mono">
+                          <span className={remaining <= 0.01 ? 'text-emerald-400 font-black' : 'text-amber-400'}>
+                            {euro(paidTotal)} / {euro(finalTotal)}
+                          </span>
+                          {remaining > 0.01 && (
+                            <span className="block text-[10px] text-rose-400">
+                              (Nog {euro(remaining)} te voldoen)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
               </div>
             )}
           </div>
@@ -1157,26 +1309,32 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                 </div>
               )}
 
-              {/* MODE C: DIY Pinapparaat (USB / Arduino) */}
+              {/* MODE C: DIY Pinapparaat (Firebase Wi-Fi / USB) */}
               {werkpayMode === 'terminal' && (
                 <div className="space-y-3">
                   <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl space-y-2">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-bold text-white flex items-center gap-1.5">
                         <Cpu className="w-4 h-4 text-cyan-400" />
-                        DIY Pinapparaat (Arduino + I2C LCD + Keypad)
+                        DIY Pinapparaat (Pico W Wi-Fi / USB)
                       </span>
                       <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
-                        terminalConnected 
+                        terminalCloudWaiting || terminalWaitingCard
+                          ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 animate-pulse'
+                          : terminalConnected 
                           ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' 
-                          : 'bg-slate-800 text-slate-400 border-slate-700'
+                          : 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
                       }`}>
-                        {terminalConnected ? '● USB Actief' : '○ Standby'}
+                        {terminalCloudWaiting || terminalWaitingCard
+                          ? '📡 Wachten op Pas & PIN...'
+                          : terminalConnected
+                          ? '● USB + Cloud Gereed'
+                          : '☁️ Firebase Cloud Gereed'}
                       </span>
                     </div>
 
                     <p className="text-[11px] text-slate-300 leading-relaxed">
-                      Koppel je fysieke Arduino terminal via USB of gebruik de ingebouwde simulator om de RFID kaart en het 4x4 matrix toetsenbord te testen.
+                      Klik op <strong>Activeer Pinapparaat</strong> om het bedrag draadloos naar je Raspberry Pi Pico W (via Firebase Cloud) en/of USB te sturen.
                     </p>
 
                     <div className="flex gap-2 pt-1">
@@ -1186,8 +1344,18 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                         className="flex-1 py-2 px-3 rounded-xl text-xs font-black bg-cyan-500 hover:bg-cyan-400 text-slate-950 flex items-center justify-center gap-1.5 transition"
                       >
                         <Radio className="w-3.5 h-3.5" />
-                        <span>{terminalWaitingCard ? 'Wachten op Pas & PIN...' : 'Activeer Pinapparaat'}</span>
+                        <span>{terminalWaitingCard || terminalCloudWaiting ? 'Wachten op Pas & PIN...' : 'Activeer Pinapparaat'}</span>
                       </button>
+
+                      {(terminalWaitingCard || terminalCloudWaiting) && (
+                        <button
+                          type="button"
+                          onClick={() => handleCancelTerminalPayment(true)}
+                          className="py-2 px-3 rounded-xl text-xs font-bold bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-500/30 transition"
+                        >
+                          Annuleren
+                        </button>
+                      )}
 
                       <button
                         type="button"
@@ -1372,39 +1540,48 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
               <span>{errorMessage}</span>
             </div>
           )}
+            </div>
+          </div>
         </div>
 
         {/* Footer actions */}
-        <div className="p-4 sm:p-5 bg-slate-950 border-t border-slate-800 flex gap-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="flex-1 py-3 px-4 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
-          >
-            Annuleren
-          </button>
-          
-          <button
-            type="button"
-            disabled={isProcessing || Boolean(waitingCashRequest)}
-            onClick={handleConfirmPayment}
-            className={`flex-2 py-3 px-6 rounded-xl text-sm font-black flex items-center justify-center gap-2 transition-all shadow-lg ${
-              isProcessing || Boolean(waitingCashRequest)
-                ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-emerald-500/20 active:translate-y-0.5'
-            }`}
-          >
-            {isProcessing ? (
-              <span>Bezig met verwerken...</span>
-            ) : waitingCashRequest ? (
-              <span>Wachten op medewerker...</span>
-            ) : (
-              <>
-                <span>{paymentMethod === 'cash' && !isAuthorizedCashier ? 'Verstuur Verzoek naar Medewerker' : 'Betaling Bevestigen'}</span>
-                <ArrowRight className="w-4 h-4" />
-              </>
-            )}
-          </button>
+        <div className="px-5 py-3.5 bg-slate-950 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div className="hidden sm:flex items-center gap-2 text-xs text-slate-400">
+            <span>Totaal te betalen:</span>
+            <strong className="text-base font-black font-mono text-emerald-400">{euro(finalTotal)}</strong>
+          </div>
+
+          <div className="flex gap-3 flex-1 sm:flex-initial sm:min-w-[380px]">
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex-1 py-3 px-4 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+            >
+              Annuleren
+            </button>
+            
+            <button
+              type="button"
+              disabled={isProcessing || Boolean(waitingCashRequest)}
+              onClick={handleConfirmPayment}
+              className={`flex-[2] py-3 px-6 rounded-xl text-sm font-black flex items-center justify-center gap-2 transition-all shadow-lg ${
+                isProcessing || Boolean(waitingCashRequest)
+                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-emerald-500/20 active:translate-y-0.5'
+              }`}
+            >
+              {isProcessing ? (
+                <span>Bezig met verwerken...</span>
+              ) : waitingCashRequest ? (
+                <span>Wachten op medewerker...</span>
+              ) : (
+                <>
+                  <span>{paymentMethod === 'cash' && !isAuthorizedCashier ? 'Verstuur Verzoek naar Medewerker' : `Betaling Bevestigen (${euro(finalTotal)})`}</span>
+                  <ArrowRight className="w-4 h-4" />
+                </>
+              )}
+            </button>
+          </div>
         </div>
 
       </div>

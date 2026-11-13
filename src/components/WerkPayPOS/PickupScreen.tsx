@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { AudioFX, SpeechVoiceOption, TtsEngineMode, AudioDiagnosticStatus } from '../../services/audio';
 import { getStatusMeta, isOrderInProgress, isOrderReady } from '../../services/orderStatus';
@@ -121,74 +121,65 @@ const AutoScrollContainer: React.FC<AutoScrollContainerProps> = ({ children, cla
     const el = containerRef.current;
     if (!el) return;
 
-    let timer: NodeJS.Timeout;
-    let interval: NodeJS.Timeout;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let interval: ReturnType<typeof setInterval> | undefined;
     let active = true;
+    let direction = 1;
+    let currentScroll = el.scrollTop;
 
-    const startAutoScroll = () => {
+    const tick = () => {
       if (!active || !el) return;
-      
-      const maxScroll = el.scrollHeight - el.clientHeight;
-      if (maxScroll <= 0) {
-        // Content fits, reset scroll and wait
-        el.scrollTop = 0;
-        timer = setTimeout(startAutoScroll, 2000);
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+
+      const max = el.scrollHeight - el.clientHeight;
+      if (max <= 0) {
+        if (el.scrollTop !== 0) el.scrollTop = 0;
+        currentScroll = 0;
         return;
       }
 
-      let direction = 1; // 1 = down, -1 = up
-      let currentScroll = el.scrollTop;
-
-      interval = setInterval(() => {
-        if (!active || !el) return;
-
-        const max = el.scrollHeight - el.clientHeight;
-        if (max <= 0) {
-          el.scrollTop = 0;
+      if (direction === 1) {
+        currentScroll += 0.6;
+        if (currentScroll >= max) {
+          currentScroll = max;
+          el.scrollTop = currentScroll;
+          if (interval) clearInterval(interval);
+          timer = setTimeout(() => {
+            if (!active) return;
+            direction = -1;
+            interval = setInterval(tick, 40);
+          }, 3000);
           return;
         }
-
-        if (direction === 1) {
-          currentScroll += 0.5; // slow smooth scroll down
-          if (currentScroll >= max) {
-            currentScroll = max;
-            el.scrollTop = currentScroll;
-            // Pause at the bottom
-            clearInterval(interval);
-            timer = setTimeout(() => {
-              direction = -1;
-              startAutoScroll();
-            }, 3000); // 3 seconds pause at bottom
-            return;
-          }
-        } else {
-          currentScroll -= 1.5; // slightly faster scroll up
-          if (currentScroll <= 0) {
-            currentScroll = 0;
-            el.scrollTop = currentScroll;
-            // Pause at the top
-            clearInterval(interval);
-            timer = setTimeout(() => {
-              direction = 1;
-              startAutoScroll();
-            }, 3000); // 3 seconds pause at top
-            return;
-          }
+      } else {
+        currentScroll -= 1.5;
+        if (currentScroll <= 0) {
+          currentScroll = 0;
+          el.scrollTop = currentScroll;
+          if (interval) clearInterval(interval);
+          timer = setTimeout(() => {
+            if (!active) return;
+            direction = 1;
+            interval = setInterval(tick, 40);
+          }, 3000);
+          return;
         }
+      }
 
-        el.scrollTop = currentScroll;
-      }, 30); // ~33 fps
+      el.scrollTop = currentScroll;
     };
 
-    // Delay start of scrolling slightly
-    timer = setTimeout(startAutoScroll, 2500);
+    timer = setTimeout(() => {
+      if (!active) return;
+      interval = setInterval(tick, 40);
+    }, 2500);
 
     return () => {
       active = false;
-      clearTimeout(timer);
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
+      if (interval) clearInterval(interval);
     };
-  }, [children]); // Re-run when children change (e.g. orders added/removed)
+  }, []);
 
   return (
     <div ref={containerRef} className={`${className} overflow-y-auto no-scrollbar`}>
@@ -407,7 +398,7 @@ export const PickupScreen: React.FC = () => {
   const [diagnostics, setDiagnostics] = useState<AudioDiagnosticStatus>(() => AudioFX.getDiagnostics());
 
   const isKoekploeg = activeBrand === 'koekploeg';
-  const brandTitle = customBranding.useCustomBranding ? customBranding.storeName : (isKoekploeg ? 'De Koekploeg' : 'Werkdonalds');
+  const brandTitle = customBranding.useCustomBranding ? customBranding.storeName : (isKoekploeg ? 'De Koekploeg' : 'WerkPay');
   const brandEmoji = customBranding.useCustomBranding ? customBranding.logoEmoji : (isKoekploeg ? '🧇' : '🍔');
   const brandTagline = customBranding.useCustomBranding ? customBranding.tagline : (isKoekploeg ? 'Vers Bereid • Snelle Service' : 'Vers Bereid • Snelle Kassa & Keuken');
   const brandGradient = customBranding.useCustomBranding ? customBranding.headerGradient : (isKoekploeg ? 'from-amber-600 to-amber-400' : 'from-blue-700 to-blue-500');
@@ -547,18 +538,27 @@ export const PickupScreen: React.FC = () => {
   }, [showVoiceSettings]);
 
   // CRITICAL REQUIREMENT:
-  // "en als het een bezorgen is kan je het niet omroepen en hoeft het niet op het scherm snap je ik wil een verbetering voor het afhaalscherm"
   // Filter out all delivery orders!
-  const pickupOrders = orders.filter(o => 
-    o.orderType !== 'delivery' && 
-    !o.identifier?.toLowerCase().includes('bezorg')
-  );
-
-  const waitingOrders = pickupOrders.filter(o => o.status === 'new' || o.status === 'wachten').slice(0, 15);
-  const preparingOrders = pickupOrders.filter(o => o.status !== 'new' && o.status !== 'wachten' && isOrderInProgress(o.status) && o.status !== 'inpakken').slice(0, 15);
-  const packingOrders = pickupOrders.filter(o => o.status === 'inpakken').slice(0, 15);
-  const prepOrders = pickupOrders.filter(o => isOrderInProgress(o.status)).slice(0, 30);
-  const readyOrders = pickupOrders.filter(o => isOrderReady(o.status)).slice(0, 30);
+  const {
+    waitingOrders,
+    preparingOrders,
+    packingOrders,
+    prepOrders,
+    readyOrders
+  } = useMemo(() => {
+    const pickup = orders.filter(
+      o => o.orderType !== 'delivery' && !o.identifier?.toLowerCase().includes('bezorg')
+    );
+    return {
+      waitingOrders: pickup.filter(o => o.status === 'new' || o.status === 'wachten').slice(0, 15),
+      preparingOrders: pickup
+        .filter(o => o.status !== 'new' && o.status !== 'wachten' && isOrderInProgress(o.status) && o.status !== 'inpakken')
+        .slice(0, 15),
+      packingOrders: pickup.filter(o => o.status === 'inpakken').slice(0, 15),
+      prepOrders: pickup.filter(o => isOrderInProgress(o.status)).slice(0, 30),
+      readyOrders: pickup.filter(o => isOrderReady(o.status)).slice(0, 30)
+    };
+  }, [orders]);
 
   const handleToggleTvMode = () => {
     setShowTvSetupModal(true);
@@ -1205,7 +1205,7 @@ export const PickupScreen: React.FC = () => {
                       <span className="text-xl animate-bounce">🔥</span>
                       <div>
                         <span className="text-[10px] font-black uppercase tracking-wider block opacity-90">DAGDEAL / PROMO van de DAG</span>
-                        <span className="text-xs font-black block">🍔 Werkdonalds Super Deal Menu + Vers Gekoelde Drank</span>
+                        <span className="text-xs font-black block">🍔 WerkPay Super Deal Menu + Vers Gekoelde Drank</span>
                       </div>
                     </div>
                     <span className="bg-amber-400 text-slate-950 font-mono font-black text-xs px-2.5 py-1 rounded-xl shadow">
@@ -1547,21 +1547,21 @@ export const PickupScreen: React.FC = () => {
 
             const columns = [
               {
-                brand: "🍔 WERKDONALDS",
+                brand: "🍔 WERKPAY",
                 title: "Burgers & Wraps",
                 icon: "🍔",
                 items: col1Items,
                 brandColor: "border-red-500/30 text-red-400 bg-red-950/20"
               },
               {
-                brand: "🍟 WERKDONALDS",
+                brand: "🍟 WERKPAY",
                 title: "Snacks, Frites & Dips",
                 icon: "🍟",
                 items: col2Items,
                 brandColor: "border-amber-500/30 text-amber-400 bg-amber-950/20"
               },
               {
-                brand: "🥤 WERKDONALDS",
+                brand: "🥤 WERKPAY",
                 title: "Dranken & Desserts",
                 icon: "🍦",
                 items: col3Items,
@@ -1597,7 +1597,7 @@ export const PickupScreen: React.FC = () => {
                       <h2 className="text-xl sm:text-2xl font-black text-amber-400 uppercase tracking-tight">
                         📖 GEZAMENLIJKE MENUKAART
                       </h2>
-                      <p className="text-xs text-slate-400">Geniet van onze WerkDonalds &amp; Koekploeg specialiteiten</p>
+                      <p className="text-xs text-slate-400">Geniet van onze WerkPay &amp; Koekploeg specialiteiten</p>
                     </div>
                   </div>
                   <span className="text-xs bg-slate-800 text-slate-300 px-3 py-1 rounded-full border border-slate-700 font-bold">

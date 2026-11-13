@@ -1,29 +1,39 @@
-import React, { useState } from 'react';
+import React, { useState, Suspense, lazy } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
-import { ShieldAlert, Lock } from 'lucide-react';
+import { ShieldAlert, Loader2 } from 'lucide-react';
 import { Header } from './components/Header';
 import { PosScreen } from './components/WerkPayPOS/PosScreen';
-import { KitchenScreen } from './components/WerkPayPOS/KitchenScreen';
-import { PickupScreen } from './components/WerkPayPOS/PickupScreen';
-import { InventoryScreen } from './components/WerkPayPOS/InventoryScreen';
-import { ManagerScreen } from './components/WerkPayPOS/ManagerScreen';
-import { OrderTrackingScreen } from './components/WerkPayPOS/OrderTrackingScreen';
 import { ReceiptModal } from './components/WerkPayPOS/ReceiptModal';
 import { PaymentModal } from './components/WerkPayPOS/PaymentModal';
-import { WalletScreen } from './components/WerkPayBank/WalletScreen';
-import { ManagerAccountsScreen } from './components/WerkPayBank/ManagerAccountsScreen';
 import { StaffCashRequestNotifier } from './components/WerkPayPOS/StaffCashRequestNotifier';
 import { StaffPaalPairingNotifier } from './components/WerkPayPOS/StaffPaalPairingNotifier';
-import { SupabaseModal } from './components/SupabaseModal';
-import { GitHubExportModal } from './components/GitHubExportModal';
-import { DigitalPhone } from './components/DigitalPhone/DigitalPhone';
 import { AutoUpdateBanner } from './components/AutoUpdateBanner';
-import { PickupControlScreen } from './components/WerkPayPOS/PickupControlScreen';
-import { LoyaltyTerminalScreen } from './components/WerkPayPOS/LoyaltyTerminalScreen';
 import { AppToast } from './components/AppToast';
 import { TwoFactorChallengeModal } from './components/TwoFactorChallengeModal';
 import { TwoFactorSetupModal } from './components/TwoFactorSetupModal';
 import { SystemLockScreen } from './components/WerkPayPOS/SystemLockScreen';
+
+const KitchenScreen = lazy(() => import('./components/WerkPayPOS/KitchenScreen').then(m => ({ default: m.KitchenScreen })));
+const PickupScreen = lazy(() => import('./components/WerkPayPOS/PickupScreen').then(m => ({ default: m.PickupScreen })));
+const PickupControlScreen = lazy(() => import('./components/WerkPayPOS/PickupControlScreen').then(m => ({ default: m.PickupControlScreen })));
+const InventoryScreen = lazy(() => import('./components/WerkPayPOS/InventoryScreen').then(m => ({ default: m.InventoryScreen })));
+const ManagerScreen = lazy(() => import('./components/WerkPayPOS/ManagerScreen').then(m => ({ default: m.ManagerScreen })));
+const OrderTrackingScreen = lazy(() => import('./components/WerkPayPOS/OrderTrackingScreen').then(m => ({ default: m.OrderTrackingScreen })));
+const LoyaltyTerminalScreen = lazy(() => import('./components/WerkPayPOS/LoyaltyTerminalScreen').then(m => ({ default: m.LoyaltyTerminalScreen })));
+const WalletScreen = lazy(() => import('./components/WerkPayBank/WalletScreen').then(m => ({ default: m.WalletScreen })));
+const ManagerAccountsScreen = lazy(() => import('./components/WerkPayBank/ManagerAccountsScreen').then(m => ({ default: m.ManagerAccountsScreen })));
+const SupabaseModal = lazy(() => import('./components/SupabaseModal').then(m => ({ default: m.SupabaseModal })));
+const GitHubExportModal = lazy(() => import('./components/GitHubExportModal').then(m => ({ default: m.GitHubExportModal })));
+const DigitalPhone = lazy(() => import('./components/DigitalPhone/DigitalPhone').then(m => ({ default: m.DigitalPhone })));
+
+const ScreenLoader: React.FC = () => (
+  <div className="flex-1 flex items-center justify-center p-12 text-slate-400">
+    <div className="flex items-center gap-3 bg-slate-900/80 border border-slate-800 px-5 py-3 rounded-2xl shadow-xl">
+      <Loader2 className="w-5 h-5 animate-spin text-blue-400" />
+      <span className="text-sm font-bold">Scherm laden...</span>
+    </div>
+  </div>
+);
 
 const MainLayout: React.FC = () => {
   const { 
@@ -39,6 +49,8 @@ const MainLayout: React.FC = () => {
     pending2FALogin,
     setPending2FALogin,
     currentPosUser,
+    posUsers,
+    bankAccounts,
     logoutPos,
     isSystemLocked,
     setIsSystemLocked
@@ -53,14 +65,32 @@ const MainLayout: React.FC = () => {
     return sessionStorage.getItem(`wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`) === 'true';
   });
 
-  // Automatically sync unlock status when posScreen or user changes
+  const manager2FARequired = React.useMemo(() => {
+    if (!currentPosUser) return false;
+    const cleanU = currentPosUser.username.toLowerCase();
+    const posMatch = posUsers.find(u => u.username.toLowerCase() === cleanU);
+    const bankMatch = bankAccounts.find(a => a.username.toLowerCase() === cleanU);
+    return Boolean(
+      (currentPosUser.is_2fa_enabled && currentPosUser.totp_secret) ||
+      (posMatch?.is_2fa_enabled && posMatch?.totp_secret) ||
+      (bankMatch?.is_2fa_enabled && bankMatch?.totp_secret)
+    );
+  }, [currentPosUser, posUsers, bankAccounts]);
+
+  // Automatically lock manager menu whenever leaving it or switching users/app modes
   React.useEffect(() => {
-    if (currentPosUser) {
-      setManagerSessionUnlocked(sessionStorage.getItem(`wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`) === 'true');
-    } else {
+    if (!currentPosUser) {
       setManagerSessionUnlocked(false);
+      return;
     }
-  }, [posScreen, currentPosUser]);
+    const key = `wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`;
+    if (appMode !== 'pos' || posScreen !== 'manager') {
+      try { sessionStorage.removeItem(key); } catch {}
+      setManagerSessionUnlocked(false);
+    } else {
+      setManagerSessionUnlocked(sessionStorage.getItem(key) === 'true');
+    }
+  }, [appMode, posScreen, currentPosUser]);
 
   // Global keyboard shortcut to instantly lock the manager screen & block the system (NumpadEnter only)
   React.useEffect(() => {
@@ -119,7 +149,7 @@ const MainLayout: React.FC = () => {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none antialiased">
+    <div className={`min-h-screen text-slate-100 flex flex-col font-sans select-none antialiased ${currentPosUser?.theme || 'bg-slate-950'}`}>
       {/* GitHub Deployment Auto-Update Listener & Banner */}
       <AutoUpdateBanner />
 
@@ -128,95 +158,78 @@ const MainLayout: React.FC = () => {
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col overflow-hidden">
-        {/* Werkdonalds POS screens */}
-        {appMode === 'pos' && (
-          <>
-            {posScreen === 'kassa' && (
-              <PosScreen onOpenPaymentModal={() => setShowPaymentModal(true)} />
-            )}
-            {posScreen === 'keuken' && <KitchenScreen />}
-            {posScreen === 'afhaal' && <PickupScreen />}
-            {posScreen === 'pickup_control' && <PickupControlScreen />}
-            {posScreen === 'voorraad' && <InventoryScreen />}
-            {posScreen === 'manager' && (
-              managerSessionUnlocked ? (
-                <ManagerScreen />
-              ) : (
-                <div className="flex-1 flex items-center justify-center bg-slate-950 p-4 sm:p-6">
-                  {currentPosUser?.is_2fa_enabled ? (
+        <Suspense fallback={<ScreenLoader />}>
+          {/* WerkPay POS screens */}
+          {appMode === 'pos' && (
+            <>
+              {posScreen === 'kassa' && (
+                <PosScreen onOpenPaymentModal={() => setShowPaymentModal(true)} />
+              )}
+              {posScreen === 'keuken' && <KitchenScreen />}
+              {posScreen === 'afhaal' && <PickupScreen />}
+              {posScreen === 'pickup_control' && <PickupControlScreen />}
+              {posScreen === 'voorraad' && <InventoryScreen />}
+              {posScreen === 'manager' && (
+                (!manager2FARequired || managerSessionUnlocked) ? (
+                  <ManagerScreen />
+                ) : (
+                  <div className="flex-1 flex items-center justify-center bg-slate-950 p-4 sm:p-6">
                     <TwoFactorChallengeModal
-                      username={currentPosUser.username}
-                      userTitle="Manager Dashboard"
+                      username={currentPosUser?.username || ''}
+                      userTitle="Manager Menu"
                       onSuccess={() => {
-                        sessionStorage.setItem(`wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`, 'true');
+                        if (currentPosUser) {
+                          sessionStorage.setItem(`wd_manager_unlocked_${currentPosUser.username.toLowerCase()}`, 'true');
+                        }
                         setManagerSessionUnlocked(true);
                       }}
                       onCancel={() => {
                         setPosScreen('kassa');
                       }}
                     />
-                  ) : (
-                    <div className="bg-slate-900 border border-purple-500/40 rounded-3xl w-full max-w-lg p-6 sm:p-8 shadow-2xl space-y-6 text-white text-center">
-                      <div className="w-16 h-16 rounded-2xl bg-purple-500/20 text-purple-400 border border-purple-500/30 flex items-center justify-center mx-auto shadow-lg shadow-purple-950/50">
-                        <Lock className="w-8 h-8 animate-pulse text-purple-300" />
-                      </div>
-                      <div className="space-y-1.5">
-                        <h2 className="text-xl font-black text-purple-400">🔒 2FA Setup Verplicht</h2>
-                        <p className="text-xs text-slate-300 max-w-md mx-auto leading-relaxed">
-                          Om toegang te krijgen tot de managerinstellingen is tweestapsverificatie (2FA) verplicht. Stel nu 2FA in om door te gaan.
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setShowSetup2FA(true)}
-                        className="w-full py-3.5 rounded-2xl font-black text-sm bg-purple-600 hover:bg-purple-500 text-white transition shadow-lg shadow-purple-600/25 flex items-center justify-center gap-2"
-                      >
-                        <span>🔑 Start 2FA Inschakelen</span>
-                      </button>
-                    </div>
-                  )}
+                  </div>
+                )
+              )}
+              {posScreen === 'volgscherm' && <OrderTrackingScreen />}
+              {posScreen === 'loyalty_terminal' && <LoyaltyTerminalScreen />}
+            </>
+          )}
+
+          {/* WerkPay Bank screens */}
+          {appMode === 'werkpay' && (
+            <>
+              {(werkpayScreen === 'wallet' || werkpayScreen === 'overboeken') && <WalletScreen />}
+              {werkpayScreen === 'accounts' && <ManagerAccountsScreen />}
+            </>
+          )}
+
+          {/* Split screen testing mode: POS left, WerkPay Bank right */}
+          {appMode === 'split' && (
+            <div className="flex-1 flex flex-col lg:flex-row h-[calc(100vh-108px)] overflow-hidden divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
+              {/* Left side: POS Kassa */}
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 font-bold text-xs flex items-center justify-between">
+                  <span>🍔 WerkPay Kassa (Bestellen &amp; Afrekenen)</span>
+                  <span className="text-[10px] text-slate-400">Live Test Mode</span>
                 </div>
-              )
-            )}
-            {posScreen === 'volgscherm' && <OrderTrackingScreen />}
-            {posScreen === 'loyalty_terminal' && <LoyaltyTerminalScreen />}
-          </>
-        )}
-
-        {/* WerkPay Bank screens */}
-        {appMode === 'werkpay' && (
-          <>
-            {(werkpayScreen === 'wallet' || werkpayScreen === 'overboeken') && <WalletScreen />}
-            {werkpayScreen === 'accounts' && <ManagerAccountsScreen />}
-          </>
-        )}
-
-        {/* Split screen testing mode: POS left, WerkPay Bank right */}
-        {appMode === 'split' && (
-          <div className="flex-1 flex flex-col lg:flex-row h-[calc(100vh-108px)] overflow-hidden divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
-            {/* Left side: POS Kassa */}
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 font-bold text-xs flex items-center justify-between">
-                <span>🍔 Werkdonalds Kassa (Bestellen &amp; Afrekenen)</span>
-                <span className="text-[10px] text-slate-400">Live Test Mode</span>
+                <div className="flex-1 overflow-hidden">
+                  <PosScreen onOpenPaymentModal={() => setShowPaymentModal(true)} />
+                </div>
               </div>
-              <div className="flex-1 overflow-hidden">
-                <PosScreen onOpenPaymentModal={() => setShowPaymentModal(true)} />
+
+              {/* Right side: WerkPay Bank */}
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="px-4 py-1.5 bg-cyan-500/10 border-b border-cyan-500/20 text-cyan-300 font-bold text-xs flex items-center justify-between">
+                  <span>💳 WerkPay Digitale Bank (Saldo &amp; Transacties)</span>
+                  <span className="text-[10px] text-slate-400">Realtime Saldo Updates</span>
+                </div>
+                <div className="flex-1 overflow-hidden">
+                  <WalletScreen />
+                </div>
               </div>
             </div>
-
-            {/* Right side: WerkPay Bank */}
-            <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="px-4 py-1.5 bg-cyan-500/10 border-b border-cyan-500/20 text-cyan-300 font-bold text-xs flex items-center justify-between">
-                <span>💳 WerkPay Digitale Bank (Saldo &amp; Transacties)</span>
-                <span className="text-[10px] text-slate-400">Realtime Saldo Updates</span>
-              </div>
-              <div className="flex-1 overflow-hidden">
-                <WalletScreen />
-              </div>
-            </div>
-          </div>
-        )}
+          )}
+        </Suspense>
       </main>
 
       {/* Global Modals & Notifications */}
@@ -228,10 +241,18 @@ const MainLayout: React.FC = () => {
         <PaymentModal onClose={() => setShowPaymentModal(false)} />
       )}
       {appMode === 'setup' && (
-        <SupabaseModal onClose={() => setAppMode('pos')} />
+        <Suspense fallback={null}>
+          <SupabaseModal onClose={() => setAppMode('pos')} />
+        </Suspense>
       )}
-      <GitHubExportModal isOpen={showGithubModal} onClose={() => setShowGithubModal(false)} />
-      <DigitalPhone />
+      {showGithubModal && (
+        <Suspense fallback={null}>
+          <GitHubExportModal isOpen={showGithubModal} onClose={() => setShowGithubModal(false)} />
+        </Suspense>
+      )}
+      <Suspense fallback={null}>
+        <DigitalPhone />
+      </Suspense>
       {showSetup2FA && currentPosUser && (
         <TwoFactorSetupModal
           username={currentPosUser.username}
@@ -245,9 +266,7 @@ const MainLayout: React.FC = () => {
         <TwoFactorChallengeModal
           username={pending2FALogin.user.username}
           userTitle={pending2FALogin.loginType === 'pos' ? 'POS Kassa' : 'WerkPay Bank'}
-          onSuccess={() => {
-            // Confirm pending login state
-          }}
+          onSuccess={() => {}}
           onCancel={() => setPending2FALogin(null)}
         />
       )}

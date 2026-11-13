@@ -108,14 +108,60 @@ export const DEFAULT_PRODUCTS: Product[] = [
   { id: 89, name: "Verse Gekoelde Jus d'Orange", price: 3.75, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍊", inStock: true },
   { id: 90, name: "Chocomel Koud & Romig", price: 3.25, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍫", inStock: true },
   { id: 91, name: "Fristi Rood Fruit", price: 3.25, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍓", inStock: true },
-  { id: 92, name: "WerkShake Aardbei", price: 4.10, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍓", inStock: true },
-  { id: 93, name: "WerkShake Chocolade", price: 4.10, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍫", inStock: true },
-  { id: 94, name: "WerkShake Vanille", price: 4.10, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🥛", inStock: true },
-  { id: 95, name: "WerkShake Banaan", price: 4.10, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍌", inStock: true },
-  { id: 96, name: "WerkShake Karamel Zeezout", price: 4.35, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍮", inStock: true },
-  { id: 97, name: "WerkShake Mango Passievrucht", price: 4.35, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🥭", inStock: true },
-  { id: 98, name: "WerkShake Oreo Cookies & Cream", price: 4.50, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🍪", inStock: true },
-  { id: 99, name: "WerkShake Witte Chocolade & Bosbes", price: 4.50, salePrice: 0, onSale: false, cat: "Koude Dranken & WerkShakes", emoji: "🫐", inStock: true },
+  {
+    id: 92,
+    name: "WerkShake",
+    price: 4.10,
+    salePrice: 0,
+    onSale: false,
+    cat: "Koude Dranken & WerkShakes",
+    emoji: "🥤",
+    inStock: true,
+    brand: 'werkpay',
+    options: [
+      {
+        id: 'werkshake_flavor',
+        name: 'Kies Smaak',
+        multipleSelection: false,
+        choices: [
+          { name: '🍓 Aardbei', priceAdjustment: 0 },
+          { name: '🍫 Chocolade', priceAdjustment: 0 },
+          { name: '🥛 Vanille', priceAdjustment: 0 },
+          { name: '🍌 Banaan', priceAdjustment: 0 },
+          { name: '🍮 Karamel Zeezout', priceAdjustment: 0.25 },
+          { name: '🥭 Mango Passievrucht', priceAdjustment: 0.25 },
+          { name: '🍪 Oreo Cookies & Cream', priceAdjustment: 0.40 },
+          { name: '🫐 Witte Chocolade & Bosbes', priceAdjustment: 0.40 }
+        ]
+      }
+    ]
+  },
+  {
+    id: 93,
+    name: "Mogu Mogu (Nata de Coco)",
+    price: 3.50,
+    salePrice: 0,
+    onSale: false,
+    cat: "Koude Dranken & WerkShakes",
+    emoji: "🧃",
+    inStock: true,
+    brand: 'werkpay',
+    options: [
+      {
+        id: 'mogumogu_flavor',
+        name: 'Kies Smaak',
+        multipleSelection: false,
+        choices: [
+          { name: '🥭 Mango', priceAdjustment: 0 },
+          { name: '🍈 Lychee', priceAdjustment: 0 },
+          { name: '🍓 Aardbei', priceAdjustment: 0 },
+          { name: '🍑 Perzik', priceAdjustment: 0 },
+          { name: '🍈 Meloen', priceAdjustment: 0 },
+          { name: '🍇 Druif', priceAdjustment: 0 }
+        ]
+      }
+    ]
+  },
 
   // ==========================================
   // 🍦 DESSERTS & IJS
