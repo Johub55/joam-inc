@@ -7,6 +7,7 @@ import {
   TerminalCallbacks 
 } from '../../services/terminalService';
 import { showToast } from '../../services/appToast';
+import { PicoFlasherPanel } from './PicoFlasherPanel';
 import { 
   Cpu, 
   Usb, 
@@ -23,7 +24,8 @@ import {
   HelpCircle,
   Smartphone,
   Info,
-  ShieldAlert
+  ShieldAlert,
+  Zap
 } from 'lucide-react';
 
 interface DiyTerminalModalProps {
@@ -39,11 +41,11 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   const [logs, setLogs] = useState<string[]>([]);
   const [copied, setCopied] = useState<boolean>(false);
   const [downloaded, setDownloaded] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<'connect' | 'code' | 'wiring' | 'guide' | 'simulator'>('wiring');
+  const [activeTab, setActiveTab] = useState<'flasher' | 'connect' | 'code' | 'wiring' | 'guide' | 'simulator'>('flasher');
 
   // Simulator State
-  const [simLcdLine1, setSimLcdLine1] = useState<string>('WerkPay POS');
-  const [simLcdLine2, setSimLcdLine2] = useState<string>('Klaar voor order');
+  const [simLcdLine1, setSimLcdLine1] = useState<string>('WerkPay Terminal');
+  const [simLcdLine2, setSimLcdLine2] = useState<string>('Wacht op kassa..');
   const [simUid, setSimUid] = useState<string>('4129883155049012');
   const [simPin, setSimPin] = useState<string>('');
   const [simState, setSimState] = useState<'idle' | 'card_scanned' | 'approved' | 'declined'>('idle');
@@ -124,50 +126,50 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   // Simulator actions
   const handleSimTapCard = () => {
     setSimState('card_scanned');
-    setSimLcdLine1('Pas herkend!');
-    setSimLcdLine2('Pincode: ');
+    setSimLcdLine1('#OK *Wis  A=Stop');
+    setSimLcdLine2('PIN: ');
     setSimPin('');
   };
 
   const handleSimKeyPress = (char: string) => {
     if (simState !== 'card_scanned') return;
 
-    if (char === '*') {
+    if (char === '*' || char === 'C') {
       setSimPin(prev => prev.slice(0, -1));
       return;
     }
-    if (char === 'D') {
+    if (char === 'A' || char === 'D') {
       setSimState('idle');
       setSimLcdLine1('Geannuleerd!');
-      setSimLcdLine2('');
+      setSimLcdLine2('Terug naar start');
       setTimeout(() => {
-        setSimLcdLine1('WerkPay POS');
-        setSimLcdLine2('Klaar voor order');
-      }, 1200);
+        setSimLcdLine1('WerkPay Terminal');
+        setSimLcdLine2('Wacht op kassa..');
+      }, 1000);
       return;
     }
-    if (char === '#' || char === 'A') {
+    if (char === '#') {
       if (simPin.length >= 4) {
-        setSimLcdLine1('Verifiëren...');
-        setSimLcdLine2('Even geduld a.u.b.');
+        setSimLcdLine1('Controleren...');
+        setSimLcdLine2('Even geduld...');
         setTimeout(() => {
           setSimState('approved');
-          setSimLcdLine1('Betaling Gelukt!');
-          setSimLcdLine2('Eet smakelijk! :)');
+          setSimLcdLine1('Betaald! Bedankt');
+          setSimLcdLine2('Betaling OK');
           if (onSimulateCardScan) {
             onSimulateCardScan(simUid, simPin);
           }
           setTimeout(() => {
             setSimState('idle');
-            setSimLcdLine1('WerkPay POS');
-            setSimLcdLine2('Klaar voor order');
+            setSimLcdLine1('WerkPay Terminal');
+            setSimLcdLine2('Wacht op kassa..');
             setSimPin('');
           }, 2500);
         }, 1000);
       }
       return;
     }
-    if (simPin.length < 6) {
+    if (/^[0-9]$/.test(char) && simPin.length < 6) {
       setSimPin(prev => prev + char);
     }
   };
@@ -281,19 +283,30 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
         <div className="px-5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center gap-2 text-xs font-bold overflow-x-auto">
           <button
             type="button"
+            onClick={() => setActiveTab('flasher')}
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
+              activeTab === 'flasher' ? 'bg-emerald-500 text-slate-950 font-black shadow' : 'text-emerald-400 hover:bg-emerald-950/50 border border-emerald-500/30'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5" />
+            <span>⚡ Pico W Flashen (USB / Mobiel)</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveTab('wiring')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition ${
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
               activeTab === 'wiring' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
-            <span>Aansluitschema (Breadboard)</span>
+            <span>Aansluitschema</span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('guide')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition ${
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
               activeTab === 'guide' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
@@ -304,7 +317,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           <button
             type="button"
             onClick={() => setActiveTab('code')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition ${
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
               activeTab === 'code' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
@@ -315,7 +328,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           <button
             type="button"
             onClick={() => setActiveTab('connect')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition ${
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
               activeTab === 'connect' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
@@ -326,7 +339,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           <button
             type="button"
             onClick={() => setActiveTab('simulator')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition ${
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
               activeTab === 'simulator' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
@@ -337,6 +350,11 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
 
         {/* Tab Content */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
+
+          {/* TAB: INGEBOUWDE PICO W FLASHER */}
+          {activeTab === 'flasher' && (
+            <PicoFlasherPanel />
+          )}
           
           {/* TAB: WIRING */}
           {activeTab === 'wiring' && (
@@ -932,7 +950,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                     />
                   </div>
                   <p className="text-[11px] text-slate-400 leading-relaxed">
-                    Wanneer je op "Houd Pas Hier" klikt en 4 cijfers intoetst gevolgd door <strong># (OK)</strong>, wordt dit direct doorgestuurd naar de WerkPay kassa alsof de fysieke hardware verbonden is!
+                    Wanneer je op "Houd Pas Hier" klikt en 4 cijfers intoetst gevolgd door <strong># (OK)</strong>, wordt dit direct doorgestuurd naar de Werkdonalds kassa alsof de fysieke hardware verbonden is!
                   </p>
                 </div>
               </div>

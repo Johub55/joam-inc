@@ -28,12 +28,12 @@ export const DEFAULT_SUPABASE_PAY_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ey
 export const BRAND_CONFIGS: Record<BrandType, BrandConfig> = {
   werkpay: {
     id: 'werkpay',
-    name: 'WerkPay',
+    name: 'Werkdonalds',
     tagline: 'Vers Bereid • Snelle Kassa & Keuken',
     logoEmoji: '🍔',
     themeColor: 'blue',
-    badgeText: 'WERKPAY POS',
-    kitchenTitle: 'WerkPay Keuken KDS',
+    badgeText: 'WERKDONALDS POS',
+    kitchenTitle: 'Werkdonalds Keuken KDS',
     primaryButtonClass: 'bg-blue-600 hover:bg-blue-500 text-white',
     accentBadgeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
     headerGradient: 'from-blue-600 via-blue-500 to-cyan-400'

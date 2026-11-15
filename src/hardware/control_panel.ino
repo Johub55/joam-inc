@@ -2,8 +2,10 @@
  * ==============================================================================
  *  WERKPAY - DIY PINAPPARAAT (RASPBERRY PI PICO W + FIREBASE CLOUD RELAY)
  * ==============================================================================
- *  - Ghost-toets vrije keypad scanner (eigen row/col scan met dubbele verificatie)
- *  - Snelle TLS Keep-Alive polling zodat Annuleren direct werkt (< 1 sec)
+ *  - Ghost-toets vrije keypad scanner (dubbele verificatie + key-release)
+ *  - Schone TLS Keep-Alive HTTPS client met automatische socket-recovery (werkt
+ *    onbeperkt vaak achter elkaar zonder opnieuw opstarten!)
+ *  - Verbeterde 16x2 LCD teksten (altijd passend, zonder afgekapte essentie)
  *  - Exacte hardware pinout:
  *      LCD & PN532 NFC (I2C): SDA = GP4, SCL = GP5 (PN532 IRQ=-1, RESET=-1)
  *      4x4 Matrix Keypad    : Rijen = {13, 12, 11, 10}, Kolommen = {9, 8, 7, 6}
@@ -52,7 +54,7 @@ byte rowPins[ROWS] = {13, 12, 11, 10};
 byte colPins[COLS] = {9, 8, 7, 6};
 
 unsigned long laatsteToetsTijd = 0;
-const unsigned long DEBOUNCE_DELAY = 320;
+const unsigned long DEBOUNCE_DELAY = 300;
 bool toetsIngedruktVorigeKeer = false;
 
 enum TerminalState {
@@ -60,7 +62,8 @@ enum TerminalState {
   STATE_LINKING,
   STATE_WAITING_CARD,
   STATE_WAITING_PIN,
-  STATE_WAITING_RESULT
+  STATE_WAITING_RESULT,
+  STATE_SHOW_RESULT
 };
 
 TerminalState currentState = STATE_IDLE;
@@ -74,10 +77,10 @@ String lastReceiptAmount = "";
 bool betalingGeslaagd = false;
 
 unsigned long stateTimer = 0;
+unsigned long resultDurationMs = 2400;
 unsigned long lastPollMs = 0;
 
 WiFiClientSecure secureClient;
-HTTPClient sharedHttp;
 
 void beep(int freq, int ms) {
   tone(BUZZER_PIN, freq, ms);
@@ -85,12 +88,39 @@ void beep(int freq, int ms) {
   noTone(BUZZER_PIN);
 }
 
+String pad16(const String& s) {
+  String clean = s;
+  clean.replace("\xC3\xAB", "e");
+  clean.replace("\xC3\xA9", "e");
+  clean.replace("\xC3\xAF", "i");
+  clean.replace("\xE2\x82\xAC", "EUR");
+  if (clean.length() > 16) {
+    clean = clean.substring(0, 16);
+  }
+  while (clean.length() < 16) {
+    clean += ' ';
+  }
+  return clean;
+}
+
 void lcdShow(const String& line1, const String& line2) {
-  lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(line1.substring(0, 16));
+  lcd.print(pad16(line1));
   lcd.setCursor(0, 1);
-  lcd.print(line2.substring(0, 16));
+  lcd.print(pad16(line2));
+}
+
+String formatShortReason(const String& rawReason) {
+  String low = rawReason;
+  low.toLowerCase();
+  if (low.indexOf("saldo") >= 0) return "Te weinig saldo!";
+  if (low.indexOf("pin") >= 0 || low.indexOf("wachtwoord") >= 0) return "Foute pincode!";
+  if (low.indexOf("kaart") >= 0 || low.indexOf("pas") >= 0 || low.indexOf("uid") >= 0 || low.indexOf("autorisatie") >= 0) {
+    return "Pas onbekend!";
+  }
+  if (low.indexOf("geblokkeerd") >= 0 || low.indexOf("ban") >= 0) return "Pas geblokkeerd";
+  if (rawReason.length() == 0) return "Mislukt";
+  return rawReason.substring(0, 16);
 }
 
 void setIdleScreen() {
@@ -101,27 +131,26 @@ void setIdleScreen() {
   scannedUid = "";
   enteredPin = "";
   if (betalingGeslaagd) {
-    lcdShow("=== WERK_PAY ===", "D: Print Bon");
+    lcdShow("WerkPay Terminal", "D = Print Bon");
   } else {
-    lcdShow("WerkPay Terminal", "Klaar voor order");
+    lcdShow("WerkPay Terminal", "Wacht op kassa..");
   }
 }
 
 void toonPincodeScherm() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("PIN + # | A=Stop");
-  lcd.setCursor(0, 1);
-  lcd.print("PIN: ");
+  lcdShow("#OK *Wis  A=Stop", "PIN: ");
 }
 
 void updatePinDisplay() {
   lcd.setCursor(5, 1);
-  lcd.print("           ");
-  lcd.setCursor(5, 1);
-  for (unsigned int i = 0; i < enteredPin.length(); i++) {
-    lcd.print("*");
+  String stars = "";
+  for (unsigned int i = 0; i < enteredPin.length() && i < 11; i++) {
+    stars += "*";
   }
+  while (stars.length() < 11) {
+    stars += " ";
+  }
+  lcd.print(stars);
 }
 
 // Ghost-toets vrije scanner: dubbele verificatie (200us) + key-release detectie + debounce
@@ -134,7 +163,6 @@ char scanKeypad() {
 
     for (int r = 0; r < ROWS; r++) {
       if (digitalRead(rowPins[r]) == LOW) {
-        // Dubbele check tegen elektromagnetische storing / ghost toetsen
         delayMicroseconds(200);
         if (digitalRead(rowPins[r]) == LOW) {
           gevondenToets = hexaKeys[r][c];
@@ -146,7 +174,6 @@ char scanKeypad() {
     if (gevondenToets != 0) break;
   }
 
-  // Wacht op loslaten voordat dezelfde/volgende toets opnieuw telt (voorkomt dubbelklikken)
   if (gevondenToets == 0) {
     toetsIngedruktVorigeKeer = false;
     return 0;
@@ -165,24 +192,65 @@ char scanKeypad() {
   return gevondenToets;
 }
 
+// Schone HTTPS-hulpfunctie: leest ALTIJD de response uit en sluit/heropent bij fouten
+bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload) {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    unsigned long startWait = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startWait < 3000) {
+      delay(50);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      outCode = -99;
+      return false;
+    }
+  }
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    HTTPClient http;
+    secureClient.setInsecure();
+    secureClient.setTimeout(3500);
+    http.setReuse(true);
+    http.setTimeout(3500);
+
+    if (!http.begin(secureClient, url)) {
+      http.end();
+      secureClient.stop();
+      outCode = -100;
+      continue;
+    }
+
+    if (method == "PATCH") {
+      http.addHeader("Content-Type", "application/json");
+    }
+    http.addHeader("Connection", "keep-alive");
+
+    outCode = (method == "GET") ? http.GET() : http.sendRequest(method.c_str(), body);
+
+    if (outCode > 0) {
+      outPayload = http.getString();
+      http.end();
+      return true;
+    }
+
+    Serial.print("[HTTP] Herstel TLS socket na foutcode: ");
+    Serial.println(outCode);
+    http.end();
+    secureClient.stop();
+    delay(25);
+  }
+  return false;
+}
+
 bool patchFirestore(const String& maskQuery, const JsonDocument& doc) {
-  if (WiFi.status() != WL_CONNECTED) return false;
   String body;
   serializeJson(doc, body);
   String url = String(FIRESTORE_DOC_URL) + maskQuery;
-
-  secureClient.setInsecure();
-  sharedHttp.setReuse(true);
-  sharedHttp.setTimeout(2500);
-  if (!sharedHttp.begin(secureClient, url)) return false;
-  sharedHttp.addHeader("Content-Type", "application/json");
-  sharedHttp.addHeader("Connection", "keep-alive");
-  int code = sharedHttp.sendRequest("PATCH", body);
-  if (code < 200 || code >= 300) {
-    sharedHttp.end();
-    return false;
-  }
-  return true;
+  int code = 0;
+  String resp;
+  if (!firestoreRequest("PATCH", url, body, code, resp)) return false;
+  return (code >= 200 && code < 300);
 }
 
 void patchStatusIdle(const String& reason = "") {
@@ -225,62 +293,76 @@ void patchPaymentSubmitted(const String& uid, const String& pin) {
 }
 
 void annuleerDirect() {
-  Serial.println("Transactie direct geannuleerd door gebruiker.");
+  Serial.println("Transactie geannuleerd door gebruiker.");
   beep(800, 120);
-  lcdShow("Afgebroken...", "Even geduld");
+  lcdShow("Geannuleerd!", "Terug naar start");
   patchStatusIdle("Geannuleerd door gebruiker");
-  delay(450);
-  setIdleScreen();
+  currentState = STATE_SHOW_RESULT;
+  stateTimer = millis();
+  resultDurationMs = 900;
 }
 
 void simuleerBonPrinten() {
-  lcdShow("Bon printen...", "Zie monitor!");
-  Serial.println("\n======= WERK_PAY KASSABON =======");
+  lcdShow("Bon geprint!", "Zie USB Monitor");
+  Serial.println("\n====== WERKPAY KASSABON ======");
   Serial.println("Terminal: #001 (CLOUD)");
   Serial.print("Kaart:    ****-****-****-");
   Serial.println(lastReceiptCard.length() >= 4 ? lastReceiptCard.substring(0, 4) : "****");
   Serial.println("Omschrijving: WerkPay Transactie");
   Serial.println("Bedrag:   EUR " + lastReceiptAmount);
   Serial.println("Status:   SUCCES / BETAALD");
-  Serial.println("=================================\n");
-  delay(1500);
+  Serial.println("==============================\n");
   betalingGeslaagd = false;
-  setIdleScreen();
+  currentState = STATE_SHOW_RESULT;
+  stateTimer = millis();
+  resultDurationMs = 1500;
+}
+
+void startLinkingState(const String& user) {
+  activeUsername = user;
+  currentState = STATE_LINKING;
+  stateTimer = millis();
+  beep(2400, 90);
+  lcdShow("Koppel: " + activeUsername, "Houd pas  A=Stop");
+}
+
+void startPayState(const String& amtStr, const String& ordNo) {
+  pendingAmount = amtStr;
+  pendingOrderNo = ordNo;
+  currentState = STATE_WAITING_CARD;
+  stateTimer = millis();
+  beep(2400, 90);
+
+  String topLine = "EUR " + pendingAmount;
+  if (pendingOrderNo != "0" && (topLine.length() + 2 + pendingOrderNo.length()) <= 16) {
+    topLine += " #" + pendingOrderNo;
+  }
+  lcdShow(topLine, "Houd pas  A=Stop");
 }
 
 void pollFirestore() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  int code = 0;
+  String payload;
+  if (!firestoreRequest("GET", String(FIRESTORE_DOC_URL), "", code, payload)) {
+    return;
+  }
 
-  secureClient.setInsecure();
-  sharedHttp.setReuse(true);
-  sharedHttp.setTimeout(2500);
-  if (!sharedHttp.begin(secureClient, FIRESTORE_DOC_URL)) return;
-  sharedHttp.addHeader("Connection", "keep-alive");
-
-  int code = sharedHttp.GET();
   if (code == 404) {
-    sharedHttp.end();
     patchStatusIdle("Boot");
     return;
   }
   if (code != 200) {
-    sharedHttp.end();
     return;
   }
-  String payload = sharedHttp.getString();
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return;
   JsonObject fields = doc["fields"];
   String status = fields["status"]["stringValue"] | "IDLE";
 
-  if (currentState == STATE_IDLE) {
+  if (currentState == STATE_IDLE || currentState == STATE_SHOW_RESULT) {
     if (status == "LINK") {
-      activeUsername = fields["username"]["stringValue"] | "gebruiker";
-      currentState = STATE_LINKING;
-      stateTimer = millis();
-      beep(2400, 90);
-      lcdShow("Koppel pas:", activeUsername);
+      startLinkingState(fields["username"]["stringValue"] | "gebruiker");
     } else if (status == "PAY") {
       double amt = 0.0;
       if (fields["amount"]["doubleValue"].is<double>()) {
@@ -288,44 +370,43 @@ void pollFirestore() {
       } else if (fields["amount"]["integerValue"].is<const char*>()) {
         amt = atof(fields["amount"]["integerValue"].as<const char*>());
       }
-      pendingAmount = String(amt, 2);
-      pendingOrderNo = fields["orderNo"]["integerValue"] | "0";
-      currentState = STATE_WAITING_CARD;
-      stateTimer = millis();
-      beep(2400, 90);
-      lcdShow("WerkPay EUR " + pendingAmount, "Scan pas | A=Stop");
+      startPayState(String(amt, 2), fields["orderNo"]["integerValue"] | "0");
     }
   } else if (currentState == STATE_LINKING || currentState == STATE_WAITING_CARD || currentState == STATE_WAITING_PIN) {
     if (status == "IDLE") {
       beep(700, 100);
-      lcdShow("Geannuleerd", "Via kassa...");
-      delay(450);
-      setIdleScreen();
+      lcdShow("Geannuleerd!", "Door kassa");
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 900;
     }
   } else if (currentState == STATE_WAITING_RESULT) {
     if (status == "LINKED") {
       beep(2200, 100); beep(2800, 180);
-      lcdShow("Pas Gekoppeld!", activeUsername);
-      delay(2000);
-      patchStatusIdle("");
-      setIdleScreen();
+      lcdShow("Pas gekoppeld!", activeUsername);
+      patchStatusIdle("Klaar");
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 2200;
     } else if (status == "APPROVED") {
       lastReceiptCard = scannedUid;
       lastReceiptAmount = pendingAmount;
       betalingGeslaagd = true;
       beep(2000, 100); beep(2500, 100); beep(3000, 200);
-      lcdShow("Betaling Gelukt!", "Eet smakelijk! :)");
-      delay(2200);
-      patchStatusIdle("");
-      setIdleScreen();
+      lcdShow("Betaald! Bedankt", "EUR " + pendingAmount + " OK");
+      patchStatusIdle("Klaar");
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 2500;
     } else if (status == "DECLINED") {
       betalingGeslaagd = false;
       String reason = fields["reason"]["stringValue"] | "Geweigerd";
-      beep(700, 250); beep(500, 350);
-      lcdShow("Afgewezen!", reason);
-      delay(2500);
-      patchStatusIdle("");
-      setIdleScreen();
+      beep(700, 220); beep(500, 320);
+      lcdShow("Geweigerd!", formatShortReason(reason));
+      patchStatusIdle("Klaar");
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 2600;
     } else if (status == "IDLE") {
       setIdleScreen();
     }
@@ -350,7 +431,8 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
-  lcdShow("WERKPAY TERMINAL", "WiFi verbinden..");
+  lcd.clear();
+  lcdShow("WerkPay Terminal", "WiFi verbinden..");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -358,6 +440,14 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED && tries < 40) {
     delay(400);
     tries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lcdShow("WiFi Verbonden!", WiFi.localIP().toString());
+    delay(700);
+  } else {
+    lcdShow("WiFi Fout!", "Check WiFi naam");
+    delay(1500);
   }
 
   nfc.begin();
@@ -375,12 +465,16 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. Scan keypad ALTIJD eerst zodat Annuleren/toetsen meteen reageren
+  // 1. Scan keypad ALTIJD eerst zodat Annuleren/toetsen direct reageren
   char key = scanKeypad();
 
-  if (currentState == STATE_IDLE) {
+  if (currentState == STATE_IDLE || currentState == STATE_SHOW_RESULT) {
     if (key == 'D' && betalingGeslaagd) {
       simuleerBonPrinten();
+      return;
+    }
+    if (currentState == STATE_SHOW_RESULT && (now - stateTimer >= resultDurationMs)) {
+      setIdleScreen();
       return;
     }
   } else if (currentState == STATE_LINKING || currentState == STATE_WAITING_CARD) {
@@ -403,7 +497,7 @@ void loop() {
       if (currentState == STATE_LINKING) {
         currentState = STATE_WAITING_RESULT;
         stateTimer = millis();
-        lcdShow("Pas Gezien!", "Koppelen...");
+        lcdShow("Pas gescand!", "Koppelen...");
         patchCardScanned(scannedUid);
       } else {
         currentState = STATE_WAITING_PIN;
@@ -415,6 +509,7 @@ void loop() {
     }
   } else if (currentState == STATE_WAITING_PIN) {
     if (key) {
+      stateTimer = now;
       if (key == 'A' || key == 'D') {
         annuleerDirect();
         return;
@@ -429,7 +524,7 @@ void loop() {
           beep(2800, 120);
           currentState = STATE_WAITING_RESULT;
           stateTimer = millis();
-          lcdShow("Verifieren...", "Even geduld a.u.b.");
+          lcdShow("Controleren...", "Even geduld...");
           patchPaymentSubmitted(scannedUid, enteredPin);
           return;
         } else {
@@ -445,10 +540,11 @@ void loop() {
     }
 
     if (now - stateTimer > 45000) {
-      lcdShow("PIN Timeout", "");
+      lcdShow("Tijd verstreken", "Opnieuw scannen");
       patchStatusIdle("PIN timeout");
-      delay(800);
-      setIdleScreen();
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 1500;
       return;
     }
   } else if (currentState == STATE_WAITING_RESULT) {
@@ -457,12 +553,16 @@ void loop() {
       return;
     }
     if (now - stateTimer > 25000) {
-      setIdleScreen();
+      lcdShow("Geen reactie", "Terug naar start");
+      patchStatusIdle("Timeout");
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 1500;
       return;
     }
   }
 
-  // 2. Slimme polling (snelle Keep-Alive; tijdens PIN alleen als even niet getypt wordt)
+  // 2. Slimme polling (snelle schone Keep-Alive; tijdens PIN alleen als even niet getypt wordt)
   unsigned long pollInterval = (currentState == STATE_WAITING_PIN) ? 1200 : 550;
   bool magPollen = (currentState != STATE_WAITING_PIN) || (now - laatsteToetsTijd > 650);
   if (magPollen && (now - lastPollMs >= pollInterval)) {

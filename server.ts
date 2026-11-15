@@ -85,6 +85,47 @@ async function startServer() {
   });
 
 
+  // Serve genuinely compiled RP2040 C++ UF2 firmware
+  async function readCompiledCppUf2() {
+    const fs = await import("fs");
+    const uf2Path = path.join(process.cwd(), "public", "firmware", "werkpay_picow_i2c_pn532.uf2");
+    if (!fs.existsSync(uf2Path)) {
+      throw new Error("Gecompileerde C++ .UF2 firmware nog niet gevonden op de server.");
+    }
+    const buffer = fs.readFileSync(uf2Path);
+    return {
+      buffer,
+      filename: "werkpay_picow_i2c_pn532.uf2"
+    };
+  }
+
+  app.get("/api/pico/firmware-info", async (req, res) => {
+    try {
+      const info = await readCompiledCppUf2();
+      res.json({
+        ok: true,
+        filename: info.filename,
+        size: info.buffer.byteLength,
+        language: "C++ (RP2040 Arduino)"
+      });
+    } catch (err: any) {
+      res.status(404).json({ ok: false, error: err?.message || "C++ firmware niet gevonden" });
+    }
+  });
+
+  app.get("/api/pico/cpp-uf2", async (req, res) => {
+    try {
+      const info = await readCompiledCppUf2();
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename="${info.filename}"`);
+      res.setHeader("Content-Length", info.buffer.byteLength);
+      res.setHeader("X-Pico-Filename", info.filename);
+      res.send(info.buffer);
+    } catch (err: any) {
+      res.status(404).json({ error: err?.message || "Kon Pico W C++ firmware niet laden" });
+    }
+  });
+
   // In-memory state
   let linkModeUsername: string | null = null;
   let payModeActive: boolean = false;

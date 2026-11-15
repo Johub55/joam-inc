@@ -1295,29 +1295,29 @@ export const DigitalPhone: React.FC = () => {
       {/* Hidden audio element for WebRTC remote voice stream */}
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
-      {/* 1. FLOATING CYAN LAUNCHER TRIGGER */}
+      {/* 1. COMPACT FLOATING CYAN LAUNCHER TRIGGER */}
       <button
         onClick={() => {
           setIsOpen(!isOpen);
           try { AudioFX.beep(); } catch {}
         }}
         id="digital-phone-trigger"
-        className="fixed bottom-6 right-6 z-50 p-4 rounded-full bg-cyan-500 text-slate-950 font-bold shadow-2xl hover:scale-110 active:scale-95 transition-all ring-4 ring-cyan-500/20 hover:bg-cyan-400 flex items-center justify-center gap-2"
+        className="fixed bottom-3 right-3 sm:bottom-4 sm:right-4 z-50 p-2.5 sm:px-3 sm:py-2 rounded-full bg-cyan-500/95 text-slate-950 font-bold shadow-lg hover:scale-105 active:scale-95 transition-all ring-2 ring-cyan-500/25 hover:bg-cyan-400 flex items-center justify-center gap-1.5"
         title="Open Mobiele Telefoon"
       >
-        <span className="relative flex h-3 w-3">
+        <span className="relative flex h-2 w-2">
           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-slate-950 opacity-75"></span>
-          <span className="relative inline-flex rounded-full h-3 w-3 bg-slate-950"></span>
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-slate-950"></span>
         </span>
-        <Phone className="w-5 h-5" />
-        <span className="text-xs font-black uppercase tracking-tight pr-1">Telefoon</span>
+        <Phone className="w-4 h-4" />
+        <span className="hidden sm:inline text-[11px] font-black uppercase tracking-tight pr-0.5">Telefoon</span>
       </button>
 
       {/* 2. PHONE CHASSIS MOCKUP CONTAINER */}
       {isOpen && (
         <div
           id="digital-phone-shell"
-          className="fixed bottom-24 right-6 z-50 w-[320px] max-h-[85vh] h-[580px] bg-slate-900 border-4 border-slate-750 rounded-[40px] shadow-[0_25px_60px_-15px_rgba(0,0,0,0.8)] overflow-hidden flex flex-col font-sans ring-1 ring-white/10"
+          className="fixed bottom-16 right-3 sm:bottom-16 sm:right-4 z-50 w-[320px] max-h-[82vh] h-[560px] bg-slate-900 border-4 border-slate-750 rounded-[40px] shadow-[0_25px_60px_-15px_rgba(0,0,0,0.8)] overflow-hidden flex flex-col font-sans ring-1 ring-white/10"
         >
           {/* TOP STATUS BAR & DYNAMIC NOTCH */}
           <div className="bg-slate-950 px-5 pt-3.5 pb-2.5 flex items-center justify-between select-none relative z-20">

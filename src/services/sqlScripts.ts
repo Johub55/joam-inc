@@ -825,7 +825,7 @@ ON CONFLICT (username) DO NOTHING;
 -- Werkdonalds & De Koekploeg Producten
 INSERT INTO public.products (id, name, price, sale_price, on_sale, cat, emoji, in_stock) VALUES
   -- Werkdonalds
-  (1, 'WerkPay Classic Burger', 6.25, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
+  (1, 'Werkdonalds Classic Burger', 6.25, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (2, 'Double WerkBurger', 8.25, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (3, 'Triple WerkBurger Extra Beef', 9.45, 0.00, FALSE, 'Burgers & Wraps', '🍔', TRUE),
   (4, 'Big Werk Mac', 5.85, 3.95, FALSE, 'Burgers & Wraps', '🍔', TRUE),

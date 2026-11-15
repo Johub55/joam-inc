@@ -174,6 +174,14 @@ interface AppContextType {
     identifier: string,
     paymentMeta: any
   ) => Promise<{ success: boolean; message: string; order?: Order }>;
+  processSumUpPayment: (params: {
+    amount: number;
+    tipAmount?: number;
+    description?: string;
+    method: 'workpay' | 'cash';
+    paymentMeta?: any;
+  }) => Promise<{ success: boolean; message: string; order?: Order }>;
+  refundSumUpTransaction: (orderNo: number) => Promise<{ success: boolean; message: string }>;
 
   // Cash Payment Requests (Cross-terminal / Staff authorization)
   cashRequests: CashPaymentRequest[];
@@ -1086,7 +1094,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } catch {}
     }
     return {
-      storeName: 'WerkPay',
+      storeName: 'Werkdonalds',
       tagline: 'Vers Bereid • Snelle Kassa & Keuken',
       logoEmoji: '🍔',
       primaryColor: '#2563eb', // blue-600
@@ -1167,7 +1175,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try { return JSON.parse(saved); } catch {}
     }
     return [
-      { id: 1, from_account: 'klant01', to_account: 'WerkPay Kassa', amount: 14.50, label: 'WerkPay Bestelling #1000', when: 'Vandaag 12:30', timestamp: Date.now() - 3600000 },
+      { id: 1, from_account: 'klant01', to_account: 'Werkdonalds Kassa', amount: 14.50, label: 'Werkdonalds Bestelling #1000', when: 'Vandaag 12:30', timestamp: Date.now() - 3600000 },
       { id: 2, from_account: 'joas', to_account: 'emma', amount: 25.00, label: 'Overboeking naar emma', when: 'Gisteren', timestamp: Date.now() - 86400000 }
     ];
   });
@@ -2728,7 +2736,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       // Determine brand for proper transaction logging
       const currentBrandKey = activeBrand || 'koekploeg';
       const isKoekploegBrand = currentBrandKey === 'koekploeg';
-      const brandName = isKoekploegBrand ? 'De Koekploeg' : 'WerkPay';
+      const brandName = isKoekploegBrand ? 'De Koekploeg' : 'Werkdonalds';
       const toMerchant = `${brandName} Kassa`;
       const txLabel = `${brandName} Bestelling #${orderNo}`;
 
@@ -2881,6 +2889,363 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       success: true,
       message: `Bestelling #${newOrder.no} is succesvol geplaatst!`,
       order: newOrder
+    };
+  };
+
+  // SumUp Standalone Terminal Payment (direct bedrag zonder bestelling/keuken)
+  const processSumUpPayment = async (params: {
+    amount: number;
+    tipAmount?: number;
+    description?: string;
+    method: 'workpay' | 'cash';
+    paymentMeta?: any;
+  }): Promise<{ success: boolean; message: string; order?: Order }> => {
+    const baseAmount = Math.round((Number(params.amount) || 0) * 100) / 100;
+    const tipAmount = Math.round((Number(params.tipAmount) || 0) * 100) / 100;
+    const finalTotal = Math.round((baseAmount + tipAmount) * 100) / 100;
+
+    if (finalTotal <= 0) {
+      return { success: false, message: 'Voer een geldig bedrag hoger dan € 0,00 in.' };
+    }
+
+    const desc = (params.description || '').trim() || 'SumUp Betaling';
+    const currentBrandKey = activeBrand || 'koekploeg';
+    const isKoekploegBrand = currentBrandKey === 'koekploeg';
+    const brandName = isKoekploegBrand ? 'De Koekploeg' : 'Werkdonalds';
+    const meta: any = {
+      ...(params.paymentMeta || {}),
+      isSumUp: true,
+      sumupDescription: desc,
+      baseAmount,
+      tipAmount,
+      brand: currentBrandKey,
+      brandName
+    };
+
+    if (params.method === 'workpay') {
+      const mode = meta.mode || 'terminal';
+      let chargedAccount: BankAccount | null = null;
+      const targetClient = payClient || posClient;
+
+      if (mode === 'quick') {
+        if (!currentBankAccount) {
+          return { success: false, message: 'Geen actief WerkPay account ingelogd!' };
+        }
+        const pin = String(meta.pin || '').trim();
+        if (!pin) return { success: false, message: 'Voer de 4-cijferige pincode in.' };
+        const validPin = (currentBankAccount.pin_code && currentBankAccount.pin_code === pin) ||
+                         (currentBankAccount.password && currentBankAccount.password === pin);
+        if (!validPin) return { success: false, message: 'Onjuiste pincode!' };
+        chargedAccount = currentBankAccount;
+      } else if (mode === 'login') {
+        const username = String(meta.username || '').trim().toLowerCase();
+        const password = String(meta.password || '').trim();
+        if (!username || !password) {
+          return { success: false, message: 'Vul gebruikersnaam en wachtwoord/PIN in.' };
+        }
+        chargedAccount = bankAccounts.find(
+          a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
+        ) || null;
+        if (!chargedAccount && targetClient) {
+          try {
+            const { data } = await targetClient
+              .from('bank_accounts')
+              .select('*')
+              .ilike('username', username)
+              .or(`password.eq.${password},pin_code.eq.${password}`)
+              .single();
+            if (data) {
+              chargedAccount = {
+                id: data.id,
+                username: data.username,
+                account_holder: data.account_holder,
+                card_uid: data.card_uid,
+                linked_uids: parseLinkedUids(data.linked_uids),
+                pin_code: data.pin_code,
+                balance: Number(data.balance),
+                is_admin: Boolean(data.is_admin)
+              };
+            }
+          } catch {}
+        }
+      } else {
+        const cleanUid = normalizeCardUid(meta.cardUid);
+        const pin = String(meta.pin || '').trim();
+        if (!cleanUid) return { success: false, message: 'Geen pasnummer of NFC kaart gescand!' };
+        if (!pin) return { success: false, message: 'Voer de 4-cijferige pincode in.' };
+
+        chargedAccount = bankAccounts.find(a =>
+          accountMatchesUid(a, cleanUid) && (a.pin_code === pin || a.password === pin)
+        ) || null;
+
+        if (!chargedAccount && targetClient) {
+          try {
+            const { data: allDbAccs } = await targetClient.from('bank_accounts').select('*');
+            const matchedRow = (allDbAccs || []).find((row: any) => {
+              const candidate: BankAccount = {
+                id: row.id,
+                username: row.username,
+                account_holder: row.account_holder,
+                card_uid: row.card_uid,
+                linked_uids: parseLinkedUids(row.linked_uids),
+                pin_code: row.pin_code,
+                password: row.password,
+                balance: Number(row.balance),
+                is_admin: Boolean(row.is_admin)
+              };
+              return (candidate.pin_code === pin || candidate.password === pin) && accountMatchesUid(candidate, cleanUid);
+            });
+            if (matchedRow) {
+              chargedAccount = {
+                id: matchedRow.id,
+                username: matchedRow.username,
+                account_holder: matchedRow.account_holder,
+                card_uid: matchedRow.card_uid,
+                linked_uids: parseLinkedUids(matchedRow.linked_uids),
+                pin_code: matchedRow.pin_code,
+                balance: Number(matchedRow.balance),
+                is_admin: Boolean(matchedRow.is_admin)
+              };
+            }
+          } catch {}
+        }
+      }
+
+      if (!chargedAccount) {
+        return { success: false, message: 'Ongeldige kaart, gebruiker of pincode!' };
+      }
+
+      if (!chargedAccount.is_admin && chargedAccount.balance < finalTotal) {
+        return {
+          success: false,
+          message: `Onvoldoende saldo! Saldo is € ${chargedAccount.balance.toFixed(2)}, gevraagd is € ${finalTotal.toFixed(2)}.`
+        };
+      }
+
+      const newBal = chargedAccount.is_admin
+        ? chargedAccount.balance
+        : Math.max(0, Math.round((chargedAccount.balance - finalTotal) * 100) / 100);
+
+      setBankAccounts(prev => prev.map(a => a.id === chargedAccount!.id ? { ...a, balance: newBal } : a));
+      if (currentBankAccount && currentBankAccount.id === chargedAccount.id) {
+        setCurrentBankAccount(prev => prev ? { ...prev, balance: newBal } : null);
+      }
+
+      const tx: BankTransaction = {
+        id: Date.now(),
+        from_account: chargedAccount.username,
+        to_account: `${brandName} SumUp`,
+        amount: finalTotal,
+        label: `SumUp: ${desc} (#${orderNo})`,
+        note: `SumUp terminal via ${mode === 'terminal' ? 'Pico W Pinapparaat' : mode === 'card' ? 'NFC Pas' : 'WerkPay'} (${brandName})`,
+        order_no: orderNo,
+        when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
+        timestamp: Date.now()
+      };
+      setBankTransactions(prev => [tx, ...prev]);
+
+      if (targetClient) {
+        try {
+          if (mode === 'card' || mode === 'terminal') {
+            await targetClient.rpc('werkpay_charge_by_card', {
+              p_card_uid: chargedAccount.card_uid || meta.cardUid,
+              p_pin: meta.pin,
+              p_amount: finalTotal,
+              p_reference: `SUMUP-${orderNo}`,
+              p_cashier: currentPosUser?.name || 'SumUp Terminal',
+              p_order_no: orderNo,
+              p_brand: `${brandName} SumUp`
+            });
+          } else {
+            await targetClient.rpc('werkpay_charge_by_login', {
+              p_username: chargedAccount.username,
+              p_password: chargedAccount.password || meta.password || meta.pin,
+              p_amount: finalTotal,
+              p_reference: `SUMUP-${orderNo}`,
+              p_cashier: currentPosUser?.name || 'SumUp Terminal',
+              p_order_no: orderNo,
+              p_brand: `${brandName} SumUp`
+            });
+          }
+          await targetClient.from('bank_accounts').update({ balance: newBal }).eq('id', chargedAccount.id);
+        } catch {}
+      }
+
+      meta.account = chargedAccount.username;
+      meta.balance_after = newBal;
+    }
+
+    const sumupItems: OrderItem[] = [
+      {
+        name: desc,
+        qty: 1,
+        price: baseAmount,
+        done: true,
+        stage: 'klaar'
+      }
+    ];
+    if (tipAmount > 0) {
+      sumupItems.push({
+        name: 'Fooi (SumUp)',
+        qty: 1,
+        price: tipAmount,
+        done: true,
+        stage: 'klaar'
+      });
+    }
+
+    const newOrder: Order = {
+      id: Date.now(),
+      no: orderNo,
+      items: sumupItems,
+      total: finalTotal,
+      discount: 0,
+      orderType: 'takeaway',
+      identifier: desc,
+      notes: `SumUp Terminal (${currentPosUser?.name || 'Medewerker'})`,
+      paymentMethod: params.method,
+      paymentMeta: meta,
+      cashier: currentPosUser?.name || 'SumUp Terminal',
+      status: 'afgehaald',
+      time: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
+      timestamp: Date.now()
+    };
+
+    setOrders(prev => [newOrder, ...prev]);
+    setOrderNo(prev => prev + 1);
+    AudioFX.bell();
+
+    if (posClient) {
+      try {
+        await posClient.from('orders').insert({
+          order_no: newOrder.no,
+          items: newOrder.items,
+          total: newOrder.total,
+          discount: newOrder.discount,
+          order_type: newOrder.orderType,
+          identifier: newOrder.identifier,
+          notes: newOrder.notes,
+          payment_method: newOrder.paymentMethod,
+          payment_meta: newOrder.paymentMeta,
+          cashier: newOrder.cashier,
+          status: newOrder.status
+        });
+      } catch {}
+    }
+
+    broadcastSync('SYNC_ORDER_NEW', newOrder);
+
+    return {
+      success: true,
+      message: `SumUp betaling #${newOrder.no} (€ ${finalTotal.toFixed(2)}) geslaagd!`,
+      order: newOrder
+    };
+  };
+
+  const refundSumUpTransaction = async (targetOrderNo: number): Promise<{ success: boolean; message: string }> => {
+    const targetOrder = orders.find(o => o.no === targetOrderNo);
+    if (!targetOrder) {
+      return { success: false, message: 'Transactie niet gevonden.' };
+    }
+    if (targetOrder.status === 'cancelled' || targetOrder.status === 'geannuleerd' || targetOrder.paymentMeta?.refunded) {
+      return { success: false, message: 'Deze transactie is al terugbetaald/geannuleerd.' };
+    }
+
+    const targetClient = payClient || posClient;
+    const refundedBy = currentPosUser?.name || 'Medewerker';
+    const nextMeta = {
+      ...(targetOrder.paymentMeta || {}),
+      refunded: true,
+      refundedAt: Date.now(),
+      refundedBy
+    };
+
+    if (targetOrder.paymentMethod === 'workpay' && targetOrder.paymentMeta?.account) {
+      const accUsername = targetOrder.paymentMeta.account.toLowerCase();
+      let acc = bankAccounts.find(a => a.username.toLowerCase() === accUsername) || null;
+      if (!acc && targetClient) {
+        try {
+          const { data } = await targetClient
+            .from('bank_accounts')
+            .select('*')
+            .ilike('username', accUsername)
+            .single();
+          if (data) {
+            acc = {
+              id: data.id,
+              username: data.username,
+              account_holder: data.account_holder,
+              card_uid: data.card_uid,
+              pin_code: data.pin_code,
+              balance: Number(data.balance),
+              is_admin: Boolean(data.is_admin)
+            };
+          }
+        } catch {}
+      }
+
+      if (acc) {
+        const nextBalance = acc.is_admin
+          ? acc.balance
+          : Math.round((acc.balance + targetOrder.total) * 100) / 100;
+
+        setBankAccounts(prev => prev.map(a => a.id === acc!.id ? { ...a, balance: nextBalance } : a));
+        if (currentBankAccount && currentBankAccount.id === acc.id) {
+          setCurrentBankAccount(prev => prev ? { ...prev, balance: nextBalance } : null);
+        }
+
+        const refundTx: BankTransaction = {
+          id: Date.now(),
+          from_account: `${targetOrder.paymentMeta?.brandName || 'Werkdonalds'} SumUp`,
+          to_account: acc.username,
+          amount: targetOrder.total,
+          label: `Terugbetaling #${targetOrder.no}`,
+          note: `SumUp refund door ${refundedBy}`,
+          order_no: targetOrder.no,
+          when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
+          timestamp: Date.now()
+        };
+        setBankTransactions(prev => [refundTx, ...prev]);
+
+        if (targetClient) {
+          try {
+            await targetClient.from('bank_accounts').update({ balance: nextBalance }).eq('id', acc.id);
+            await targetClient.from('bank_transactions').insert({
+              from_account: refundTx.from_account,
+              to_account: refundTx.to_account,
+              amount: refundTx.amount,
+              label: refundTx.label,
+              note: refundTx.note,
+              order_no: refundTx.order_no
+            });
+          } catch {}
+        }
+      }
+    }
+
+    const now = Date.now();
+    setOrders(prev => prev.map(o => o.no === targetOrderNo ? {
+      ...o,
+      status: 'geannuleerd',
+      paymentMeta: nextMeta,
+      updatedAt: now
+    } : o));
+    recordLocalOrderMutation(targetOrderNo, { status: 'geannuleerd' });
+    broadcastSync('SYNC_ORDER_STATUS', { orderNo: targetOrderNo, status: 'geannuleerd', updatedAt: now });
+
+    if (posClient) {
+      try {
+        await posClient.from('orders').update({
+          status: 'geannuleerd',
+          payment_meta: nextMeta
+        }).eq('order_no', targetOrderNo);
+      } catch {}
+    }
+
+    logAuditAction('SUMUP_REFUND', `Transactie #${targetOrderNo} (€ ${targetOrder.total.toFixed(2)}) terugbetaald door ${refundedBy}.`);
+    return {
+      success: true,
+      message: `€ ${targetOrder.total.toFixed(2)} succesvol terugbetaald!`
     };
   };
 
@@ -4710,6 +5075,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         trackedOrderNo,
         setTrackedOrderNo,
         processCheckout,
+        processSumUpPayment,
+        refundSumUpTransaction,
         cashRequests,
         createCashRequest,
         approveCashRequest,

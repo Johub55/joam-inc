@@ -753,6 +753,23 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
             </p>
           </div>
 
+          {/* Pre-login small-screen SumUp Mode Preview */}
+          <div className="md:hidden p-3.5 rounded-2xl bg-cyan-950/40 border border-cyan-500/40 text-left space-y-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-black text-cyan-300 flex items-center gap-1.5">
+                <span>📱</span>
+                <span>Speciale SumUp Terminal Modus</span>
+              </span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-200 border border-cyan-500/30 font-bold">
+                Klein scherm
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-300 leading-relaxed">
+              Op dit kleine scherm opent na het inloggen als medewerker automatisch de compacte{' '}
+              <strong className="text-white">SumUp Terminal App</strong> (direct afrekenen, bestellingen, NFC passen &amp; Pi flasher).
+            </p>
+          </div>
+
           <div className="space-y-3 pt-2">
             <button
               type="button"
@@ -775,7 +792,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
               className="w-full py-3.5 px-5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center gap-2 border border-slate-700 transition"
             >
               <Lock className="w-4 h-4 text-amber-400" />
-              <span>🔑 Inloggen als Medewerker / Manager</span>
+              <span>🔑 Inloggen als Medewerker / Manager (SumUp)</span>
             </button>
           </div>
 
@@ -1822,7 +1839,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ onOpenPaymentModal }) => {
                         <span className="font-bold text-slate-300 text-xs block mb-1">🧊 IJs in drank</span>
                         {directDrinkLemon ? (
                           <div className="p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300 font-bold flex items-center justify-center text-center">
-                            <span>🔒 Geen keuze over ijs bij citroen (vast WerkPay recept)</span>
+                            <span>🔒 Geen keuze over ijs bij citroen (vast Werkdonalds recept)</span>
                           </div>
                         ) : (
                           <div className="grid grid-cols-3 gap-1">

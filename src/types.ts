@@ -15,7 +15,7 @@ export interface BrandConfig {
   headerGradient: string;
 }
 
-export type PosScreenType = 'kassa' | 'keuken' | 'afhaal' | 'pickup_control' | 'volgscherm' | 'voorraad' | 'manager' | 'loyalty_terminal';
+export type PosScreenType = 'kassa' | 'keuken' | 'afhaal' | 'pickup_control' | 'volgscherm' | 'voorraad' | 'manager' | 'loyalty_terminal' | 'sumup_terminal';
 
 export type WerkPayScreenType = 'wallet' | 'overboeken' | 'accounts';
 
@@ -104,6 +104,13 @@ export interface Order {
     accepted_by?: string;
     brand?: string;
     brandName?: string;
+    isSumUp?: boolean;
+    sumupDescription?: string;
+    tipAmount?: number;
+    baseAmount?: number;
+    refunded?: boolean;
+    refundedAt?: number;
+    refundedBy?: string;
   };
   cashier: string;
   status: OrderStatus;

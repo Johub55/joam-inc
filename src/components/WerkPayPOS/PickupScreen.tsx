@@ -398,7 +398,7 @@ export const PickupScreen: React.FC = () => {
   const [diagnostics, setDiagnostics] = useState<AudioDiagnosticStatus>(() => AudioFX.getDiagnostics());
 
   const isKoekploeg = activeBrand === 'koekploeg';
-  const brandTitle = customBranding.useCustomBranding ? customBranding.storeName : (isKoekploeg ? 'De Koekploeg' : 'WerkPay');
+  const brandTitle = customBranding.useCustomBranding ? customBranding.storeName : (isKoekploeg ? 'De Koekploeg' : 'Werkdonalds');
   const brandEmoji = customBranding.useCustomBranding ? customBranding.logoEmoji : (isKoekploeg ? '🧇' : '🍔');
   const brandTagline = customBranding.useCustomBranding ? customBranding.tagline : (isKoekploeg ? 'Vers Bereid • Snelle Service' : 'Vers Bereid • Snelle Kassa & Keuken');
   const brandGradient = customBranding.useCustomBranding ? customBranding.headerGradient : (isKoekploeg ? 'from-amber-600 to-amber-400' : 'from-blue-700 to-blue-500');
@@ -1043,14 +1043,14 @@ export const PickupScreen: React.FC = () => {
                         <div>
                           <p className="text-[10px] font-black uppercase tracking-wider opacity-80">Geschatte Bereidingstijd</p>
                           <p className="text-xs font-black">
-                            {preparingOrders.length === 0 ? 'Direct klaar (~2-3 min)' : `~${Math.max(3, preparingOrders.length * 2)} tot ${Math.max(5, preparingOrders.length * 3)} min wachttijd`}
+                            {prepOrders.length === 0 ? 'Direct klaar (~2-3 min)' : `~${Math.max(3, prepOrders.length * 2)} tot ${Math.max(5, prepOrders.length * 3)} min wachttijd`}
                           </p>
                         </div>
                       </div>
                       <span className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase ${
                         clockStyle === 'pixel' ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/40' : 'bg-slate-800 text-amber-400'
                       }`}>
-                        {preparingOrders.length} in wachtrij
+                        {prepOrders.length} in wachtrij
                       </span>
                     </div>
                   )}
@@ -1058,6 +1058,51 @@ export const PickupScreen: React.FC = () => {
                   {/* BEREIDEN KEUKEN */}
                   {activeWidgets.prep && (
                     <div className="flex flex-col gap-3 flex-1 overflow-hidden">
+                      {/* SUB-COLUMN: WACHTEN OP BEREIDING */}
+                      <div className={`rounded-3xl p-3.5 shadow-xl flex flex-col shrink-0 max-h-36 overflow-hidden transition ${
+                        clockStyle === 'pixel'
+                          ? 'bg-slate-950/90 border-2 border-emerald-500/40 font-mono'
+                          : clockStyle === 'neon'
+                          ? 'bg-slate-900/90 border-2 border-slate-700'
+                          : 'bg-slate-900/90 border-2 border-slate-800'
+                      }`}>
+                        <div className="flex items-center justify-between pb-2 border-b border-slate-800 shrink-0 mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className={`w-2 h-2 rounded-full animate-pulse ${clockStyle === 'pixel' ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+                            <h3 className={`text-sm font-black uppercase tracking-tight ${clockStyle === 'pixel' ? 'text-emerald-300 font-mono tracking-wider' : 'text-slate-300'}`}>
+                              {clockStyle === 'pixel' ? '📥 WACHTEN OP BEREIDING' : '⏳ Wachten op Bereiding'} ({waitingOrders.length})
+                            </h3>
+                          </div>
+                        </div>
+                        <div className="overflow-y-auto no-scrollbar">
+                          {waitingOrders.length === 0 ? (
+                            <p className={`text-[11px] font-bold py-1.5 text-center italic ${clockStyle === 'pixel' ? 'text-emerald-600 font-mono' : 'text-slate-500'}`}>
+                              Geen bestellingen wachten op bereiding
+                            </p>
+                          ) : (
+                            <div className="flex flex-wrap gap-1.5 pt-0.5">
+                              {waitingOrders.map(o => (
+                                <button
+                                  type="button"
+                                  key={o.no}
+                                  onClick={() => setTrackedOrderNo(o.no)}
+                                  className={`px-2.5 py-1 rounded-xl border text-left transition hover:scale-[1.03] flex items-center gap-1.5 ${
+                                    clockStyle === 'pixel'
+                                      ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300 font-mono'
+                                      : 'bg-slate-950 border-slate-700/80 text-slate-200 hover:border-slate-500'
+                                  }`}
+                                >
+                                  <span className="font-mono font-black text-sm">#{o.no}</span>
+                                  {o.identifier && (
+                                    <span className="text-[10px] font-bold opacity-75 truncate max-w-[90px]">{o.identifier}</span>
+                                  )}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
                       {/* SUB-COLUMN: WORDT BEREID */}
                       <div className={`rounded-3xl p-4 shadow-xl flex flex-col flex-1 overflow-hidden transition ${
                         clockStyle === 'pixel'
@@ -1205,7 +1250,7 @@ export const PickupScreen: React.FC = () => {
                       <span className="text-xl animate-bounce">🔥</span>
                       <div>
                         <span className="text-[10px] font-black uppercase tracking-wider block opacity-90">DAGDEAL / PROMO van de DAG</span>
-                        <span className="text-xs font-black block">🍔 WerkPay Super Deal Menu + Vers Gekoelde Drank</span>
+                        <span className="text-xs font-black block">🍔 Werkdonalds Super Deal Menu + Vers Gekoelde Drank</span>
                       </div>
                     </div>
                     <span className="bg-amber-400 text-slate-950 font-mono font-black text-xs px-2.5 py-1 rounded-xl shadow">
@@ -1338,26 +1383,33 @@ export const PickupScreen: React.FC = () => {
                   </div>
                 </div>
 
-                {/* IN DE WACHTRIJ LIST */}
+                {/* WACHTEN OP BEREIDING LIST */}
                 <div className="mb-4 pb-4 border-b border-slate-800 shrink-0">
-                  <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2 mb-2.5">
-                    <span className="w-2 h-2 rounded-full bg-slate-500 animate-pulse" />
-                    📥 IN DE WACHTRIJ ({waitingOrders.length})
+                  <h3 className="text-xs font-black text-slate-300 uppercase tracking-widest flex items-center gap-2 mb-2.5">
+                    <span className="w-2 h-2 rounded-full bg-slate-400 animate-pulse" />
+                    ⏳ WACHTEN OP BEREIDING ({waitingOrders.length})
                   </h3>
                   {waitingOrders.length === 0 ? (
                     <p className="py-2 px-3 rounded-xl bg-slate-950/30 text-slate-500 text-xs font-bold border border-dashed border-slate-800/85">
-                      Geen bestellingen in de wachtrij
+                      Geen bestellingen wachten op bereiding
                     </p>
                   ) : (
-                    <div className="flex flex-wrap gap-2 max-h-[75px] overflow-y-auto">
+                    <div className="flex flex-wrap gap-2 max-h-[85px] overflow-y-auto">
                       {waitingOrders.map(o => (
-                        <div 
-                          key={o.no} 
-                          className="px-3.5 py-1 rounded-xl bg-slate-950 border border-slate-800 flex items-center gap-1 font-mono font-black text-base text-slate-300 shadow-sm"
+                        <button
+                          type="button"
+                          key={o.no}
+                          onClick={() => setTrackedOrderNo(o.no)}
+                          className="px-3.5 py-1 rounded-xl bg-slate-950 border border-slate-700 hover:border-slate-500 flex items-center gap-1.5 font-mono font-black text-base text-slate-200 shadow-sm transition"
                         >
                           <span className="text-slate-500 text-xs">#</span>
                           <span>{o.no}</span>
-                        </div>
+                          {o.identifier && (
+                            <span className="font-sans text-[11px] font-bold text-slate-400 truncate max-w-[110px]">
+                              · {o.identifier}
+                            </span>
+                          )}
+                        </button>
                       ))}
                     </div>
                   )}
@@ -1547,21 +1599,21 @@ export const PickupScreen: React.FC = () => {
 
             const columns = [
               {
-                brand: "🍔 WERKPAY",
+                brand: "🍔 WERKDONALDS",
                 title: "Burgers & Wraps",
                 icon: "🍔",
                 items: col1Items,
                 brandColor: "border-red-500/30 text-red-400 bg-red-950/20"
               },
               {
-                brand: "🍟 WERKPAY",
+                brand: "🍟 WERKDONALDS",
                 title: "Snacks, Frites & Dips",
                 icon: "🍟",
                 items: col2Items,
                 brandColor: "border-amber-500/30 text-amber-400 bg-amber-950/20"
               },
               {
-                brand: "🥤 WERKPAY",
+                brand: "🥤 WERKDONALDS",
                 title: "Dranken & Desserts",
                 icon: "🍦",
                 items: col3Items,
@@ -1597,7 +1649,7 @@ export const PickupScreen: React.FC = () => {
                       <h2 className="text-xl sm:text-2xl font-black text-amber-400 uppercase tracking-tight">
                         📖 GEZAMENLIJKE MENUKAART
                       </h2>
-                      <p className="text-xs text-slate-400">Geniet van onze WerkPay &amp; Koekploeg specialiteiten</p>
+                      <p className="text-xs text-slate-400">Geniet van onze Werkdonalds &amp; Koekploeg specialiteiten</p>
                     </div>
                   </div>
                   <span className="text-xs bg-slate-800 text-slate-300 px-3 py-1 rounded-full border border-slate-700 font-bold">
@@ -1874,6 +1926,60 @@ export const PickupScreen: React.FC = () => {
               </div>
 
               <AutoScrollContainer className="flex-1 pt-4 space-y-6">
+                {/* SUBSECTION 0: WACHTEN OP BEREIDING */}
+                <div>
+                  <h3 className="text-xs font-black text-slate-300 uppercase tracking-widest flex items-center gap-2 mb-3">
+                    <span className="w-2 h-2 bg-slate-400 rounded-full animate-pulse" />
+                    ⏳ Wachten op Bereiding ({waitingOrders.length})
+                  </h3>
+                  {waitingOrders.length === 0 ? (
+                    <p className="py-2.5 px-3.5 rounded-xl bg-slate-950/40 text-slate-500 text-xs font-bold border border-dashed border-slate-800">
+                      Geen bestellingen wachten op bereiding
+                    </p>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                      {waitingOrders.map(o => {
+                        const meta = getStatusMeta(o.status);
+                        const displayName = o.identifier || (o.orderType === 'dine_in' ? 'Tafel' : 'Afhaal');
+
+                        return (
+                          <div
+                            key={o.no}
+                            onClick={() => setTrackedOrderNo(o.no)}
+                            className="p-3.5 rounded-2xl bg-slate-950 border-2 border-dashed border-slate-700/80 text-left shadow-inner flex flex-col justify-between hover:border-slate-500 transition cursor-pointer group"
+                            title="Klik om status te bekijken"
+                          >
+                            <div>
+                              <div className="flex items-center justify-between">
+                                <span className="font-mono font-black text-2xl sm:text-3xl text-slate-200 group-hover:scale-105 transition-transform">
+                                  #{o.no}
+                                </span>
+                                <span className="text-sm">
+                                  {o.orderType === 'dine_in' ? '🍽️' : '🛍️'}
+                                </span>
+                              </div>
+
+                              <div className="mt-1 font-bold text-xs text-slate-300 truncate" title={displayName}>
+                                voor {displayName}
+                              </div>
+                            </div>
+
+                            <div className="mt-2.5 pt-2 border-t border-slate-800/80 flex items-center justify-between">
+                              <span className="text-[10px] font-bold text-slate-400 flex items-center gap-1 truncate">
+                                <span>{meta.emoji}</span>
+                                <span className="truncate">{meta.shortLabel || 'In wachtrij'}</span>
+                              </span>
+                              <span className="text-[10px] text-slate-500 font-mono">
+                                {o.time}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
                 {/* SUBSECTION 1: BEREIDEN */}
                 <div>
                   <h3 className="text-xs font-black text-amber-400 uppercase tracking-widest flex items-center gap-2 mb-3">

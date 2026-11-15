@@ -82,7 +82,7 @@ const QuickEmojiSelector: React.FC<{ onSelect: (emoji: string) => void; current?
 
 const USER_THEME_OPTIONS = [
   { id: 'bg-slate-950', label: 'Standaard Donker', swatch: 'bg-slate-800 border-slate-500' },
-  { id: 'bg-blue-950', label: 'WerkPay Blauw', swatch: 'bg-blue-700 border-blue-400' },
+  { id: 'bg-blue-950', label: 'Werkdonalds Blauw', swatch: 'bg-blue-700 border-blue-400' },
   { id: 'bg-amber-950', label: 'Koekploeg Goud', swatch: 'bg-amber-600 border-amber-300' },
   { id: 'bg-emerald-950', label: 'Emerald Groen', swatch: 'bg-emerald-700 border-emerald-400' },
   { id: 'bg-purple-950', label: 'Paars Luxe', swatch: 'bg-purple-700 border-purple-400' },
@@ -188,7 +188,7 @@ export const ManagerScreen: React.FC = () => {
   const [stopIcon, setStopIcon] = useState<string>(orderStopConfig?.icon || '🛑');
 
   // Branding Customization States
-  const [brandName, setBrandName] = useState<string>(customBranding?.storeName || 'WerkPay');
+  const [brandName, setBrandName] = useState<string>(customBranding?.storeName || 'Werkdonalds');
   const [brandTagline, setBrandTagline] = useState<string>(customBranding?.tagline || 'Vers Bereid • Snelle Kassa & Keuken');
   const [brandEmoji, setBrandEmoji] = useState<string>(customBranding?.logoEmoji || '🍔');
   const [brandColor, setBrandColor] = useState<string>(customBranding?.primaryColor || '#2563eb');
@@ -1766,7 +1766,7 @@ export const ManagerScreen: React.FC = () => {
                       value={brandName}
                       onChange={e => setBrandName(e.target.value)}
                       className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-white text-sm focus:border-blue-500 outline-none transition"
-                      placeholder="Bijv. WerkPay"
+                      placeholder="Bijv. Werkdonalds"
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -1944,7 +1944,7 @@ export const ManagerScreen: React.FC = () => {
                 <h3 className="text-lg font-black text-white leading-tight">Hoe werkt branding?</h3>
                 <div className="space-y-4 text-sm text-slate-400 leading-relaxed">
                   <p>
-                    Wanneer je <strong>"Activeer Aangepaste Branding"</strong> inschakelt, zal de applicatie niet langer kijken naar het geselecteerde merk (WerkPay of Koekploeg) voor het uiterlijk.
+                    Wanneer je <strong>"Activeer Aangepaste Branding"</strong> inschakelt, zal de applicatie niet langer kijken naar het geselecteerde merk (Werkdonalds of Koekploeg) voor het uiterlijk.
                   </p>
                   <ul className="space-y-3">
                     <li className="flex gap-3">
@@ -1971,7 +1971,7 @@ export const ManagerScreen: React.FC = () => {
                  <div className="grid grid-cols-1 gap-2">
                     <button 
                       onClick={() => {
-                        setBrandName('WerkPay');
+                        setBrandName('Werkdonalds');
                         setBrandTagline('Vers Bereid • Snelle Kassa & Keuken');
                         setBrandEmoji('🍔');
                         setBrandColor('#2563eb');
@@ -1979,7 +1979,7 @@ export const ManagerScreen: React.FC = () => {
                       }}
                       className="p-2 rounded-lg bg-slate-950 border border-slate-800 text-left hover:border-blue-500 transition flex items-center justify-between"
                     >
-                      <span className="text-[11px] font-bold text-slate-300">Zet terug naar WerkPay Blauw</span>
+                      <span className="text-[11px] font-bold text-slate-300">Zet terug naar Werkdonalds Blauw</span>
                       <span className="text-xs">🍔</span>
                     </button>
                     <button 
@@ -2879,7 +2879,7 @@ export const ManagerScreen: React.FC = () => {
           </div>
           <button
             onClick={() => {
-              if (confirm('Menulijst herstellen naar de standaard WerkPay & Koekploeg gerechten?')) {
+              if (confirm('Menulijst herstellen naar de standaard Werkdonalds & Koekploeg gerechten?')) {
                 resetProductsToDefault();
               }
             }}
@@ -2972,8 +2972,8 @@ export const ManagerScreen: React.FC = () => {
                 onChange={e => setNewProdBrand(e.target.value as any)}
                 className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
               >
-                <option value="both">Allebei (WerkPay + Koekploeg)</option>
-                <option value="werkpay">Alleen WerkPay</option>
+                <option value="both">Allebei (Werkdonalds + Koekploeg)</option>
+                <option value="werkpay">Alleen Werkdonalds</option>
                 <option value="koekploeg">Alleen Koekploeg</option>
               </select>
             </div>
@@ -3075,7 +3075,7 @@ export const ManagerScreen: React.FC = () => {
                           ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
                           : 'bg-slate-800 text-slate-400 border-slate-700'
                       }`}>
-                        {p.brand === 'koekploeg' ? 'Koekploeg' : p.brand === 'werkpay' ? 'WerkPay' : 'Beide'}
+                        {p.brand === 'koekploeg' ? 'Koekploeg' : p.brand === 'werkpay' ? 'Werkdonalds' : 'Beide'}
                       </span>
                     </div>
                   </td>
@@ -3795,9 +3795,9 @@ export const ManagerScreen: React.FC = () => {
                     onChange={e => setEditingProduct({ ...editingProduct, brand: e.target.value as any })}
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white"
                   >
-                    <option value="werkpay">WerkPay</option>
+                    <option value="werkpay">Werkdonalds</option>
                     <option value="koekploeg">Koekploeg</option>
-                    <option value="both">Allebei (WerkPay + Koekploeg)</option>
+                    <option value="both">Allebei (Werkdonalds + Koekploeg)</option>
                   </select>
                 </div>
               </div>
@@ -3869,7 +3869,7 @@ export const ManagerScreen: React.FC = () => {
 
             <div className="p-5 bg-white text-slate-950 font-mono text-xs space-y-2 select-text">
               <div className="text-center pb-2 border-b-2 border-dashed border-slate-300">
-                <h3 className="font-black text-base">WERKPAY POS</h3>
+                <h3 className="font-black text-base">WERKDONALDS POS</h3>
                 <p className="text-[10px] text-slate-500">Z-RAPPORT / FINANCIËLE DAGAFSLUITING</p>
                 <p className="text-[10px] text-slate-500">{new Date().toLocaleString('nl-NL')}</p>
               </div>

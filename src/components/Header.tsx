@@ -37,9 +37,10 @@ import { getStatusMeta } from '../services/orderStatus';
 
 interface HeaderProps {
   onOpenGithub?: () => void;
+  hideHeader?: boolean;
 }
 
-export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
+export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false }) => {
   const { 
     appMode, 
     setAppMode, 
@@ -77,7 +78,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
 
   const USER_THEMES = [
     { id: 'bg-slate-950', label: 'Standaard Donker', dot: 'bg-slate-600' },
-    { id: 'bg-blue-950', label: 'WerkPay Blauw', dot: 'bg-blue-500' },
+    { id: 'bg-blue-950', label: 'Werkdonalds Blauw', dot: 'bg-blue-500' },
     { id: 'bg-amber-950', label: 'Koekploeg Goud', dot: 'bg-amber-500' },
     { id: 'bg-emerald-950', label: 'Emerald Groen', dot: 'bg-emerald-500' },
     { id: 'bg-purple-950', label: 'Paars Luxe', dot: 'bg-purple-500' },
@@ -89,10 +90,16 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
   const [soundActive, setSoundActive] = useState<boolean>(AudioFX.isEnabled);
 
   // Determine permissions using centralized canAccess
-  const isCustomer = !currentPosUser || 
-    currentPosUser.username === 'bestel_kassa' || 
-    currentPosUser.username === 'klant' || 
-    (!canAccess('kitchen') && !canAccess('voorraad') && !canAccess('manager'));
+  const isLoggedInStaff = Boolean(
+    currentPosUser &&
+    currentPosUser.username !== 'bestel_kassa' &&
+    currentPosUser.username !== 'klant' &&
+    currentPosUser.username !== 'rpi' &&
+    !currentPosUser.is_terminal_locked
+  );
+
+  const isCustomer = !isLoggedInStaff ||
+    (!canAccess('pos') && !canAccess('kitchen') && !canAccess('voorraad') && !canAccess('manager') && !canAccess('cash_pay') && !canAccess('pickup_control') && !currentPosUser?.is_admin);
 
   const canAccessKitchen = canAccess('kitchen');
   const canAccessInventory = canAccess('voorraad');
@@ -100,6 +107,10 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
   const canAccessPickupControl = canAccess('manager') || canAccess('pickup_control') || currentPosUser?.is_admin || currentPosUser?.username.toLowerCase() === 'joas';
 
   const handleSelectPosScreen = (screen: PosScreenType) => {
+    if (screen === 'sumup_terminal' && !isLoggedInStaff) {
+      showToast('Log eerst in als medewerker om de SumUp Terminal te openen.', 'error');
+      return;
+    }
     if (screen === 'keuken' && !canAccessKitchen) {
       showToast('Geen toegang tot de keuken. Als je dit recht niet hebt mag je dit scherm niet openen.', 'error');
       return;
@@ -137,13 +148,30 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
     headerGradient: customBranding.headerGradient
   } : brandConfig;
 
-  // If logged in as RPI Kiosk account or locked terminal, hide the top header completely
-  if (currentPosUser?.username === 'rpi' || currentPosUser?.is_terminal_locked) {
+  // If logged in as RPI Kiosk account, locked terminal, or compact SumUp mobile shell, hide top header
+  if (hideHeader || currentPosUser?.username === 'rpi' || currentPosUser?.is_terminal_locked) {
     return null;
   }
 
   return (
     <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40 shadow-xl">
+      {/* Pre-login small-screen indicator: maakt vooraf duidelijk dat dit kleine scherm de speciale SumUp modus heeft */}
+      {!isLoggedInStaff && (
+        <div className="md:hidden px-3 py-1.5 bg-gradient-to-r from-cyan-950 via-slate-900 to-blue-950 border-b border-cyan-500/30 flex items-center justify-between gap-2 text-[11px]">
+          <div className="flex items-center gap-1.5 text-cyan-200 font-bold min-w-0">
+            <span className="shrink-0">📱</span>
+            <span className="truncate">Speciale SumUp Modus beschikbaar na inloggen</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowPosLoginModal(true)}
+            className="shrink-0 px-2.5 py-0.5 rounded-md bg-cyan-500 text-slate-950 font-black text-[10px]"
+          >
+            Inloggen
+          </button>
+        </div>
+      )}
+
       {/* Top Banner with App Switcher & User Statuses */}
       <div className="px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 bg-slate-950/70 backdrop-blur-md">
         
@@ -208,10 +236,10 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
                   ? 'bg-blue-600 text-white shadow-sm' 
                   : 'text-slate-400 hover:text-blue-300'
               }`}
-              title="Wissel naar WerkPay (Burgers & Blauw thema)"
+              title="Wissel naar Werkdonalds (Burgers & Blauw thema)"
             >
               <span>🍔</span>
-              <span className="hidden md:inline">WerkPay</span>
+              <span className="hidden md:inline">Werkdonalds</span>
             </button>
           </div>
         </div>
@@ -229,7 +257,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
             }`}
           >
             <Utensils className="w-4 h-4" />
-            <span>{isKoekploeg ? 'De Koekploeg Kassa' : 'WerkPay POS'}</span>
+            <span>{isKoekploeg ? 'De Koekploeg Kassa' : 'Werkdonalds POS'}</span>
             {activeKitchenCount > 0 && (
               <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] font-black bg-rose-600 text-white animate-pulse">
                 {activeKitchenCount}
@@ -458,6 +486,21 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub }) => {
               </span>
             )}
           </button>
+
+          {isLoggedInStaff && (
+            <button
+              onClick={() => handleSelectPosScreen('sumup_terminal')}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg font-bold transition whitespace-nowrap ${
+                posScreen === 'sumup_terminal'
+                  ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/25 font-black'
+                  : 'text-cyan-300 hover:bg-cyan-950/50 border border-cyan-500/30'
+              }`}
+              title="Open SumUp Terminal App (snel afrekenen, refunds & NFC pas tools)"
+            >
+              <CreditCard className="w-4 h-4" />
+              <span>SumUp Terminal</span>
+            </button>
+          )}
 
           <button
             onClick={() => handleSelectPosScreen('afhaal')}

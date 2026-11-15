@@ -20,6 +20,8 @@ const InventoryScreen = lazy(() => import('./components/WerkPayPOS/InventoryScre
 const ManagerScreen = lazy(() => import('./components/WerkPayPOS/ManagerScreen').then(m => ({ default: m.ManagerScreen })));
 const OrderTrackingScreen = lazy(() => import('./components/WerkPayPOS/OrderTrackingScreen').then(m => ({ default: m.OrderTrackingScreen })));
 const LoyaltyTerminalScreen = lazy(() => import('./components/WerkPayPOS/LoyaltyTerminalScreen').then(m => ({ default: m.LoyaltyTerminalScreen })));
+const SumUpTerminalScreen = lazy(() => import('./components/WerkPayPOS/SumUpTerminalScreen').then(m => ({ default: m.SumUpTerminalScreen })));
+const MobileTerminalLoginScreen = lazy(() => import('./components/WerkPayPOS/MobileTerminalLoginScreen').then(m => ({ default: m.MobileTerminalLoginScreen })));
 const WalletScreen = lazy(() => import('./components/WerkPayBank/WalletScreen').then(m => ({ default: m.WalletScreen })));
 const ManagerAccountsScreen = lazy(() => import('./components/WerkPayBank/ManagerAccountsScreen').then(m => ({ default: m.ManagerAccountsScreen })));
 const SupabaseModal = lazy(() => import('./components/SupabaseModal').then(m => ({ default: m.SupabaseModal })));
@@ -59,6 +61,64 @@ const MainLayout: React.FC = () => {
   const [showGithubModal, setShowGithubModal] = useState<boolean>(false);
   const [showPaymentModal, setShowPaymentModal] = useState<boolean>(false);
   const [showSetup2FA, setShowSetup2FA] = useState<boolean>(false);
+  const [preferFullPosOnMobile, setPreferFullPosOnMobile] = useState<boolean>(false);
+  const [isSmallScreen, setIsSmallScreen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.innerWidth < 768;
+  });
+
+  const isLoggedInStaff = Boolean(
+    currentPosUser &&
+    currentPosUser.username !== 'bestel_kassa' &&
+    currentPosUser.username !== 'klant' &&
+    currentPosUser.username !== 'rpi' &&
+    !currentPosUser.is_terminal_locked
+  );
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mq = window.matchMedia('(max-width: 767px)');
+    const syncScreen = () => setIsSmallScreen(mq.matches);
+    syncScreen();
+    mq.addEventListener('change', syncScreen);
+    window.addEventListener('resize', syncScreen);
+    return () => {
+      mq.removeEventListener('change', syncScreen);
+      window.removeEventListener('resize', syncScreen);
+    };
+  }, []);
+
+  // Auth-gate & automatic small-screen SumUp mode activation for logged-in staff
+  React.useEffect(() => {
+    if (!isLoggedInStaff) {
+      setPreferFullPosOnMobile(false);
+      if (posScreen === 'sumup_terminal') {
+        setPosScreen('kassa');
+      }
+      return;
+    }
+
+    if (isSmallScreen && appMode === 'pos' && !preferFullPosOnMobile && posScreen !== 'sumup_terminal') {
+      setPosScreen('sumup_terminal');
+    }
+  }, [isLoggedInStaff, isSmallScreen, appMode, preferFullPosOnMobile, posScreen, setPosScreen]);
+
+  const showMobilePreLoginShell = Boolean(
+    isSmallScreen &&
+    !isLoggedInStaff &&
+    appMode === 'pos' &&
+    !preferFullPosOnMobile
+  );
+
+  const isCompactSumUpMobileShell = Boolean(
+    isSmallScreen &&
+    isLoggedInStaff &&
+    appMode === 'pos' &&
+    posScreen === 'sumup_terminal' &&
+    !preferFullPosOnMobile
+  );
+
+  const hideMainHeader = showMobilePreLoginShell || isCompactSumUpMobileShell;
 
   const [managerSessionUnlocked, setManagerSessionUnlocked] = useState<boolean>(() => {
     if (!currentPosUser) return false;
@@ -153,14 +213,19 @@ const MainLayout: React.FC = () => {
       {/* GitHub Deployment Auto-Update Listener & Banner */}
       <AutoUpdateBanner />
 
-      {/* Universal Top Header */}
-      <Header onOpenGithub={() => setShowGithubModal(true)} />
+      {/* Universal Top Header (verborgen op klein scherm in SumUp Terminal / Mobiele Login stand) */}
+      <Header onOpenGithub={() => setShowGithubModal(true)} hideHeader={hideMainHeader} />
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col overflow-hidden">
         <Suspense fallback={<ScreenLoader />}>
-          {/* WerkPay POS screens */}
+          {/* Werkdonalds POS screens */}
           {appMode === 'pos' && (
+            showMobilePreLoginShell ? (
+              <MobileTerminalLoginScreen
+                onSwitchToFullVersion={() => setPreferFullPosOnMobile(true)}
+              />
+            ) : (
             <>
               {posScreen === 'kassa' && (
                 <PosScreen onOpenPaymentModal={() => setShowPaymentModal(true)} />
@@ -192,7 +257,17 @@ const MainLayout: React.FC = () => {
               )}
               {posScreen === 'volgscherm' && <OrderTrackingScreen />}
               {posScreen === 'loyalty_terminal' && <LoyaltyTerminalScreen />}
+              {posScreen === 'sumup_terminal' && isLoggedInStaff && (
+                <SumUpTerminalScreen
+                  isCompactMobileShell={isCompactSumUpMobileShell}
+                  onSwitchToFullVersion={() => {
+                    setPreferFullPosOnMobile(true);
+                    setPosScreen('kassa');
+                  }}
+                />
+              )}
             </>
+            )
           )}
 
           {/* WerkPay Bank screens */}
@@ -209,7 +284,7 @@ const MainLayout: React.FC = () => {
               {/* Left side: POS Kassa */}
               <div className="flex-1 flex flex-col overflow-hidden">
                 <div className="px-4 py-1.5 bg-amber-500/10 border-b border-amber-500/20 text-amber-300 font-bold text-xs flex items-center justify-between">
-                  <span>🍔 WerkPay Kassa (Bestellen &amp; Afrekenen)</span>
+                  <span>🍔 Werkdonalds Kassa (Bestellen &amp; Afrekenen)</span>
                   <span className="text-[10px] text-slate-400">Live Test Mode</span>
                 </div>
                 <div className="flex-1 overflow-hidden">

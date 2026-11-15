@@ -51,7 +51,7 @@ export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess
               <ShieldCheck className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-base font-black text-white">WerkPay Medewerker Toegang</h2>
+              <h2 className="text-base font-black text-white">Werkdonalds Medewerker Toegang</h2>
               <p className="text-xs text-slate-400">
                 Log in voor beheer, contant-goedkeuring en voorraad.
               </p>
@@ -67,6 +67,16 @@ export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess
 
         {/* Body */}
         <div className="p-5 space-y-4">
+          <div className="md:hidden p-3 rounded-2xl bg-cyan-950/40 border border-cyan-500/40 text-xs text-cyan-200 space-y-0.5">
+            <div className="font-black flex items-center gap-1.5">
+              <span>📱</span>
+              <span>Speciale Klein-Scherm SumUp Modus</span>
+            </div>
+            <p className="text-[11px] text-slate-300 leading-snug">
+              Na het inloggen opent direct de speciale mobiele SumUp betaalterminal.
+            </p>
+          </div>
+
           <div className="relative flex py-1 items-center">
             <div className="flex-grow border-t border-slate-800"></div>
             <span className="flex-shrink mx-3 text-[10px] text-slate-500 font-bold uppercase tracking-wider">
