@@ -67,7 +67,9 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
     applyCouponCode,
     removeCoupon,
     posUsers,
-    managerOverride
+    managerOverride,
+    authorizeCashStaffUser,
+    verifyMasterPin
   } = useApp();
 
   const [paymentMethod, setPaymentMethod] = useState<'workpay' | 'cash' | 'giftcard'>('workpay');
@@ -102,8 +104,9 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   // Cash Mode & Approval
   const [cashReceived, setCashReceived] = useState<string>('');
   const [showCashApprovalModal, setShowCashApprovalModal] = useState<boolean>(false);
-  const [cashApprovalData, setCashApprovalData] = useState<{ received: number; change: number; acceptedBy: string } | null>(null);
+  const [cashApprovalData, setCashApprovalData] = useState<{ received: number; change: number; acceptedBy: string; approvalPin?: string } | null>(null);
   const [waitingCashRequest, setWaitingCashRequest] = useState<CashPaymentRequest | null>(null);
+  const cashCheckoutInFlightRef = useRef<boolean>(false);
 
   // DIY Terminal Modal
   const [showDiyTerminalModal, setShowDiyTerminalModal] = useState<boolean>(false);
@@ -160,15 +163,15 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   }, [isSplitMode, splitPersonsCount, finalTotal]);
 
   // Cash change
-  const receivedNum = parseFloat(cashReceived) || (cashApprovalData ? cashApprovalData.received : 0);
-  const changeAmount = Math.max(0, receivedNum - finalTotal);
+  const parsedCashInput = parseFloat(cashReceived.replace(',', '.'));
+  const receivedNum = Number.isFinite(parsedCashInput)
+    ? parsedCashInput
+    : (cashApprovalData ? cashApprovalData.received : 0);
+  const changeAmount = Math.max(0, Math.round((receivedNum - finalTotal) * 100) / 100);
 
-  // Cashier role check
+  // Strict cashier role check
   const isAuthorizedCashier = Boolean(
-    managerOverride ||
-    (currentPosUser && 
-    currentPosUser.username !== 'bestel_kassa' && 
-    canAccess('cash_pay'))
+    managerOverride || authorizeCashStaffUser(currentPosUser)
   );
 
   // Active user check for WerkPay quick mode
@@ -337,30 +340,35 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
 
   // Listen for remote cash approval from staff screen
   useEffect(() => {
-    if (!waitingCashRequest) return;
+    if (!waitingCashRequest || cashCheckoutInFlightRef.current) return;
     const found = cashRequests.find(r => r.id === waitingCashRequest.id);
     if (!found) return;
 
     if (found.status === 'approved') {
+      cashCheckoutInFlightRef.current = true;
       setIsProcessing(true);
-      processCheckout('cash', orderType, identifier, {
+      const targetIdentifier = identifier.trim() || found.identifier || (orderType === 'dine_in' ? 'Eetzaal' : 'Meenemen');
+      processCheckout('cash', orderType, targetIdentifier, {
+        cashRequestId: found.id,
         received: found.received,
         change: found.change,
-        cashier: found.approvedBy || 'Kassamedewerker'
+        cashier: found.approvedBy || 'Kassamedewerker',
+        ...(activeLoyaltyCustomer ? { loyaltyPhone: activeLoyaltyCustomer.phone, loyaltyCustomerName: activeLoyaltyCustomer.name } : {})
       }).then(res => {
         setIsProcessing(false);
+        cashCheckoutInFlightRef.current = false;
+        setWaitingCashRequest(null);
         if (res.success) {
           onClose();
         } else {
           setErrorMessage(res.message);
-          setWaitingCashRequest(null);
         }
       });
     } else if (found.status === 'rejected') {
       setErrorMessage(found.rejectedReason || 'Contant betaalverzoek is afgewezen door medewerker.');
       setWaitingCashRequest(null);
     }
-  }, [cashRequests, waitingCashRequest, orderType, identifier, processCheckout, onClose]);
+  }, [cashRequests, waitingCashRequest, orderType, identifier, activeLoyaltyCustomer, processCheckout, onClose]);
 
   const handleConfirmPayment = async () => {
     setErrorMessage('');
@@ -377,7 +385,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       return;
     }
 
-    // Check if Cash requires staff authorization on another screen
+    // Check if Cash requires staff authorization
     if (paymentMethod === 'cash') {
       if (!isAuthorizedCashier && !cashApprovalData) {
         // Create request for staff on another screen
@@ -385,12 +393,12 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
           orderNo,
           finalTotal,
           orderType,
-          identifier || (orderType === 'dine_in' ? 'Eetzaal' : 'Meenemen')
+          identifier.trim() || (orderType === 'dine_in' ? 'Eetzaal' : 'Meenemen')
         );
         setWaitingCashRequest(req);
         return;
       }
-      if (isAuthorizedCashier && receivedNum < finalTotal) {
+      if (receivedNum < finalTotal - 0.01) {
         setErrorMessage(`Ontvangen contant (€${receivedNum.toFixed(2)}) is minder dan het totaalbedrag (${euro(finalTotal)}).`);
         return;
       }
@@ -442,10 +450,11 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
           meta = { mode: 'terminal', cardUid: wpCardUid.trim(), pin: wpPin.trim() };
         }
       } else if (paymentMethod === 'cash') {
-        meta = { 
-          received: cashApprovalData ? cashApprovalData.received : receivedNum, 
-          change: cashApprovalData ? cashApprovalData.change : changeAmount, 
-          cashier: cashApprovalData ? cashApprovalData.acceptedBy : currentPosUser?.name 
+        meta = {
+          received: cashApprovalData ? cashApprovalData.received : receivedNum,
+          change: cashApprovalData ? cashApprovalData.change : changeAmount,
+          cashier: cashApprovalData ? cashApprovalData.acceptedBy : currentPosUser?.name,
+          approvalPin: cashApprovalData?.approvalPin
         };
       } else if (paymentMethod === 'giftcard') {
         if (!giftCardCode.trim()) {
@@ -477,18 +486,25 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
     }
   };
 
-  const handleCashApproved = async (data: { received: number; change: number; acceptedBy: string }) => {
+  const handleCashApproved = async (data: { received: number; change: number; acceptedBy: string; approvalPin?: string }) => {
     setCashApprovalData(data);
     setShowCashApprovalModal(false);
     setIsProcessing(true);
+    setErrorMessage('');
 
     try {
-      const meta = { 
-        received: data.received, 
-        change: data.change, 
-        cashier: data.acceptedBy 
+      const targetIdentifier = identifier.trim() || (orderType === 'dine_in' ? 'Tafel -' : 'Afhaal');
+      const meta: any = {
+        received: data.received,
+        change: data.change,
+        cashier: data.acceptedBy,
+        approvalPin: data.approvalPin
       };
-      const res = await processCheckout('cash', orderType, identifier, meta);
+      if (activeLoyaltyCustomer) {
+        meta.loyaltyPhone = activeLoyaltyCustomer.phone;
+        meta.loyaltyCustomerName = activeLoyaltyCustomer.name;
+      }
+      const res = await processCheckout('cash', orderType, targetIdentifier, meta);
       if (res.success) {
         onClose();
       } else {
@@ -903,10 +919,14 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
 
                             if (val.length >= 4) {
                               const validUser = posUsers.find(u =>
+                                !u.is_banned &&
+                                !u.is_suspended &&
+                                !u.is_terminal_locked &&
+                                !['bestel_kassa', 'klant', 'rpi'].includes(u.username.toLowerCase()) &&
                                 (u.password === val || (u as any).pin_code === val) &&
                                 (u.is_admin || u.perms?.includes('coupons_giftcards'))
                               );
-                              if (val === '1234' || val === 'admin123' || validUser) {
+                              if (validUser || verifyMasterPin(val)) {
                                 setIsCouponsUnlocked(true);
                                 setShowStaffCouponUnlock(false);
                               }
@@ -919,10 +939,14 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                           onClick={() => {
                             const val = couponUnlockPin.trim();
                             const validUser = posUsers.find(u =>
+                              !u.is_banned &&
+                              !u.is_suspended &&
+                              !u.is_terminal_locked &&
+                              !['bestel_kassa', 'klant', 'rpi'].includes(u.username.toLowerCase()) &&
                               (u.password === val || (u as any).pin_code === val) &&
                               (u.is_admin || u.perms?.includes('coupons_giftcards'))
                             );
-                            if (val === '1234' || val === 'admin123' || validUser) {
+                            if (validUser || verifyMasterPin(val)) {
                               setIsCouponsUnlocked(true);
                               setShowStaffCouponUnlock(false);
                             } else {
@@ -1438,7 +1462,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                       </p>
                     </div>
                     <div className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800 text-[11px] text-slate-400">
-                      Bestelnummer: <strong className="text-white font-mono">#{orderNo}</strong> • Status: <span className="text-amber-400 font-bold animate-pulse">Wachten op acceptatie...</span>
+                      Bestelnummer: <strong className="text-white font-mono tabular-nums">#{orderNo}</strong> · Status: <span className="text-amber-400 font-bold">Wachten op kassa-goedkeuring...</span>
                     </div>
                     <button
                       type="button"
@@ -1452,25 +1476,59 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                     </button>
                   </div>
                 ) : (
-                  <div className="p-3 bg-amber-950/20 border border-amber-500/30 rounded-xl space-y-2 text-xs">
+                  <div className="p-3 bg-amber-950/20 border border-amber-500/30 rounded-xl space-y-2.5 text-xs">
                     <p className="text-slate-300 leading-relaxed">
-                      Contante betaling vereist autorisatie van een kassamedewerker. Klik op de knop om het verzoek direct door te sturen naar het scherm van de medewerker.
+                      Contante betaling vereist autorisatie van een bevoegde kassamedewerker (<strong>cash_pay</strong>). Verstuur het verzoek naar de kassa of laat een medewerker hier direct zijn/haar PIN invoeren.
                     </p>
                     <button
                       type="button"
                       onClick={() => {
+                        if (!identifier.trim()) {
+                          setIdentifierError(true);
+                          setErrorMessage(
+                            orderType === 'dine_in'
+                              ? 'Voer eerst een tafelnummer of klantnaam in.'
+                              : orderType === 'delivery'
+                              ? 'Voer eerst een bezorgadres en naam in.'
+                              : 'Voer eerst een klantnaam of bestelcode in.'
+                          );
+                          return;
+                        }
+                        setErrorMessage('');
                         const req = createCashRequest(
                           orderNo,
                           finalTotal,
                           orderType,
-                          identifier || (orderType === 'dine_in' ? 'Eetzaal' : 'Meenemen')
+                          identifier.trim() || (orderType === 'dine_in' ? 'Eetzaal' : 'Meenemen')
                         );
                         setWaitingCashRequest(req);
                       }}
-                      className="w-full py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center justify-center gap-2 transition active:scale-95 shadow-lg shadow-amber-500/20"
+                      className="w-full min-h-[44px] py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center justify-center gap-2 transition active:scale-95 shadow-lg shadow-amber-500/20"
                     >
                       <UserCheck className="w-4 h-4" />
                       <span>Verstuur Contant Verzoek naar Medewerker ({euro(finalTotal)})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!identifier.trim()) {
+                          setIdentifierError(true);
+                          setErrorMessage(
+                            orderType === 'dine_in'
+                              ? 'Voer eerst een tafelnummer of klantnaam in.'
+                              : orderType === 'delivery'
+                              ? 'Voer eerst een bezorgadres en naam in.'
+                              : 'Voer eerst een klantnaam of bestelcode in.'
+                          );
+                          return;
+                        }
+                        setErrorMessage('');
+                        setShowCashApprovalModal(true);
+                      }}
+                      className="w-full min-h-[44px] py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-amber-300 font-bold text-xs flex items-center justify-center gap-2 border border-amber-500/30 transition"
+                    >
+                      <Lock className="w-3.5 h-3.5" />
+                      <span>Medewerker PIN ter plekke invoeren</span>
                     </button>
                   </div>
                 )
@@ -1589,7 +1647,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       {/* Cash Approval Modal */}
       {showCashApprovalModal && (
         <CashApprovalModal
-          orderNo={Math.floor(1000 + Math.random() * 9000)}
+          orderNo={orderNo}
           totalAmount={finalTotal}
           onApprove={handleCashApproved}
           onCancel={() => setShowCashApprovalModal(false)}

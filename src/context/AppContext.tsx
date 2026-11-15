@@ -180,14 +180,21 @@ interface AppContextType {
     description?: string;
     method: 'workpay' | 'cash';
     paymentMeta?: any;
+    sendToKitchen?: boolean;
+    orderType?: 'dine_in' | 'takeaway' | 'delivery';
+    identifier?: string;
+    items?: OrderItem[];
+    notes?: string;
   }) => Promise<{ success: boolean; message: string; order?: Order }>;
   refundSumUpTransaction: (orderNo: number) => Promise<{ success: boolean; message: string }>;
 
   // Cash Payment Requests (Cross-terminal / Staff authorization)
   cashRequests: CashPaymentRequest[];
   createCashRequest: (orderNo: number, total: number, orderType: 'dine_in' | 'takeaway' | 'delivery', identifier: string) => CashPaymentRequest;
-  approveCashRequest: (requestId: string, approvedBy: string, received: number, change: number) => void;
+  approveCashRequest: (requestId: string, approvedBy: string, received: number, change: number) => { success: boolean; message: string };
   rejectCashRequest: (requestId: string, reason?: string) => void;
+  authorizeCashStaffUser: (user: PosUser | null) => boolean;
+  verifyCashApprovalPin: (pin: string) => { valid: boolean; user?: PosUser; approverName?: string };
 
   // Product & Inventory Actions
   createProduct: (product: Omit<Product, 'id'>) => Promise<void>;
@@ -1124,6 +1131,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setManagerOverride(false);
   };
 
+  const authorizeCashStaffUser = (user: PosUser | null): boolean => {
+    if (!user) return false;
+    if (user.is_banned || user.is_suspended || user.is_terminal_locked) return false;
+    const uname = String(user.username || '').toLowerCase();
+    if (!uname || uname === 'bestel_kassa' || uname === 'klant' || uname === 'rpi') return false;
+    if (user.is_admin || uname === 'joas') return true;
+    return Array.isArray(user.perms) && user.perms.includes('cash_pay');
+  };
+
+  const verifyCashApprovalPin = (pin: string): { valid: boolean; user?: PosUser; approverName?: string } => {
+    const cleanPin = String(pin || '').trim();
+    if (!cleanPin) return { valid: false };
+
+    const matchedUser = posUsers.find(u => {
+      if (!authorizeCashStaffUser(u)) return false;
+      const userPass = String(u.password || '').trim();
+      const userPin = String((u as any).pin_code || '').trim();
+      return (userPass.length > 0 && userPass === cleanPin) || (userPin.length > 0 && userPin === cleanPin);
+    });
+
+    if (matchedUser) {
+      return { valid: true, user: matchedUser, approverName: matchedUser.name };
+    }
+
+    if (verifyMasterPin(cleanPin)) {
+      return { valid: true, approverName: currentPosUser?.name || 'Manager (Master PIN)' };
+    }
+
+    return { valid: false };
+  };
+
   const [isSystemLocked, setIsSystemLockedState] = useState<boolean>(() => {
     return localStorage.getItem('wd_system_locked') === 'true';
   });
@@ -1368,7 +1406,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     orderType: row.order_type || 'takeaway',
     identifier: row.identifier || row.cashier || '',
     total: Number(row.amount || 0),
-    status: row.status as 'pending' | 'approved' | 'rejected',
+    status: (row.status || 'pending') as CashPaymentRequest['status'],
     requestedAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
     approvedBy: row.approved_by || undefined,
     received: row.received !== null && row.received !== undefined ? Number(row.received) : undefined,
@@ -2794,6 +2832,75 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       paymentMeta.brandName = brandName;
     }
 
+    // 1.5 Cash Payment Authorization & Amount Integrity
+    let consumedCashRequestId: string | null = null;
+    const sanitizedPaymentMeta: any = { ...(paymentMeta || {}) };
+    delete sanitizedPaymentMeta.approvalPin;
+
+    if (method === 'cash') {
+      const hasActiveStaffAuth = managerOverride || canAccess('manager_override') || authorizeCashStaffUser(currentPosUser);
+      const pinCheck = sanitizedPaymentMeta.rawApprovalPin || paymentMeta?.approvalPin
+        ? verifyCashApprovalPin(paymentMeta?.approvalPin || sanitizedPaymentMeta.rawApprovalPin)
+        : { valid: false };
+      delete sanitizedPaymentMeta.rawApprovalPin;
+
+      const reqId = typeof paymentMeta?.cashRequestId === 'string' ? paymentMeta.cashRequestId : '';
+      const matchedReq = reqId
+        ? cashRequests.find(r => r.id === reqId && r.status === 'approved')
+        : undefined;
+      const hasApprovedRequest = Boolean(
+        matchedReq &&
+        !matchedReq.consumedAt &&
+        Math.abs(Number(matchedReq.total) - finalTotal) < 0.02
+      );
+
+      if (!hasActiveStaffAuth && !pinCheck.valid && !hasApprovedRequest) {
+        logAuditAction(
+          'CONTANT_BETALING_GEBLOKKEERD',
+          `Onbevoegde contante betaling geblokkeerd voor #${orderNo} (€ ${finalTotal.toFixed(2)}) door ${currentPosUser?.username || 'niet-ingelogd'}.`
+        );
+        return {
+          success: false,
+          message: 'Contante betaling geweigerd: geldige kassamedewerker-bevoegdheid (cash_pay), goedkeurings-PIN of afstandsgoedkeuring vereist!'
+        };
+      }
+
+      const receivedAmount = hasApprovedRequest && matchedReq?.received !== undefined
+        ? Number(matchedReq.received)
+        : Number(paymentMeta?.received);
+
+      if (!Number.isFinite(receivedAmount) || receivedAmount < finalTotal - 0.01) {
+        logAuditAction(
+          'CONTANT_BEDRAG_ONGELDIG',
+          `Ongeldig contant bedrag (€${Number.isFinite(receivedAmount) ? receivedAmount.toFixed(2) : 'NaN'}) voor order #${orderNo} (totaal €${finalTotal.toFixed(2)}).`
+        );
+        return {
+          success: false,
+          message: `Ontvangen contant bedrag is onvolledig (minimaal € ${finalTotal.toFixed(2)} vereist).`
+        };
+      }
+
+      const verifiedChange = Math.max(0, Math.round((receivedAmount - finalTotal) * 100) / 100);
+      const verifiedCashierName = hasApprovedRequest
+        ? (matchedReq?.approvedBy || paymentMeta?.cashier || 'Kassamedewerker')
+        : pinCheck.valid
+        ? (pinCheck.approverName || 'Kassamedewerker')
+        : (currentPosUser?.name || 'Kassamedewerker');
+
+      sanitizedPaymentMeta.received = Math.round(receivedAmount * 100) / 100;
+      sanitizedPaymentMeta.change = verifiedChange;
+      sanitizedPaymentMeta.cashier = verifiedCashierName;
+      sanitizedPaymentMeta.accepted_by = verifiedCashierName;
+      if (hasApprovedRequest && matchedReq) {
+        consumedCashRequestId = matchedReq.id;
+      }
+
+      logAuditAction(
+        'CONTANT_BETALING_GOEDGEKEURD',
+        `Contante betaling #${orderNo} (€ ${finalTotal.toFixed(2)}, ontvangen € ${receivedAmount.toFixed(2)}) geautoriseerd door ${verifiedCashierName}.`
+      );
+    }
+
     // 2. Gift card deduction
     if (method === 'giftcard') {
       const card = giftCards.find(g => g.code === paymentMeta.code && g.is_active);
@@ -2809,6 +2916,28 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         } catch (err) {
           console.error('Error updating gift card balance in DB during checkout:', err);
         }
+      }
+    }
+
+    // 2.5 Consume cash approval request immediately to prevent replay
+    if (consumedCashRequestId) {
+      const consumedAt = Date.now();
+      const nextReqs = cashRequests.map(r =>
+        r.id === consumedCashRequestId
+          ? { ...r, status: 'consumed' as const, consumedAt }
+          : r
+      );
+      syncCashRequests(nextReqs);
+      if (posClient) {
+        try {
+          const isNumericOnly = /^req_\d+$/.test(consumedCashRequestId);
+          const q = posClient.from('cash_requests').update({ status: 'consumed' });
+          if (isNumericOnly) {
+            await q.or(`req_id.eq.${consumedCashRequestId},id.eq.${consumedCashRequestId.replace('req_', '')}`);
+          } else {
+            await q.eq('req_id', consumedCashRequestId);
+          }
+        } catch {}
       }
     }
 
@@ -2828,10 +2957,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       discount: discountAmount,
       orderType,
       identifier: identifier || (orderType === 'dine_in' ? 'Tafel -' : 'Afhaal'),
-      notes: paymentMeta?.note || '',
+      notes: sanitizedPaymentMeta?.note || '',
       paymentMethod: method,
-      paymentMeta,
-      cashier: currentPosUser?.name || 'Kassa',
+      paymentMeta: sanitizedPaymentMeta,
+      cashier: sanitizedPaymentMeta?.accepted_by || currentPosUser?.name || 'Kassa',
       status: 'new',
       time: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
       timestamp: Date.now()
@@ -2892,14 +3021,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     };
   };
 
-  // SumUp Standalone Terminal Payment (direct bedrag zonder bestelling/keuken)
+  // SumUp Standalone Terminal Payment (en optionele mobiele keukenbestelling)
   const processSumUpPayment = async (params: {
     amount: number;
     tipAmount?: number;
     description?: string;
     method: 'workpay' | 'cash';
     paymentMeta?: any;
+    sendToKitchen?: boolean;
+    orderType?: 'dine_in' | 'takeaway' | 'delivery';
+    identifier?: string;
+    items?: OrderItem[];
+    notes?: string;
   }): Promise<{ success: boolean; message: string; order?: Order }> => {
+    if (params.sendToKitchen && orderStopActive && (!currentPosUser || !currentPosUser.is_admin)) {
+      return { success: false, message: 'Bestellingen zijn momenteel gepauzeerd door de bestelstop.' };
+    }
+
     const baseAmount = Math.round((Number(params.amount) || 0) * 100) / 100;
     const tipAmount = Math.round((Number(params.tipAmount) || 0) * 100) / 100;
     const finalTotal = Math.round((baseAmount + tipAmount) * 100) / 100;
@@ -2912,6 +3050,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const currentBrandKey = activeBrand || 'koekploeg';
     const isKoekploegBrand = currentBrandKey === 'koekploeg';
     const brandName = isKoekploegBrand ? 'De Koekploeg' : 'Werkdonalds';
+    const rawApprovalPin = params.paymentMeta?.approvalPin ? String(params.paymentMeta.approvalPin) : '';
     const meta: any = {
       ...(params.paymentMeta || {}),
       isSumUp: true,
@@ -2921,6 +3060,44 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       brand: currentBrandKey,
       brandName
     };
+    delete meta.approvalPin;
+
+    if (params.method === 'cash') {
+      const hasCashStaffAuth = managerOverride || canAccess('manager_override') || authorizeCashStaffUser(currentPosUser);
+      const pinCheck = rawApprovalPin ? verifyCashApprovalPin(rawApprovalPin) : { valid: false };
+
+      if (!hasCashStaffAuth && !pinCheck.valid) {
+        logAuditAction(
+          'SUMUP_CONTANT_GEBLOKKEERD',
+          `Onbevoegde SumUp contante betaling (€ ${finalTotal.toFixed(2)}) geblokkeerd voor ${currentPosUser?.username || 'gast'}.`
+        );
+        return {
+          success: false,
+          message: 'Geen contant-bevoegdheid (cash_pay). Voer eerst een bevoegde medewerker PIN in.'
+        };
+      }
+
+      const receivedAmount = Number(meta.received);
+      if (!Number.isFinite(receivedAmount) || receivedAmount < finalTotal - 0.01) {
+        return {
+          success: false,
+          message: `Ontvangen contant bedrag is lager dan € ${finalTotal.toFixed(2)}.`
+        };
+      }
+
+      const approver = pinCheck.valid
+        ? (pinCheck.approverName || 'Medewerker')
+        : (currentPosUser?.name || 'SumUp Kassier');
+      meta.received = Math.round(receivedAmount * 100) / 100;
+      meta.change = Math.max(0, Math.round((receivedAmount - finalTotal) * 100) / 100);
+      meta.accepted_by = approver;
+      meta.cashier = approver;
+
+      logAuditAction(
+        'SUMUP_CONTANT_GOEDGEKEURD',
+        `SumUp contante betaling #${orderNo} (€ ${finalTotal.toFixed(2)}) geaccepteerd door ${approver}.`
+      );
+    }
 
     if (params.method === 'workpay') {
       const mode = meta.mode || 'terminal';
@@ -3075,15 +3252,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       meta.balance_after = newBal;
     }
 
-    const sumupItems: OrderItem[] = [
-      {
-        name: desc,
-        qty: 1,
-        price: baseAmount,
-        done: true,
-        stage: 'klaar'
-      }
-    ];
+    const sendToKitchen = Boolean(params.sendToKitchen);
+    const sumupItems: OrderItem[] = (params.items && params.items.length > 0)
+      ? params.items.map(it => ({
+          ...it,
+          done: sendToKitchen ? false : true,
+          stage: sendToKitchen ? ('wachten' as OrderItemStage) : ('klaar' as OrderItemStage)
+        }))
+      : [
+          {
+            name: desc,
+            qty: 1,
+            price: baseAmount,
+            done: sendToKitchen ? false : true,
+            stage: sendToKitchen ? ('wachten' as OrderItemStage) : ('klaar' as OrderItemStage)
+          }
+        ];
+
     if (tipAmount > 0) {
       sumupItems.push({
         name: 'Fooi (SumUp)',
@@ -3100,19 +3285,31 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       items: sumupItems,
       total: finalTotal,
       discount: 0,
-      orderType: 'takeaway',
-      identifier: desc,
-      notes: `SumUp Terminal (${currentPosUser?.name || 'Medewerker'})`,
+      orderType: params.orderType || 'takeaway',
+      identifier: (params.identifier || '').trim() || desc,
+      notes: (params.notes || '').trim() || `SumUp Terminal (${currentPosUser?.name || 'Medewerker'})`,
       paymentMethod: params.method,
       paymentMeta: meta,
-      cashier: currentPosUser?.name || 'SumUp Terminal',
-      status: 'afgehaald',
+      cashier: meta.accepted_by || currentPosUser?.name || 'SumUp Terminal',
+      status: sendToKitchen ? 'new' : 'afgehaald',
       time: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
       timestamp: Date.now()
     };
 
     setOrders(prev => [newOrder, ...prev]);
     setOrderNo(prev => prev + 1);
+    if (sendToKitchen && params.items && params.items.length > 0) {
+      deductInventoryForItems(
+        params.items.map((it, idx) => ({
+          id: `sumup_${Date.now()}_${idx}`,
+          productId: 0,
+          name: it.name,
+          price: it.price,
+          qty: it.qty,
+          itemNote: it.itemNote
+        }))
+      );
+    }
     AudioFX.bell();
 
     if (posClient) {
@@ -3728,29 +3925,72 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     approvedBy: string,
     received: number,
     change: number
-  ) => {
+  ): { success: boolean; message: string } => {
+    const isAuthorized = managerOverride || canAccess('manager_override') || authorizeCashStaffUser(currentPosUser);
+    if (!isAuthorized) {
+      logAuditAction(
+        'CONTANT_VERZOEK_GEBLOKKEERD',
+        `Onbevoegde poging om contant verzoek ${requestId} goed te keuren door ${currentPosUser?.username || 'niet-ingelogd'}.`
+      );
+      return { success: false, message: 'Geen contant-bevoegdheid (cash_pay) om dit verzoek goed te keuren!' };
+    }
+
+    const targetReq = cashRequests.find(r => r.id === requestId);
+    if (!targetReq) {
+      return { success: false, message: 'Contant betaalverzoek niet gevonden.' };
+    }
+    if (targetReq.status !== 'pending') {
+      return { success: false, message: 'Dit verzoek is al verwerkt.' };
+    }
+    if (!Number.isFinite(received) || received < targetReq.total - 0.01) {
+      return { success: false, message: `Ontvangen contant (€ ${Number(received || 0).toFixed(2)}) is minder dan € ${targetReq.total.toFixed(2)}.` };
+    }
+
+    const verifiedApprover = currentPosUser?.name || approvedBy;
+    const verifiedChange = Math.max(0, Math.round((received - targetReq.total) * 100) / 100);
+    const roundedReceived = Math.round(received * 100) / 100;
+
     const updated = cashRequests.map(r =>
       r.id === requestId
-        ? { ...r, status: 'approved' as const, approvedBy, received, change }
+        ? {
+            ...r,
+            status: 'approved' as const,
+            approvedBy: verifiedApprover,
+            approvedByUsername: currentPosUser?.username,
+            approvedAt: Date.now(),
+            received: roundedReceived,
+            change: verifiedChange
+          }
         : r
     );
     syncCashRequests(updated);
+    logAuditAction(
+      'CONTANT_VERZOEK_GOEDGEKEURD',
+      `Contant verzoek #${targetReq.orderNo} (€ ${targetReq.total.toFixed(2)}, ontvangen € ${roundedReceived.toFixed(2)}) goedgekeurd door ${verifiedApprover}.`
+    );
 
     if (posClient) {
-      posClient.from('cash_requests').update({
+      const isSimpleReqId = /^req_\d+$/.test(requestId);
+      const q = posClient.from('cash_requests').update({
         status: 'approved',
-        approved_by: approvedBy,
-        received: received,
-        change: change
-      }).or(`req_id.eq.${requestId},id.eq.${requestId.replace('req_', '')}`)
-        .then(({ error }) => {
-          if (error) console.warn('Supabase cash_requests approve error:', error);
-        });
+        approved_by: verifiedApprover,
+        received: roundedReceived,
+        change: verifiedChange
+      });
+      const reqPromise = isSimpleReqId
+        ? q.or(`req_id.eq.${requestId},id.eq.${requestId.replace('req_', '')}`)
+        : q.eq('req_id', requestId);
+      reqPromise.then(({ error }) => {
+        if (error) console.warn('Supabase cash_requests approve error:', error);
+      });
     }
+
+    return { success: true, message: 'Contant verzoek goedgekeurd.' };
   };
 
   const rejectCashRequest = (requestId: string, reason?: string) => {
     const rejectedReason = reason || 'Geweigerd door medewerker';
+    const targetReq = cashRequests.find(r => r.id === requestId);
     const updated = cashRequests.map(r =>
       r.id === requestId
         ? { ...r, status: 'rejected' as const, rejectedReason }
@@ -3758,14 +3998,25 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     );
     syncCashRequests(updated);
 
+    if (targetReq) {
+      logAuditAction(
+        'CONTANT_VERZOEK_AFGEWEZEN',
+        `Contant verzoek #${targetReq.orderNo} (€ ${targetReq.total.toFixed(2)}) afgewezen (${rejectedReason}).`
+      );
+    }
+
     if (posClient) {
-      posClient.from('cash_requests').update({
+      const isSimpleReqId = /^req_\d+$/.test(requestId);
+      const q = posClient.from('cash_requests').update({
         status: 'rejected',
         rejected_reason: rejectedReason
-      }).or(`req_id.eq.${requestId},id.eq.${requestId.replace('req_', '')}`)
-        .then(({ error }) => {
-          if (error) console.warn('Supabase cash_requests reject error:', error);
-        });
+      });
+      const reqPromise = isSimpleReqId
+        ? q.or(`req_id.eq.${requestId},id.eq.${requestId.replace('req_', '')}`)
+        : q.eq('req_id', requestId);
+      reqPromise.then(({ error }) => {
+        if (error) console.warn('Supabase cash_requests reject error:', error);
+      });
     }
   };
 
@@ -5081,6 +5332,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         createCashRequest,
         approveCashRequest,
         rejectCashRequest,
+        authorizeCashStaffUser,
+        verifyCashApprovalPin,
         createProduct,
         updateProduct,
         deleteProduct,

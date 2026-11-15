@@ -21,12 +21,14 @@ import {
   CreditCard,
   Delete,
   Plus,
+  Minus,
   CheckCircle2,
   XCircle,
   Loader2,
   Radio,
   Receipt,
   RotateCcw,
+  Undo2,
   Banknote,
   QrCode,
   Cpu,
@@ -51,7 +53,12 @@ import {
   Package,
   Sliders,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Lock,
+  Megaphone,
+  Star,
+  Clock,
+  ChefHat
 } from 'lucide-react';
 
 interface SumUpTerminalScreenProps {
@@ -61,6 +68,14 @@ interface SumUpTerminalScreenProps {
 
 type SumUpTab = 'charge' | 'history' | 'kassa_tools' | 'tools';
 type PayMethodTab = 'pico' | 'card' | 'login' | 'cash';
+type MobileOrderFilter = 'open' | 'wachten' | 'bereiden' | 'inpakken' | 'klaar' | 'afgerond';
+
+interface QuickCartEntry {
+  name: string;
+  price: number;
+  qty: number;
+  emoji?: string;
+}
 
 export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   isCompactMobileShell = false,
@@ -70,6 +85,8 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     currentPosUser,
     logoutPos,
     canAccess,
+    managerOverride,
+    authorizeCashStaffUser,
     orders,
     orderNo,
     brandProducts,
@@ -79,6 +96,8 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     processSumUpPayment,
     refundSumUpTransaction,
     updateOrderStatus,
+    toggleOrderPrio,
+    cancelOrder,
     orderStopActive,
     toggleOrderStop,
     pickupClosed,
@@ -92,6 +111,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<SumUpTab>('charge');
+  const hasCashAuth = Boolean(managerOverride || authorizeCashStaffUser(currentPosUser));
 
   // Calculator / Keypad State (supports + chaining like SumUp)
   const [currentInput, setCurrentInput] = useState<string>('0');
@@ -113,6 +133,14 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   const [wpUser, setWpUser] = useState<string>('');
   const [wpPass, setWpPass] = useState<string>('');
   const [cashReceived, setCashReceived] = useState<string>('');
+  const [cashApprovalPin, setCashApprovalPin] = useState<string>('');
+
+  // Mobile Kitchen Order Builder (optional inside SumUp Charge tab)
+  const [quickCart, setQuickCart] = useState<QuickCartEntry[]>([]);
+  const [sendToKitchen, setSendToKitchen] = useState<boolean>(false);
+  const [mobileOrderType, setMobileOrderType] = useState<'dine_in' | 'takeaway' | 'delivery'>('takeaway');
+  const [mobileIdentifier, setMobileIdentifier] = useState<string>('');
+  const [mobileOrderNote, setMobileOrderNote] = useState<string>('');
 
   // Pico W Cloud Relay Live State
   const [picoWaiting, setPicoWaiting] = useState<boolean>(false);
@@ -126,6 +154,13 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   const [confirmRefundNo, setConfirmRefundNo] = useState<number | null>(null);
   const [refundBusyNo, setRefundBusyNo] = useState<number | null>(null);
 
+  // Mobile Orders Tab State
+  const [mobileOrderSearch, setMobileOrderSearch] = useState<string>('');
+  const [mobileOrderFilter, setMobileOrderFilter] = useState<MobileOrderFilter>('open');
+  const [confirmCancelOrderNo, setConfirmCancelOrderNo] = useState<number | null>(null);
+  const [showGiftSection, setShowGiftSection] = useState<boolean>(false);
+  const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
+
   // Tools: Card balance checker, DIY Terminal Modal, Inline Flasher, Quick Products, Orders & Gift cards
   const [toolSearch, setToolSearch] = useState<string>('');
   const [customTopUpAmt, setCustomTopUpAmt] = useState<string>('10');
@@ -138,11 +173,22 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   const [newGiftAmount, setNewGiftAmount] = useState<string>('15');
   const [soundEnabled, setSoundEnabled] = useState<boolean>(AudioFX.isEnabled);
 
+  useEffect(() => {
+    if (activeTab !== 'kassa_tools') return;
+    setNowTickMs(Date.now());
+    const id = setInterval(() => setNowTickMs(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [activeTab]);
+
   const parsedCurrent = useMemo(() => {
     const clean = currentInput.replace(',', '.');
     const n = parseFloat(clean);
     return Number.isFinite(n) ? n : 0;
   }, [currentInput]);
+
+  const quickCartTotal = useMemo(() => {
+    return Math.round(quickCart.reduce((sum, it) => sum + it.price * it.qty, 0) * 100) / 100;
+  }, [quickCart]);
 
   const baseAmount = useMemo(() => {
     return Math.round((accumulatedTotal + parsedCurrent) * 100) / 100;
@@ -178,12 +224,31 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     setIsProcessing(true);
     setPayError('');
     try {
+      const manualExtra = Math.round((baseAmount - quickCartTotal) * 100) / 100;
+      const structuredItems = quickCart.map(it => ({
+        name: it.name,
+        qty: it.qty,
+        price: it.price
+      }));
+      if (structuredItems.length > 0 && manualExtra > 0.01) {
+        structuredItems.push({
+          name: description.trim() || 'Extra bedrag',
+          qty: 1,
+          price: manualExtra
+        });
+      }
+
       const res = await processSumUpPayment({
         amount: baseAmount,
         tipAmount,
         description: description.trim() || 'SumUp Betaling',
         method,
-        paymentMeta: meta
+        paymentMeta: meta,
+        sendToKitchen,
+        orderType: mobileOrderType,
+        identifier: mobileIdentifier.trim() || description.trim() || (mobileOrderType === 'dine_in' ? 'Tafel -' : 'Mobiele Bestelling'),
+        items: structuredItems.length > 0 ? structuredItems : undefined,
+        notes: mobileOrderNote.trim() || undefined
       });
 
       if (res.success && res.order) {
@@ -199,12 +264,17 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         setCurrentInput('0');
         setAccumulatedTotal(0);
         setEntryCount(0);
+        setQuickCart([]);
+        setSendToKitchen(false);
+        setMobileIdentifier('');
+        setMobileOrderNote('');
         setDescription('');
         setTipPercent(0);
         setCardUid('');
         setCardPin('');
         setWpPass('');
         setCashReceived('');
+        setCashApprovalPin('');
         showToast(res.message, 'success');
       } else {
         if (fromPicoCloud) {
@@ -314,6 +384,8 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     setCurrentInput('0');
     setAccumulatedTotal(0);
     setEntryCount(0);
+    setQuickCart([]);
+    setSendToKitchen(false);
   };
 
   const handleAddPlus = () => {
@@ -324,8 +396,8 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   };
 
   const handleQuickAmount = (amt: number) => {
-    setAccumulatedTotal(0);
-    setEntryCount(0);
+    setAccumulatedTotal(quickCartTotal);
+    setEntryCount(quickCart.reduce((s, it) => s + it.qty, 0));
     setCurrentInput(amt.toFixed(2));
   };
 
@@ -334,7 +406,12 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
       showToast('Toets eerst een bedrag in.', 'error');
       return;
     }
+    if (sendToKitchen && !mobileIdentifier.trim() && !description.trim()) {
+      showToast('Vul een tafelnummer of klantnaam in voor de keukenbestelling.', 'error');
+      return;
+    }
     setPayError('');
+    setCashApprovalPin('');
     setPayMethod('pico');
     setShowPaySheet(true);
     setCashReceived(finalTotal.toFixed(2));
@@ -373,13 +450,26 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   };
 
   const handleCashSubmit = async () => {
-    const rec = parseFloat(cashReceived.replace(',', '.')) || 0;
-    if (rec < finalTotal) {
-      setPayError(`Ontvangen bedrag (${euro(rec)}) is lager dan ${euro(finalTotal)}.`);
+    const rec = parseFloat(cashReceived.replace(',', '.'));
+    if (!Number.isFinite(rec) || rec < finalTotal - 0.01) {
+      setPayError(`Ontvangen bedrag is ongeldig of lager dan ${euro(finalTotal)}.`);
       return;
     }
-    const change = Math.round((rec - finalTotal) * 100) / 100;
-    await executeCharge('cash', { received: rec, change, cashier: currentPosUser?.name || 'SumUp' }, false);
+    if (!hasCashAuth && !cashApprovalPin.trim()) {
+      setPayError('Voer eerst een geldige medewerker PIN (cash_pay) in om contant geld aan te nemen.');
+      return;
+    }
+    const change = Math.max(0, Math.round((rec - finalTotal) * 100) / 100);
+    await executeCharge(
+      'cash',
+      {
+        received: Math.round(rec * 100) / 100,
+        change,
+        cashier: currentPosUser?.name || 'SumUp',
+        approvalPin: !hasCashAuth ? cashApprovalPin.trim() : undefined
+      },
+      false
+    );
   };
 
   // History calculations
@@ -449,10 +539,71 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     : brandConfig.name;
 
   const openKitchenPickupOrders = useMemo(() => {
-    return orders
-      .filter(o => isOrderInProgress(o.status) || isOrderReady(o.status))
-      .slice(0, 25);
+    return orders.filter(o => isOrderInProgress(o.status) || isOrderReady(o.status));
   }, [orders]);
+
+  const mobileOrderCounts = useMemo(() => {
+    let open = 0;
+    let wachten = 0;
+    let bereiden = 0;
+    let inpakken = 0;
+    let klaar = 0;
+    let afgerond = 0;
+
+    for (const o of orders) {
+      if (o.status === 'new' || o.status === 'wachten') {
+        wachten++;
+        open++;
+      } else if (o.status === 'bereiden' || o.status === 'oven_grill' || o.status === 'frituren') {
+        bereiden++;
+        open++;
+      } else if (o.status === 'inpakken') {
+        inpakken++;
+        open++;
+      } else if (o.status === 'klaar' || o.status === 'done') {
+        klaar++;
+        open++;
+      } else {
+        afgerond++;
+      }
+    }
+    return { open, wachten, bereiden, inpakken, klaar, afgerond };
+  }, [orders]);
+
+  const filteredMobileOrders = useMemo(() => {
+    const q = mobileOrderSearch.trim().toLowerCase().replace(/^#/, '');
+    const list = orders.filter(o => {
+      if (mobileOrderFilter === 'open') {
+        if (!isOrderInProgress(o.status) && !isOrderReady(o.status)) return false;
+      } else if (mobileOrderFilter === 'wachten') {
+        if (o.status !== 'new' && o.status !== 'wachten') return false;
+      } else if (mobileOrderFilter === 'bereiden') {
+        if (o.status !== 'bereiden' && o.status !== 'oven_grill' && o.status !== 'frituren') return false;
+      } else if (mobileOrderFilter === 'inpakken') {
+        if (o.status !== 'inpakken') return false;
+      } else if (mobileOrderFilter === 'klaar') {
+        if (o.status !== 'klaar' && o.status !== 'done') return false;
+      } else if (mobileOrderFilter === 'afgerond') {
+        if (isOrderInProgress(o.status) || isOrderReady(o.status)) return false;
+      }
+
+      if (!q) return true;
+      if (String(o.no).includes(q)) return true;
+      if ((o.identifier || '').toLowerCase().includes(q)) return true;
+      if ((o.notes || '').toLowerCase().includes(q)) return true;
+      return o.items.some(it => it.name.toLowerCase().includes(q) || (it.itemNote || '').toLowerCase().includes(q));
+    });
+
+    const sorted = [...list].sort((a, b) => {
+      if (mobileOrderFilter !== 'afgerond') {
+        if (a.isPrio && !b.isPrio) return -1;
+        if (!a.isPrio && b.isPrio) return 1;
+      }
+      return (b.timestamp || 0) - (a.timestamp || 0);
+    });
+
+    return mobileOrderFilter === 'afgerond' ? sorted.slice(0, 30) : sorted;
+  }, [orders, mobileOrderFilter, mobileOrderSearch]);
 
   const filteredQuickProducts = useMemo(() => {
     const q = productSearch.trim().toLowerCase();
@@ -468,16 +619,40 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     return giftCards.find(g => g.code.toUpperCase() === clean) || null;
   }, [giftCards, giftSearch]);
 
-  const handleQuickAddProduct = (prodName: string, price: number) => {
+  const handleQuickAddProduct = (prodName: string, price: number, emoji?: string) => {
     setAccumulatedTotal(prev => Math.round((prev + price) * 100) / 100);
     setEntryCount(prev => prev + 1);
+    setQuickCart(prev => {
+      const idx = prev.findIndex(x => x.name === prodName && x.price === price);
+      if (idx !== -1) {
+        const copy = [...prev];
+        copy[idx] = { ...copy[idx], qty: copy[idx].qty + 1 };
+        return copy;
+      }
+      return [...prev, { name: prodName, price, qty: 1, emoji }];
+    });
+    setSendToKitchen(true);
     setDescription(prev => {
       if (!prev.trim()) return prodName;
       if (prev.includes(prodName)) return prev;
       return `${prev}, ${prodName}`.slice(0, 60);
     });
     try { AudioFX.beep(); } catch {}
-    showToast(`${prodName} (+${euro(price)}) opgeteld`, 'success');
+    showToast(`${prodName} (+${euro(price)}) toegevoegd`, 'success');
+  };
+
+  const handleAdjustQuickCartItem = (name: string, price: number, delta: number) => {
+    const target = quickCart.find(x => x.name === name && x.price === price);
+    if (!target) return;
+    const nextQty = target.qty + delta;
+    setAccumulatedTotal(prev => Math.max(0, Math.round((prev + delta * price) * 100) / 100));
+    setEntryCount(prev => Math.max(0, prev + delta));
+    setQuickCart(prev => {
+      if (nextQty <= 0) {
+        return prev.filter(x => !(x.name === name && x.price === price));
+      }
+      return prev.map(x => (x.name === name && x.price === price ? { ...x, qty: nextQty } : x));
+    });
   };
 
   const handleShareRequest = async () => {
@@ -706,30 +881,138 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                           <button
                             key={prod.id}
                             type="button"
-                            onClick={() => handleQuickAddProduct(prod.name, unitPrice)}
-                            className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-left flex items-center justify-between gap-1.5 transition active:scale-95"
+                            onClick={() => handleQuickAddProduct(prod.name, unitPrice, prod.emoji)}
+                            className="p-2.5 min-h-[44px] rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-left flex items-center justify-between gap-1.5 transition active:scale-95"
                           >
                             <div className="flex items-center gap-1.5 min-w-0">
                               <span className="text-base shrink-0">{prod.emoji}</span>
                               <span className="text-[11px] font-bold text-slate-200 truncate">{prod.name}</span>
                             </div>
-                            <span className="text-[11px] font-mono font-black text-cyan-300 shrink-0">
+                            <span className="text-[11px] font-mono font-black tabular-nums text-cyan-300 shrink-0">
                               {euro(unitPrice)}
                             </span>
                           </button>
                         );
                       })}
                     </div>
+
+                    {quickCart.length > 0 && (
+                      <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-bold text-slate-300">Gekozen items ({quickCart.reduce((s, i) => s + i.qty, 0)})</span>
+                          <button
+                            type="button"
+                            onClick={handleClear}
+                            className="text-rose-400 hover:text-rose-300 font-bold"
+                          >
+                            Alles wissen
+                          </button>
+                        </div>
+                        <div className="space-y-1">
+                          {quickCart.map(item => (
+                            <div
+                              key={`${item.name}-${item.price}`}
+                              className="flex items-center justify-between gap-2 bg-slate-900 rounded-lg px-2.5 py-1.5 text-xs border border-slate-800"
+                            >
+                              <span className="text-slate-100 font-bold truncate">
+                                {item.emoji ? `${item.emoji} ` : ''}{item.name}
+                              </span>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustQuickCartItem(item.name, item.price, -1)}
+                                  className="w-7 h-7 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center"
+                                  aria-label="Minder"
+                                >
+                                  <Minus className="w-3.5 h-3.5" />
+                                </button>
+                                <span className="font-mono font-black tabular-nums w-5 text-center text-cyan-300">{item.qty}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustQuickCartItem(item.name, item.price, 1)}
+                                  className="w-7 h-7 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center"
+                                  aria-label="Meer"
+                                >
+                                  <Plus className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
                 <div className="text-center py-2">
-                  <div className="text-4xl sm:text-5xl font-black tracking-tight text-white font-mono">
+                  <div className="text-4xl sm:text-5xl font-black tracking-tight text-white font-mono tabular-nums">
                     {euro(finalTotal)}
                   </div>
                   {tipAmount > 0 && (
-                    <div className="text-xs text-emerald-400 font-bold mt-1">
+                    <div className="text-xs text-emerald-400 font-bold mt-1 tabular-nums">
                       Subtotaal {euro(baseAmount)} + {tipPercent}% fooi ({euro(tipAmount)})
+                    </div>
+                  )}
+                </div>
+
+                {/* Optional Send-to-Kitchen / Order Details Toggle */}
+                <div className="rounded-2xl bg-slate-950 border border-slate-800 p-2.5 space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setSendToKitchen(prev => !prev)}
+                    className="w-full flex items-center justify-between gap-2 text-left text-xs"
+                  >
+                    <span className="flex items-center gap-2 font-bold text-slate-200">
+                      <ChefHat className={`w-4 h-4 ${sendToKitchen ? 'text-amber-400' : 'text-slate-400'}`} />
+                      <span>Doorsturen naar Keuken &amp; Afhaalscherm</span>
+                    </span>
+                    <span className={`px-2 py-0.5 rounded-md text-[11px] font-black border ${
+                      sendToKitchen
+                        ? 'bg-amber-500 text-slate-950 border-amber-400'
+                        : 'bg-slate-900 text-slate-400 border-slate-700'
+                    }`}>
+                      {sendToKitchen ? 'AAN' : 'UIT'}
+                    </span>
+                  </button>
+
+                  {sendToKitchen && (
+                    <div className="space-y-2 pt-2 border-t border-slate-800/80">
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {([
+                          { id: 'dine_in', label: '🍽️ Opeten' },
+                          { id: 'takeaway', label: '🥡 Afhaal' },
+                          { id: 'delivery', label: '🛵 Bezorgen' }
+                        ] as const).map(t => (
+                          <button
+                            key={t.id}
+                            type="button"
+                            onClick={() => setMobileOrderType(t.id)}
+                            className={`min-h-[40px] rounded-xl text-[11px] font-black border transition ${
+                              mobileOrderType === t.id
+                                ? 'bg-amber-500 text-slate-950 border-amber-400'
+                                : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
+                            }`}
+                          >
+                            {t.label}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={mobileIdentifier}
+                          onChange={e => setMobileIdentifier(e.target.value)}
+                          placeholder={mobileOrderType === 'dine_in' ? 'Tafelnummer / Naam...' : mobileOrderType === 'delivery' ? 'Adres & Naam...' : 'Klantnaam / Code...'}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
+                        />
+                        <input
+                          type="text"
+                          value={mobileOrderNote}
+                          onChange={e => setMobileOrderNote(e.target.value)}
+                          placeholder="Keuken-opmerking (optioneel)..."
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1046,10 +1329,322 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
           )}
 
           {/* ============================================================== */}
-          {/* TAB 3: MOBIELE KASSA, ACTIEVE ORDERS & CADEAUKAARTEN */}
+          {/* TAB 3: MOBIELE BESTELLINGEN, SCHAKELAARS & CADEAUKAARTEN */}
           {/* ============================================================== */}
           {activeTab === 'kassa_tools' && (
             <div className="space-y-4">
+              {/* Bestellingen Beheren (Direct bovenaan voor mobiel) */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 sm:p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-black text-white flex items-center gap-2">
+                      <Flame className="w-4 h-4 text-amber-400" />
+                      <span>Mobiel Besteloverzicht</span>
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Zoek, filter, geef prioriteit, roep af of pas status direct aan.
+                    </p>
+                  </div>
+                  <span className="text-xs font-mono font-black tabular-nums text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 px-2.5 py-1 rounded-lg shrink-0">
+                    {mobileOrderCounts.open} open
+                  </span>
+                </div>
+
+                {/* Zoekbalk */}
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={mobileOrderSearch}
+                    onChange={e => setMobileOrderSearch(e.target.value)}
+                    placeholder="Zoek op #nummer, klant, tafel of gerecht..."
+                    className="w-full min-h-[42px] bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-8 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                  />
+                  {mobileOrderSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setMobileOrderSearch('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs font-bold"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+
+                {/* Single-line horizontale status filters */}
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar">
+                  {([
+                    { id: 'open', label: 'Alle Open', count: mobileOrderCounts.open },
+                    { id: 'wachten', label: 'Wachten', count: mobileOrderCounts.wachten },
+                    { id: 'bereiden', label: 'Bereiden', count: mobileOrderCounts.bereiden },
+                    { id: 'inpakken', label: 'Inpakken', count: mobileOrderCounts.inpakken },
+                    { id: 'klaar', label: 'Klaar', count: mobileOrderCounts.klaar },
+                    { id: 'afgerond', label: 'Afgerond', count: mobileOrderCounts.afgerond }
+                  ] as const).map(tab => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setMobileOrderFilter(tab.id)}
+                      className={`min-h-[40px] px-3 rounded-xl text-xs font-bold whitespace-nowrap border flex items-center gap-1.5 shrink-0 transition ${
+                        mobileOrderFilter === tab.id
+                          ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-black'
+                          : 'bg-slate-950 text-slate-300 border-slate-800 hover:bg-slate-800'
+                      }`}
+                    >
+                      <span>{tab.label}</span>
+                      <span className={`font-mono text-[11px] tabular-nums ${
+                        mobileOrderFilter === tab.id ? 'text-slate-900' : 'text-slate-400'
+                      }`}>
+                        {tab.count}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                {/* Bestellingen Lijst (vloeiend scrollen zonder krappe max-height box) */}
+                {filteredMobileOrders.length === 0 ? (
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-6 text-center text-xs text-slate-500">
+                    Geen bestellingen gevonden voor dit filter.
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {filteredMobileOrders.map(ord => {
+                      const meta = getStatusMeta(ord.status);
+                      const elapsedMin = Math.max(0, Math.floor((nowTickMs - (ord.timestamp || nowTickMs)) / 60000));
+                      const isOpen = isOrderInProgress(ord.status) || isOrderReady(ord.status);
+                      const orderTypeLabel = ord.orderType === 'dine_in'
+                        ? '🍽️ Opeten'
+                        : ord.orderType === 'delivery'
+                        ? '🛵 Bezorgen'
+                        : '🥡 Afhaal';
+                      const paymentLabel = ord.paymentMethod === 'cash'
+                        ? '💶 Contant'
+                        : ord.paymentMethod === 'giftcard'
+                        ? '🎁 Cadeaubon'
+                        : '💳 WerkPay';
+
+                      const prevStatus = (() => {
+                        if (ord.status === 'bereiden' || ord.status === 'oven_grill' || ord.status === 'frituren') return 'wachten' as const;
+                        if (ord.status === 'inpakken') return 'bereiden' as const;
+                        if (ord.status === 'klaar' || ord.status === 'done') return 'inpakken' as const;
+                        if (ord.status === 'afgehaald') return 'klaar' as const;
+                        return null;
+                      })();
+
+                      return (
+                        <div
+                          key={`${ord.no}-${ord.timestamp}`}
+                          className={`bg-slate-950 border rounded-2xl p-3.5 space-y-3 ${
+                            ord.isPrio ? 'border-amber-500/60 ring-1 ring-amber-500/30' : 'border-slate-800'
+                          }`}
+                        >
+                          {/* Kaart Header */}
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0 space-y-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-mono font-black text-sm text-cyan-400 tabular-nums">#{ord.no}</span>
+                                <span className="font-bold text-sm text-white truncate">{ord.identifier}</span>
+                                {ord.isPrio && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500 text-slate-950 font-black">
+                                    PRIO
+                                  </span>
+                                )}
+                                <span className={`text-[10px] px-2 py-0.5 rounded font-bold border ${meta.badgeBg} ${meta.badgeBorder} ${meta.badgeText}`}>
+                                  {meta.emoji} {meta.shortLabel}
+                                </span>
+                              </div>
+
+                              <div className="text-[11px] text-slate-400 flex items-center gap-1.5 flex-wrap tabular-nums">
+                                <span>{orderTypeLabel}</span>
+                                <span>·</span>
+                                <span>{paymentLabel}</span>
+                                <span>·</span>
+                                <span className="inline-flex items-center gap-1">
+                                  <Clock className="w-3 h-3" />
+                                  {ord.time}
+                                  {isOpen && ` (${elapsedMin}m)`}
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="text-right shrink-0">
+                              <span className="font-mono font-black text-base text-emerald-400 tabular-nums">
+                                {euro(ord.total)}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Volledige Itemlijst + Opmerkingen (niet afgekapt) */}
+                          <div className="bg-slate-900/70 border border-slate-800/80 rounded-xl p-2.5 space-y-1">
+                            {ord.items.map((item, idx) => (
+                              <div key={idx} className="text-xs flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <span className="font-mono font-black text-amber-400 mr-1.5 tabular-nums">{item.qty}×</span>
+                                  <span className={`font-semibold ${item.done ? 'text-slate-400 line-through' : 'text-slate-100'}`}>
+                                    {item.name}
+                                  </span>
+                                  {item.itemNote && (
+                                    <div className="text-[11px] text-amber-300 pl-5">
+                                      ↳ {item.itemNote}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                            {ord.notes && (
+                              <div className="text-[11px] text-cyan-300 pt-1 mt-1 border-t border-slate-800">
+                                📝 {ord.notes}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Actieknoppen (>=44px aanraakdoelen) */}
+                          <div className="flex flex-wrap items-center gap-2">
+                            {(ord.status === 'new' || ord.status === 'wachten') && (
+                              <button
+                                type="button"
+                                onClick={() => updateOrderStatus(ord.no, 'bereiden')}
+                                className="flex-1 min-w-[120px] min-h-[44px] px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center justify-center gap-1.5"
+                              >
+                                <Flame className="w-4 h-4" />
+                                <span>Bereiden</span>
+                              </button>
+                            )}
+
+                            {(ord.status === 'bereiden' || ord.status === 'oven_grill' || ord.status === 'frituren') && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => updateOrderStatus(ord.no, 'inpakken')}
+                                  className="flex-1 min-w-[110px] min-h-[44px] px-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-black flex items-center justify-center gap-1.5"
+                                >
+                                  <Package className="w-4 h-4" />
+                                  <span>Inpakken</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateOrderStatus(ord.no, 'klaar')}
+                                  className="flex-1 min-w-[110px] min-h-[44px] px-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-black flex items-center justify-center gap-1.5"
+                                >
+                                  <Check className="w-4 h-4" />
+                                  <span>Direct Klaar</span>
+                                </button>
+                              </>
+                            )}
+
+                            {ord.status === 'inpakken' && (
+                              <button
+                                type="button"
+                                onClick={() => updateOrderStatus(ord.no, 'klaar')}
+                                className="flex-1 min-w-[120px] min-h-[44px] px-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-black flex items-center justify-center gap-1.5"
+                              >
+                                <Check className="w-4 h-4" />
+                                <span>Klaar voor Afhaal</span>
+                              </button>
+                            )}
+
+                            {isOrderReady(ord.status) && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => updateOrderStatus(ord.no, 'afgehaald')}
+                                  className="flex-1 min-w-[120px] min-h-[44px] px-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-black flex items-center justify-center gap-1.5"
+                                >
+                                  <Package className="w-4 h-4" />
+                                  <span>Afgehaald</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    AudioFX.speakOrder(ord.no, ord.identifier, ord.orderType, true);
+                                    showToast(`Order #${ord.no} opnieuw afgeroepen.`, 'info');
+                                  }}
+                                  className="min-h-[44px] px-3 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-xs font-black flex items-center justify-center gap-1.5"
+                                  title="Opnieuw afroepen via omroepsysteem"
+                                >
+                                  <Megaphone className="w-4 h-4" />
+                                  <span>Roep af</span>
+                                </button>
+                              </>
+                            )}
+
+                            {prevStatus && (
+                              <button
+                                type="button"
+                                onClick={() => updateOrderStatus(ord.no, prevStatus)}
+                                className="min-h-[44px] px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 text-xs font-bold flex items-center justify-center gap-1"
+                                title="Stap terug zetten"
+                              >
+                                <Undo2 className="w-3.5 h-3.5" />
+                                <span>Terug</span>
+                              </button>
+                            )}
+
+                            {isOpen && (
+                              <button
+                                type="button"
+                                onClick={() => toggleOrderPrio(ord.no)}
+                                className={`min-h-[44px] px-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-1 ${
+                                  ord.isPrio
+                                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                                    : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+                                }`}
+                                title="Prioriteit wisselen"
+                              >
+                                <Star className="w-3.5 h-3.5" />
+                                <span>Prio</span>
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={() => setActiveReceiptOrder(ord)}
+                              className="min-h-[44px] px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-bold flex items-center justify-center gap-1"
+                            >
+                              <Receipt className="w-3.5 h-3.5" />
+                              <span>Bon</span>
+                            </button>
+
+                            {isOpen && (
+                              confirmCancelOrderNo === ord.no ? (
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      await cancelOrder(ord.no);
+                                      setConfirmCancelOrderNo(null);
+                                      showToast(`Bestelling #${ord.no} geannuleerd.`, 'info');
+                                    }}
+                                    className="min-h-[44px] px-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-black"
+                                  >
+                                    Bevestig
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmCancelOrderNo(null)}
+                                    className="min-h-[44px] px-3 rounded-xl bg-slate-800 text-slate-300 text-xs font-bold"
+                                  >
+                                    Nee
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmCancelOrderNo(ord.no)}
+                                  className="min-h-[44px] px-3 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-xs font-bold flex items-center justify-center"
+                                >
+                                  Annuleer
+                                </button>
+                              )
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
               {/* Snelle Kassa & Geluid Schakelaars */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
                 <h3 className="text-sm font-black text-white flex items-center gap-2">
@@ -1065,7 +1660,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                       if (next) AudioFX.bell();
                       setSoundEnabled(next);
                     }}
-                    className={`py-2.5 px-3 rounded-xl text-xs font-black border flex items-center justify-center gap-2 transition ${
+                    className={`min-h-[44px] px-3 rounded-xl text-xs font-black border flex items-center justify-center gap-2 transition ${
                       soundEnabled
                         ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
                         : 'bg-slate-950 text-slate-400 border-slate-800'
@@ -1083,7 +1678,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                           toggleOrderStop();
                           showToast(orderStopActive ? 'Bestelstop opgeheven!' : 'Bestelstop geactiveerd!', 'info');
                         }}
-                        className={`py-2.5 px-3 rounded-xl text-xs font-black border flex items-center justify-center gap-2 transition ${
+                        className={`min-h-[44px] px-3 rounded-xl text-xs font-black border flex items-center justify-center gap-2 transition ${
                           orderStopActive
                             ? 'bg-rose-600 text-white border-rose-500 shadow'
                             : 'bg-slate-950 text-slate-300 border-slate-800 hover:bg-slate-800'
@@ -1099,7 +1694,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                           togglePickupClosed();
                           showToast(pickupClosed ? 'Afhaalbalie geopend!' : 'Afhaalbalie gesloten!', 'info');
                         }}
-                        className={`py-2.5 px-3 rounded-xl text-xs font-black border flex items-center justify-center gap-2 transition ${
+                        className={`min-h-[44px] px-3 rounded-xl text-xs font-black border flex items-center justify-center gap-2 transition ${
                           pickupClosed
                             ? 'bg-amber-600 text-white border-amber-500 shadow'
                             : 'bg-slate-950 text-slate-300 border-slate-800 hover:bg-slate-800'
@@ -1113,142 +1708,75 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 </div>
               </div>
 
-              {/* Openstaande Bestellingen Snel Beheren */}
+              {/* Cadeaukaart Mini-Balie (Inklapbaar) */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-black text-white flex items-center gap-2">
-                      <Flame className="w-4 h-4 text-amber-400" />
-                      <span>Openstaande Bestellingen ({openKitchenPickupOrders.length})</span>
-                    </h3>
-                    <p className="text-xs text-slate-400">
-                      Zet bestellingen direct vanaf je telefoon op Bereiden, Klaar of Afgehaald.
-                    </p>
-                  </div>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowGiftSection(p => !p)}
+                  className="w-full flex items-center justify-between text-left"
+                >
+                  <h3 className="text-sm font-black text-white flex items-center gap-2">
+                    <Gift className="w-4 h-4 text-purple-400" />
+                    <span>Cadeaukaart Check &amp; Uitgeven ({giftCards.length})</span>
+                  </h3>
+                  {showGiftSection ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
+                </button>
 
-                {openKitchenPickupOrders.length === 0 ? (
-                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 text-center text-xs text-slate-500">
-                    Geen openstaande keuken- of afhaalbestellingen op dit moment.
-                  </div>
-                ) : (
-                  <div className="space-y-2 max-h-80 overflow-y-auto">
-                    {openKitchenPickupOrders.map(ord => {
-                      const meta = getStatusMeta(ord.status);
-                      return (
-                        <div
-                          key={`${ord.no}-${ord.timestamp}`}
-                          className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+                {showGiftSection && (
+                  <div className="space-y-3 pt-2 border-t border-slate-800">
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        value={giftSearch}
+                        onChange={e => setGiftSearch(e.target.value)}
+                        placeholder="Voer cadeaukaart code in (bijv. GIFT-...)..."
+                        className="flex-1 min-h-[42px] bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white font-mono uppercase focus:outline-none focus:border-purple-500"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="number"
+                          min="1"
+                          step="1"
+                          value={newGiftAmount}
+                          onChange={e => setNewGiftAmount(e.target.value)}
+                          className="w-16 min-h-[42px] bg-slate-950 border border-slate-800 rounded-xl px-2 py-2 text-xs text-white font-mono text-center"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const amt = Math.max(1, parseFloat(newGiftAmount) || 15);
+                            const code = generateGiftCardCode();
+                            createGiftCard(code, amt);
+                            setGiftSearch(code);
+                            showToast(`Nieuwe cadeaukaart ${code} (${euro(amt)}) aangemaakt!`, 'success');
+                          }}
+                          className="min-h-[42px] px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-black text-xs whitespace-nowrap"
                         >
-                          <div className="space-y-1 min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-mono font-black text-xs text-cyan-400">#{ord.no}</span>
-                              <span className="font-bold text-xs text-white truncate">{ord.identifier}</span>
-                              <span className={`text-[10px] px-2 py-0.5 rounded font-bold border ${meta.badgeBg} ${meta.badgeBorder} ${meta.badgeText}`}>
-                                {meta.emoji} {meta.shortLabel}
-                              </span>
-                            </div>
-                            <p className="text-[11px] text-slate-400 truncate">
-                              {ord.items.map(i => `${i.qty}x ${i.name}`).join(', ')}
-                            </p>
-                          </div>
-
-                          <div className="flex items-center gap-1.5 shrink-0">
-                            {(ord.status === 'new' || ord.status === 'wachten') && (
-                              <button
-                                type="button"
-                                onClick={() => updateOrderStatus(ord.no, 'bereiden')}
-                                className="px-2.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 text-[11px] font-black"
-                              >
-                                🔥 Bereiden
-                              </button>
-                            )}
-                            {isOrderInProgress(ord.status) && (
-                              <button
-                                type="button"
-                                onClick={() => updateOrderStatus(ord.no, 'klaar')}
-                                className="px-2.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-[11px] font-black flex items-center gap-1"
-                              >
-                                <Check className="w-3.5 h-3.5" />
-                                <span>Klaar</span>
-                              </button>
-                            )}
-                            {isOrderReady(ord.status) && (
-                              <button
-                                type="button"
-                                onClick={() => updateOrderStatus(ord.no, 'afgehaald')}
-                                className="px-2.5 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-[11px] font-black flex items-center gap-1"
-                              >
-                                <Package className="w-3.5 h-3.5" />
-                                <span>Afgehaald</span>
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* Cadeaukaart Mini-Balie */}
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-                <h3 className="text-sm font-black text-white flex items-center gap-2">
-                  <Gift className="w-4 h-4 text-purple-400" />
-                  <span>Cadeaukaart Check &amp; Uitgeven ({giftCards.length})</span>
-                </h3>
-
-                <div className="flex flex-col sm:flex-row gap-2">
-                  <input
-                    type="text"
-                    value={giftSearch}
-                    onChange={e => setGiftSearch(e.target.value)}
-                    placeholder="Voer cadeaukaart code in (bijv. GIFT-...)..."
-                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white font-mono uppercase focus:outline-none focus:border-purple-500"
-                  />
-                  <div className="flex items-center gap-1.5">
-                    <input
-                      type="number"
-                      min="1"
-                      step="1"
-                      value={newGiftAmount}
-                      onChange={e => setNewGiftAmount(e.target.value)}
-                      className="w-16 bg-slate-950 border border-slate-800 rounded-xl px-2 py-2 text-xs text-white font-mono text-center"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const amt = Math.max(1, parseFloat(newGiftAmount) || 15);
-                        const code = generateGiftCardCode();
-                        createGiftCard(code, amt);
-                        setGiftSearch(code);
-                        showToast(`Nieuwe cadeaukaart ${code} (${euro(amt)}) aangemaakt!`, 'success');
-                      }}
-                      className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-black text-xs whitespace-nowrap"
-                    >
-                      + Nieuwe Kaart
-                    </button>
-                  </div>
-                </div>
-
-                {foundGiftCard && (
-                  <div className="bg-slate-950 border border-purple-500/40 rounded-xl p-3 flex items-center justify-between gap-2">
-                    <div>
-                      <div className="font-mono font-black text-xs text-purple-300">{foundGiftCard.code}</div>
-                      <div className="text-xs text-slate-300">
-                        Saldo: <strong className="text-emerald-400">{euro(foundGiftCard.current_balance)}</strong>
+                          + Nieuwe Kaart
+                        </button>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        topUpGiftCard(foundGiftCard.id, 10);
-                        showToast(`+€ 10,00 bijgeboekt op ${foundGiftCard.code}`, 'success');
-                      }}
-                      className="px-2.5 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-black"
-                    >
-                      +€10 Opwaarderen
-                    </button>
+
+                    {foundGiftCard && (
+                      <div className="bg-slate-950 border border-purple-500/40 rounded-xl p-3 flex items-center justify-between gap-2">
+                        <div>
+                          <div className="font-mono font-black text-xs text-purple-300">{foundGiftCard.code}</div>
+                          <div className="text-xs text-slate-300">
+                            Saldo: <strong className="text-emerald-400 font-mono tabular-nums">{euro(foundGiftCard.current_balance)}</strong>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            topUpGiftCard(foundGiftCard.id, 10);
+                            showToast(`+€ 10,00 bijgeboekt op ${foundGiftCard.code}`, 'success');
+                          }}
+                          className="min-h-[40px] px-2.5 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-black"
+                        >
+                          +€10 Opwaarderen
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -1629,21 +2157,47 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
               {/* 4. Contant */}
               {payMethod === 'cash' && (
                 <div className="space-y-3">
+                  {!hasCashAuth && (
+                    <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/40 space-y-2">
+                      <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+                        <Lock className="w-4 h-4 shrink-0" />
+                        <span>Medewerker Autorisatie Vereist (cash_pay)</span>
+                      </div>
+                      <p className="text-[11px] text-slate-300">
+                        Je huidige account heeft geen recht om direct contant geld aan te nemen. Voer een bevoegde medewerker-PIN in.
+                      </p>
+                      <input
+                        type="password"
+                        maxLength={16}
+                        value={cashApprovalPin}
+                        onChange={e => {
+                          setCashApprovalPin(e.target.value);
+                          if (payError) setPayError('');
+                        }}
+                        placeholder="Voer bevoegde medewerker PIN in..."
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-amber-400"
+                      />
+                    </div>
+                  )}
+
                   <div>
                     <label className="text-xs font-bold text-slate-400 block mb-1">Ontvangen contant (€)</label>
                     <input
-                      type="number"
-                      step="0.05"
+                      type="text"
+                      inputMode="decimal"
                       value={cashReceived}
-                      onChange={e => setCashReceived(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-lg font-mono font-bold text-white"
+                      onChange={e => {
+                        setCashReceived(e.target.value);
+                        if (payError) setPayError('');
+                      }}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-lg font-mono font-bold tabular-nums text-white"
                     />
                   </div>
                   <div className="grid grid-cols-5 gap-1.5">
                     <button
                       type="button"
                       onClick={() => setCashReceived(finalTotal.toFixed(2))}
-                      className="py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-bold text-cyan-300"
+                      className="min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-bold text-cyan-300"
                     >
                       Gepast
                     </button>
@@ -1652,7 +2206,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                         key={b}
                         type="button"
                         onClick={() => setCashReceived(b.toFixed(2))}
-                        className="py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono font-bold text-white"
+                        className="min-h-[40px] rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono font-bold tabular-nums text-white"
                       >
                         €{b}
                       </button>
@@ -1660,15 +2214,21 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                   </div>
                   <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between text-xs">
                     <span className="text-slate-400 font-bold">Wisselgeld terug:</span>
-                    <span className="font-mono font-black text-base text-emerald-400">
-                      {euro(Math.max(0, (parseFloat(cashReceived.replace(',', '.')) || 0) - finalTotal))}
-                    </span>
+                    {(() => {
+                      const rec = parseFloat(cashReceived.replace(',', '.'));
+                      const ok = Number.isFinite(rec) && rec >= finalTotal - 0.01;
+                      return (
+                        <span className={`font-mono font-black text-base tabular-nums ${ok ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {ok ? euro(Math.max(0, rec - finalTotal)) : 'Onvolledig'}
+                        </span>
+                      );
+                    })()}
                   </div>
                   <button
                     type="button"
                     disabled={isProcessing}
                     onClick={handleCashSubmit}
-                    className="w-full py-3 rounded-2xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black text-sm"
+                    className="w-full min-h-[48px] py-3 rounded-2xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black text-sm"
                   >
                     {isProcessing ? 'Verwerken...' : `Bevestig Contant ${euro(finalTotal)}`}
                   </button>

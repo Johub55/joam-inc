@@ -2,22 +2,20 @@ import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro } from '../../services/store';
 import { AudioFX } from '../../services/audio';
-import { 
-  Coins, 
-  ShieldCheck, 
-  CheckCircle2, 
-  X, 
-  AlertCircle, 
-  Banknote, 
-  KeyRound, 
-  UserCheck,
-  ShoppingBag
+import {
+  Coins,
+  CheckCircle2,
+  X,
+  AlertCircle,
+  Banknote,
+  KeyRound,
+  UserCheck
 } from 'lucide-react';
 
 interface CashApprovalModalProps {
   orderNo: number;
   totalAmount: number;
-  onApprove: (data: { received: number; change: number; acceptedBy: string }) => void;
+  onApprove: (data: { received: number; change: number; acceptedBy: string; approvalPin?: string }) => void;
   onCancel: () => void;
 }
 
@@ -27,67 +25,61 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
   onApprove,
   onCancel
 }) => {
-  const { currentPosUser, posUsers } = useApp();
+  const { currentPosUser, managerOverride, authorizeCashStaffUser, verifyCashApprovalPin } = useApp();
 
-  const isStaffLoggedIn = Boolean(
-    currentPosUser && 
-    currentPosUser.username !== 'bestel_kassa' && 
-    (currentPosUser.is_admin || currentPosUser.perms?.includes('cash_pay'))
-  );
+  const isStaffLoggedIn = Boolean(managerOverride || authorizeCashStaffUser(currentPosUser));
 
   const [receivedInput, setReceivedInput] = useState<string>(totalAmount.toFixed(2));
   const [managerPin, setManagerPin] = useState<string>('');
   const [error, setError] = useState<string>('');
 
-  const receivedNum = parseFloat(receivedInput) || 0;
-  const changeAmount = Math.max(0, receivedNum - totalAmount);
+  const normalizedReceived = receivedInput.replace(',', '.').trim();
+  const parsedReceived = normalizedReceived === '' ? NaN : Number(normalizedReceived);
+  const isValidAmount = Number.isFinite(parsedReceived) && parsedReceived >= totalAmount - 0.01;
+  const changeAmount = isValidAmount ? Math.max(0, Math.round((parsedReceived - totalAmount) * 100) / 100) : 0;
 
   const handleConfirm = () => {
     setError('');
 
-    if (receivedNum < totalAmount) {
-      setError(`Ontvangen bedrag (€${receivedNum.toFixed(2)}) is minder dan het totaalbedrag (${euro(totalAmount)})!`);
+    if (!isValidAmount) {
+      setError(`Ontvangen bedrag is ongeldig of minder dan het totaalbedrag (${euro(totalAmount)})!`);
       return;
     }
 
     let acceptedByName = currentPosUser?.name || 'Kassamedewerker';
+    let approvalPin: string | undefined = undefined;
 
-    // If currently on bestel_kassa, require a staff pin to approve
     if (!isStaffLoggedIn) {
       const cleanPin = managerPin.trim();
       if (!cleanPin) {
-        setError('Medewerker of manager pincode is vereist om deze contante betaling te accepteren!');
+        setError('Een geldige medewerker- of manager pincode met contant-rechten is vereist!');
         return;
       }
 
-      // Check against posUsers or standard pin
-      const validUser = posUsers.find(u => 
-        (u.password === cleanPin || (u as any).pin_code === cleanPin) &&
-        (u.is_admin || u.perms?.includes('cash_pay'))
-      );
-
-      if (cleanPin === '1234' || cleanPin === 'admin123' || validUser) {
-        acceptedByName = validUser ? validUser.name : 'Manager';
-      } else {
-        setError('Ongeldige medewerker/manager pincode!');
+      const check = verifyCashApprovalPin(cleanPin);
+      if (!check.valid) {
+        setError('Ongeldige pincode of onvoldoende rechten (cash_pay vereist)!');
         return;
       }
+
+      acceptedByName = check.approverName || 'Medewerker';
+      approvalPin = cleanPin;
     }
 
-    // Play chime for cash drawer
     AudioFX.bell();
 
     onApprove({
-      received: receivedNum,
+      received: Math.round(parsedReceived * 100) / 100,
       change: changeAmount,
-      acceptedBy: acceptedByName
+      acceptedBy: acceptedByName,
+      approvalPin
     });
   };
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
       <div className="bg-slate-900 border border-amber-500/40 w-full max-w-lg rounded-3xl shadow-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-200">
-        
+
         {/* Header */}
         <div className="p-5 border-b border-slate-800 bg-amber-500/10 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -97,16 +89,17 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-base font-black text-white">Contante Betaling Autorisatie</h2>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                <span className="px-2 py-0.5 rounded-md text-[10px] font-black font-mono tabular-nums bg-amber-500/20 text-amber-300 border border-amber-500/30">
                   Bestelling #{orderNo}
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                Alleen bevoegde medewerkers kunnen contant geld aannemen en registreren.
+                Alleen bevoegde medewerkers (cash_pay) kunnen contant geld accepteren.
               </p>
             </div>
           </div>
           <button
+            type="button"
             onClick={onCancel}
             className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition"
           >
@@ -116,17 +109,17 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
 
         {/* Content */}
         <div className="p-5 space-y-4">
-          
+
           {/* Bedrag overzicht */}
           <div className="p-4 bg-slate-950 border border-slate-800 rounded-2xl flex items-center justify-between">
             <div>
               <span className="text-xs text-slate-400 block font-semibold">Totaal te innen bedrag:</span>
-              <span className="text-2xl font-black text-amber-400">{euro(totalAmount)}</span>
+              <span className="text-2xl font-black text-amber-400 font-mono tabular-nums">{euro(totalAmount)}</span>
             </div>
             <div className="text-right">
               <span className="text-xs text-slate-400 block font-semibold">Wisselgeld aan klant:</span>
-              <span className={`text-xl font-black ${receivedNum >= totalAmount ? 'text-emerald-400' : 'text-rose-400'}`}>
-                {receivedNum >= totalAmount ? euro(changeAmount) : 'Onvolledig'}
+              <span className={`text-xl font-black font-mono tabular-nums ${isValidAmount ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {isValidAmount ? euro(changeAmount) : 'Onvolledig'}
               </span>
             </div>
           </div>
@@ -137,20 +130,20 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
               <Banknote className="w-4 h-4 text-amber-400" />
               Ontvangen contant geld (€)
             </label>
-            <div className="flex gap-2 mb-2">
+            <div className="flex gap-2 mb-2 flex-wrap sm:flex-nowrap">
               <input
-                type="number"
-                step="0.05"
+                type="text"
+                inputMode="decimal"
                 value={receivedInput}
                 onChange={e => setReceivedInput(e.target.value)}
-                className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-lg font-black text-white focus:outline-none focus:border-amber-400"
+                className="flex-1 min-w-[120px] bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-lg font-black font-mono tabular-nums text-white focus:outline-none focus:border-amber-400"
               />
               {[5, 10, 20, 50, 100].map(amt => (
                 <button
                   key={amt}
                   type="button"
                   onClick={() => setReceivedInput(String(amt))}
-                  className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-200 border border-slate-700"
+                  className="px-2.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold font-mono tabular-nums text-slate-200 border border-slate-700"
                 >
                   €{amt}
                 </button>
@@ -166,7 +159,7 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
               </div>
               <div className="text-xs">
                 <span className="font-bold text-emerald-300 block">
-                  Geautoriseerd door medewerker: {currentPosUser?.name}
+                  Geautoriseerd door medewerker: {currentPosUser?.name || 'Manager'}
                 </span>
                 <span className="text-[11px] text-slate-400">
                   Je hebt bevoegdheid om contante transacties direct te accepteren.
@@ -180,15 +173,15 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
                 <span>Medewerker of Manager Goedkeurings-PIN</span>
               </div>
               <p className="text-[11px] text-slate-400">
-                De kassa staat in <strong>Bestel Account</strong> modus. Een medewerker moet zijn/haar pincode invoeren om de contante ontvangst te bevestigen en de kassalade te openen.
+                Dit scherm heeft geen actieve kassarechten. Voer een persoonlijke PIN/wachtwoord in van een medewerker met <strong>Contant (cash_pay)</strong> rechten of de Master PIN.
               </p>
               <input
                 type="password"
-                maxLength={8}
+                maxLength={16}
                 value={managerPin}
                 onChange={e => setManagerPin(e.target.value)}
                 placeholder="Voer medewerker PIN in..."
-                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3.5 py-2 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
+                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
               />
             </div>
           )}
@@ -207,18 +200,18 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
           <button
             type="button"
             onClick={onCancel}
-            className="flex-1 py-3 px-4 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+            className="flex-1 min-h-[44px] py-3 px-4 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
           >
             Annuleren
           </button>
-          
+
           <button
             type="button"
             onClick={handleConfirm}
-            className="flex-2 py-3 px-5 rounded-xl text-xs font-black bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center justify-center gap-2 transition shadow-lg shadow-amber-500/20"
+            className="flex-[2] min-h-[44px] py-3 px-5 rounded-xl text-xs font-black bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center justify-center gap-2 transition shadow-lg shadow-amber-500/20"
           >
             <CheckCircle2 className="w-4 h-4" />
-            <span>Contant Ontvangen &amp; Bestelling Goedkeuren</span>
+            <span>Contant Ontvangen &amp; Goedkeuren</span>
           </button>
         </div>
 
@@ -226,3 +219,4 @@ export const CashApprovalModal: React.FC<CashApprovalModalProps> = ({
     </div>
   );
 };
+

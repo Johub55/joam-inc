@@ -278,11 +278,15 @@ export interface CashPaymentRequest {
   orderType: 'dine_in' | 'takeaway' | 'delivery';
   identifier: string;
   total: number;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'consumed';
   requestedAt: number;
   approvedBy?: string;
+  approvedByUsername?: string;
+  approvedAt?: number;
+  consumedAt?: number;
   received?: number;
   change?: number;
   rejectedReason?: string;
 }
+
 
