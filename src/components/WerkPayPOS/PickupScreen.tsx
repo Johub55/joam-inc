@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { AudioFX, SpeechVoiceOption, TtsEngineMode, AudioDiagnosticStatus } from '../../services/audio';
 import { getStatusMeta, isOrderInProgress, isOrderReady } from '../../services/orderStatus';
-import { getSupabaseClient } from '../../services/store';
+import { fsGetCollection, fsSetDoc } from '../../services/firebase';
+import { tvPresetDocId } from '../../services/firestoreSync';
 import { showToast } from '../../services/appToast';
 import { 
   getNewsConfig, 
@@ -415,13 +416,11 @@ export const PickupScreen: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch custom presets from Supabase on mount
+  // Fetch custom presets from Firebase Firestore on mount
   useEffect(() => {
-    const fetchSupabasePresets = async () => {
+    const fetchFirestorePresets = async () => {
       try {
-        const client = getSupabaseClient();
-        if (!client) return;
-        const { data } = await client.from('tv_presets').select('*');
+        const data = await fsGetCollection('tv_presets');
         if (data && data.length > 0) {
           const formatted = data.map((row: any) => ({
             id: row.id,
@@ -438,10 +437,10 @@ export const PickupScreen: React.FC = () => {
           });
         }
       } catch {
-        // Graceful fallback if table does not exist yet
+        // Graceful fallback
       }
     };
-    fetchSupabasePresets();
+    fetchFirestorePresets();
   }, []);
 
   // Automatic rotation timer: ONLY cycles between 'pickup' (Afhaallijst) and 'menu' (Menukaart) if enabled AND NOT in split mode!
@@ -614,7 +613,7 @@ export const PickupScreen: React.FC = () => {
     });
   };
 
-  const handleSaveCustomPresetToSupabase = async () => {
+  const handleSaveCustomPresetToFirestore = async () => {
     const name = presetNameInput.trim() || `Mijn Custom ${clockStyle.toUpperCase()} TV`;
     const newPreset = {
       id: `custom_${Date.now()}`,
@@ -633,22 +632,20 @@ export const PickupScreen: React.FC = () => {
     }
 
     try {
-      const client = getSupabaseClient();
-      if (client) {
-        await client.from('tv_presets').upsert([{
-          id: newPreset.id,
-          name: newPreset.name,
-          clock_style: newPreset.clockStyle,
-          view_mode: newPreset.tvView,
-          auto_rotate: newPreset.autoRotate,
-          widgets: newPreset.widgets
-        }]);
-      }
+      await fsSetDoc('tv_presets', tvPresetDocId(newPreset.id), {
+        id: newPreset.id.slice(0, 128),
+        name: newPreset.name.slice(0, 120),
+        clock_style: String(newPreset.clockStyle).slice(0, 32),
+        view_mode: String(newPreset.tvView).slice(0, 32),
+        auto_rotate: Boolean(newPreset.autoRotate),
+        widgets: newPreset.widgets,
+        updated_at: new Date().toISOString()
+      });
     } catch {
       // Graceful fallback
     }
 
-    showToast(`🚀 TV Preset "${newPreset.name}" opgeslagen! Synchroon met Supabase & lokaal.`, 'success');
+    showToast(`🚀 TV Preset "${newPreset.name}" opgeslagen! Synchroon met Firebase Cloud & lokaal.`, 'success');
   };
 
   const handleSelectVoice = (uri: string) => {
@@ -2223,7 +2220,7 @@ export const PickupScreen: React.FC = () => {
                   1. Kies een TV Layout Preset
                 </label>
                 <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded-full border border-emerald-500/30">
-                  ☁️ Supabase Synchroon
+                  ☁️ Firebase Synchroon
                 </span>
               </div>
               <div className="grid grid-cols-2 gap-2.5">
@@ -2497,10 +2494,10 @@ export const PickupScreen: React.FC = () => {
               </div>
             </div>
 
-            {/* Section 4: Opslaan in Supabase */}
+            {/* Section 4: Opslaan in Firebase */}
             <div className="space-y-2 pt-2 border-t border-slate-800">
               <label className="text-xs font-black uppercase tracking-wider text-amber-400 block">
-                4. Opslaan als Preset in Supabase
+                4. Opslaan als Preset in Firebase Cloud
               </label>
               <div className="flex items-center gap-2">
                 <input
@@ -2512,10 +2509,10 @@ export const PickupScreen: React.FC = () => {
                 />
                 <button
                   type="button"
-                  onClick={handleSaveCustomPresetToSupabase}
+                  onClick={handleSaveCustomPresetToFirestore}
                   className="px-4 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 font-black text-xs transition flex items-center gap-1.5 shrink-0"
                 >
-                  <span>💾 Opslaan in Supabase</span>
+                  <span>💾 Opslaan in Firebase</span>
                 </button>
               </div>
             </div>

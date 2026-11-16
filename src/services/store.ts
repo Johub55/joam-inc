@@ -1,4 +1,3 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { 
   Order, 
   Product, 
@@ -9,20 +8,12 @@ import {
   Coupon, 
   GiftCard, 
   PosUser, 
-  SupabaseConfig,
   BrandType,
   BrandConfig,
   LinkedNfcTag
 } from '../types';
 import { DEFAULT_PRODUCTS, KOEKPLOEG_PRODUCTS, ALL_DEFAULT_PRODUCTS } from './defaultProducts';
 import { AudioFX } from './audio';
-
-// Default Supabase project endpoints provided by the user
-export const DEFAULT_SUPABASE_POS_URL = "https://qbncbzchrmbqhfbxgvbr.supabase.co";
-export const DEFAULT_SUPABASE_POS_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFibmNiemNocm1icWhmYnhndmJyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4NjI4OTUsImV4cCI6MjEwNDQzODg5NX0.cBbcg-VQyZ8NoxkVlDWF2ddmyD8MAS2jtHjRvDtrlOo";
-
-export const DEFAULT_SUPABASE_PAY_URL = "https://qbncbzchrmbqhfbxgvbr.supabase.co";
-export const DEFAULT_SUPABASE_PAY_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFibmNiemNocm1icWhmYnhndmJyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4NjI4OTUsImV4cCI6MjEwNDQzODg5NX0.cBbcg-VQyZ8NoxkVlDWF2ddmyD8MAS2jtHjRvDtrlOo";
 
 // Store / Brand Branding Presets
 export const BRAND_CONFIGS: Record<BrandType, BrandConfig> = {
@@ -190,42 +181,3 @@ export function accountMatchesUid(
   return getAccountAllUids(acc).includes(cleanQuery);
 }
 
-// Supabase Client Factory to prevent multiple instances
-const _clientCache = new Map<string, SupabaseClient>();
-
-export function getSupabaseClient(url?: string, key?: string, options?: any): SupabaseClient | null {
-  // 1. Try to load from arguments
-  let targetUrl = url;
-  let targetKey = key;
-
-  // 2. If not in arguments, try localStorage
-  if (!targetUrl || !targetKey) {
-    if (typeof window !== 'undefined') {
-      try {
-        const cfgRaw = localStorage.getItem('wd_sb_cfg');
-        const cfg = cfgRaw ? JSON.parse(cfgRaw) : {};
-        if (!targetUrl) targetUrl = cfg.unifiedUrl || cfg.supabaseUrl;
-        if (!targetKey) targetKey = cfg.unifiedKey || cfg.supabaseAnonKey;
-      } catch (e) {}
-    }
-  }
-
-  // 3. If still not found, fallback to hardcoded defaults
-  if (!targetUrl) targetUrl = DEFAULT_SUPABASE_POS_URL;
-  if (!targetKey) targetKey = DEFAULT_SUPABASE_POS_KEY;
-
-  if (!targetUrl || !targetKey) return null;
-
-  const cacheKey = `${targetUrl}::${targetKey}`;
-  if (_clientCache.has(cacheKey)) {
-    return _clientCache.get(cacheKey) || null;
-  }
-
-  const client = createClient(targetUrl, targetKey, options || {
-    auth: { persistSession: false, autoRefreshToken: false },
-    realtime: { params: { eventsPerSecond: 10 } }
-  });
-
-  _clientCache.set(cacheKey, client);
-  return client;
-}

@@ -108,7 +108,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
 
   const handleSelectPosScreen = (screen: PosScreenType) => {
     if (screen === 'sumup_terminal' && !isLoggedInStaff) {
-      showToast('Log eerst in als medewerker om de SumUp Terminal te openen.', 'error');
+      showToast('Log eerst in als medewerker om de WerkPin Terminal te openen.', 'error');
       return;
     }
     if (screen === 'keuken' && !canAccessKitchen) {
@@ -148,19 +148,19 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
     headerGradient: customBranding.headerGradient
   } : brandConfig;
 
-  // If logged in as RPI Kiosk account, locked terminal, or compact SumUp mobile shell, hide top header
+  // If logged in as RPI Kiosk account, locked terminal, or compact WerkPin mobile shell, hide top header
   if (hideHeader || currentPosUser?.username === 'rpi' || currentPosUser?.is_terminal_locked) {
     return null;
   }
 
   return (
     <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40 shadow-xl">
-      {/* Pre-login small-screen indicator: maakt vooraf duidelijk dat dit kleine scherm de speciale SumUp modus heeft */}
+      {/* Pre-login small-screen indicator: maakt vooraf duidelijk dat dit kleine scherm de speciale WerkPin modus heeft */}
       {!isLoggedInStaff && (
         <div className="md:hidden px-3 py-1.5 bg-gradient-to-r from-cyan-950 via-slate-900 to-blue-950 border-b border-cyan-500/30 flex items-center justify-between gap-2 text-[11px]">
           <div className="flex items-center gap-1.5 text-cyan-200 font-bold min-w-0">
             <span className="shrink-0">📱</span>
-            <span className="truncate">Speciale SumUp Modus beschikbaar na inloggen</span>
+            <span className="truncate">Speciale WerkPin Modus beschikbaar na inloggen</span>
           </div>
           <button
             type="button"
@@ -278,7 +278,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
           </button>
         </div>
 
-        {/* Right Status Bars: Supabase Live Dot & User Status */}
+        {/* Right Status Bars: Firebase Live Dot & User Status */}
         <div className="flex items-center gap-2 sm:gap-3">
           {/* Sound Toggle Button */}
           <button
@@ -335,7 +335,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
             <button
               onClick={() => forceSyncNow()}
               className="p-1.5 rounded-full bg-slate-800/80 border border-slate-700/60 text-slate-300 hover:text-white hover:bg-slate-700 transition"
-              title="Nu geforceerd synchroniseren met Supabase"
+              title="Nu geforceerd synchroniseren met Firebase Cloud"
             >
               <RotateCw className={`w-3 h-3 ${syncStatus === 'syncing' ? 'animate-spin text-cyan-400' : ''}`} />
             </button>
@@ -495,10 +495,10 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
                   ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/25 font-black'
                   : 'text-cyan-300 hover:bg-cyan-950/50 border border-cyan-500/30'
               }`}
-              title="Open SumUp Terminal App (snel afrekenen, refunds & NFC pas tools)"
+              title="Open WerkPin Terminal App (snel afrekenen, refunds & NFC pas tools)"
             >
               <CreditCard className="w-4 h-4" />
-              <span>SumUp Terminal</span>
+              <span>WerkPin Terminal</span>
             </button>
           )}
 

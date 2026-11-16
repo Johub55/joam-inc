@@ -13,7 +13,6 @@ import {
   HelpCircle,
   FileCode
 } from 'lucide-react';
-import { UNIFIED_SUPABASE_SQL } from '../services/sqlScripts';
 
 interface GitHubExportModalProps {
   isOpen: boolean;
@@ -84,7 +83,7 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
                 </span>
               </h2>
               <p className="text-xs text-slate-400">
-                Beide programma's zijn nu beschikbaar als 100% losse, zelfstandige HTML-bestanden + SQL voor Supabase.
+                Beide programma&apos;s zijn beschikbaar als losse HTML-bestanden met live Firebase Cloud Firestore synchronisatie.
               </p>
             </div>
           </div>
@@ -110,10 +109,10 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
               </h4>
               <p className="text-slate-300 mt-1 leading-relaxed">
                 Je hebt gevraagd om: 
-                <strong> 1) Beide programma's los</strong>, 
-                <strong> 2) Gewoon alleen een HTML bestand per app voor GitHub</strong> (geen ingewikkelde build tools of npm install nodig), en 
-                <strong> 3) Een SQL bestand voor beide servers</strong>.
-                Hieronder download je direct de 3 bestanden:
+                <strong> 1) Beide programma&apos;s los</strong>, 
+                <strong> 2) Een losse HTML versie voor GitHub Pages</strong> (geen ingewikkelde build tools nodig), en 
+                <strong> 3) Automatische cloud synchronisatie via Firebase Firestore</strong>.
+                Hieronder download je direct de bestanden:
               </p>
             </div>
           </div>
@@ -253,7 +252,7 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
               </div>
             </div>
 
-            {/* CARD 3: Database SQL */}
+            {/* CARD 3: Firebase Cloud Sync Info */}
             <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between hover:border-emerald-500/40 transition shadow-lg">
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
@@ -261,47 +260,24 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
                     <Database className="w-4 h-4" />
                   </div>
                   <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">
-                    Supabase / SQL
+                    Firebase Firestore
                   </span>
                 </div>
                 <div>
-                  <h3 className="font-extrabold text-sm text-white">Database SQL Schema</h3>
+                  <h3 className="font-extrabold text-sm text-white">Ingebouwde Cloud Sync</h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Alle tabellen voor beide servers, de RPC functies, realtime sync en demo accounts.
+                    Geen handmatige SQL scripts of tabellen meer nodig. Alles synchroniseert automatisch in realtime via Firebase Cloud.
                   </p>
                 </div>
                 <div className="bg-slate-900 px-2.5 py-1.5 rounded-lg font-mono text-[11px] text-emerald-300 border border-slate-800 flex items-center gap-1.5">
                   <FileCode className="w-3.5 h-3.5 text-slate-400" />
-                  <span>database.sql</span>
+                  <span>firebase-applet-config.json</span>
                 </div>
               </div>
 
               <div className="pt-4 mt-4 border-t border-slate-800/80 space-y-2">
-                <button
-                  onClick={() => handleDownload('/database.sql', 'database.sql')}
-                  className="w-full py-2 px-3 rounded-xl bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs transition flex items-center justify-center gap-2 shadow"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download database.sql</span>
-                </button>
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => handleCopy(UNIFIED_SUPABASE_SQL, 'database')}
-                    className="w-full py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium transition flex items-center justify-center gap-1"
-                  >
-                    {copiedFile === 'database' ? (
-                      <>
-                        <Check className="w-3 h-3 text-emerald-400" />
-                        <span className="text-emerald-400 font-bold">SQL Gekopieerd!</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3 h-3" />
-                        <span>Kopieer SQL Query</span>
-                      </>
-                    )}
-                  </button>
+                <div className="w-full py-2 px-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-bold text-xs text-center">
+                  ⚡ Automatisch Actief (Zero-Setup)
                 </div>
               </div>
             </div>
@@ -330,13 +306,12 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
 
               <div className="space-y-2 bg-slate-900/50 p-3.5 rounded-xl border border-slate-800/60">
                 <div className="font-bold text-emerald-300 flex items-center gap-1.5">
-                  <span>🗄️</span> Supabase Database Koppeling
+                  <span>🗄️</span> Firebase Cloud Koppeling
                 </div>
                 <ol className="list-decimal pl-4 space-y-1 text-slate-300">
-                  <li>Ga naar <a href="https://supabase.com/dashboard" target="_blank" rel="noreferrer" className="text-emerald-400 underline">supabase.com</a> en open je project.</li>
-                  <li>Klik in het menu op <strong>SQL Editor</strong> en plak de inhoud van <code className="text-emerald-300">database.sql</code>.</li>
-                  <li>Klik op de groene knop <strong>RUN</strong>. Alle tabellen, RPC betaalfuncties en realtime sync worden direct klaargezet.</li>
-                  <li>Klik in beide HTML-apps op het tandwieltje (⚙️) en vul je Supabase Project URL &amp; Anon Key in. Beide apps werken nu live samen!</li>
+                  <li>Zowel de GitHub Pages website als de losse <code className="text-emerald-300">werkpay.html</code> verbinden automatisch met dezelfde Firebase Firestore database.</li>
+                  <li>Alle betalingen, bestellingen, producten, keuzemenu&apos;s en saldo&apos;s worden direct live gesynchroniseerd.</li>
+                  <li>Je hoeft nergens meer handmatig URL&apos;s, API keys of SQL scripts uit te voeren.</li>
                 </ol>
               </div>
             </div>
@@ -347,7 +322,7 @@ export const GitHubExportModal: React.FC<GitHubExportModalProps> = ({ isOpen, on
         {/* Footer */}
         <div className="px-6 py-4 bg-slate-950 border-t border-slate-800 flex items-center justify-between">
           <p className="text-[11px] text-slate-400">
-            Beide bestanden bevatten Tailwind CSS CDN en Supabase JS — geen installatie nodig.
+            Bevat Tailwind CSS CDN en Firebase Cloud Firestore — direct klaar voor GitHub Pages.
           </p>
           <button
             onClick={onClose}

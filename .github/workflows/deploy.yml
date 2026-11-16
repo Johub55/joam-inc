@@ -34,6 +34,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Generate fresh version.json
+        run: node -e "const fs=require('fs');const v=JSON.stringify({version:'1.0.'+Date.now(),buildTime:Date.now()});fs.mkdirSync('./public',{recursive:true});fs.writeFileSync('./public/version.json',v);"
+
       - name: Build Vite static assets
         run: npx vite build
 

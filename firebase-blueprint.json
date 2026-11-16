@@ -2,54 +2,224 @@
   "entities": {
     "Product": {
       "title": "Product",
-      "description": "A product available for sale",
+      "description": "A product available for sale including optional choice menus (keuzemenu's) and recipes",
       "type": "object",
       "properties": {
         "id": { "type": "number" },
-        "name": { "type": "string" },
+        "name": { "type": "string", "maxLength": 160 },
         "price": { "type": "number" },
         "salePrice": { "type": "number" },
         "onSale": { "type": "boolean" },
-        "cat": { "type": "string" },
-        "emoji": { "type": "string" },
-        "inStock": { "type": "boolean" }
+        "cat": { "type": "string", "maxLength": 80 },
+        "emoji": { "type": "string", "maxLength": 32 },
+        "inStock": { "type": "boolean" },
+        "options": { "type": "array" },
+        "brand": { "type": "string", "maxLength": 32 },
+        "recipe": { "type": "array" },
+        "recipeDescription": { "type": "string", "maxLength": 1000 },
+        "updatedAt": { "type": "number" }
       },
       "required": ["id", "name", "price", "cat", "inStock"]
     },
     "Order": {
       "title": "Order",
-      "description": "A customer order",
+      "description": "A customer order synced across POS, Kitchen KDS and Pickup TV",
       "type": "object",
       "properties": {
+        "id": { "type": "string", "maxLength": 128 },
         "no": { "type": "number" },
+        "items": { "type": "array" },
         "total": { "type": "number" },
-        "status": { "type": "string" },
-        "orderType": { "type": "string" },
-        "identifier": { "type": "string" }
+        "discount": { "type": "number" },
+        "orderType": { "type": "string", "enum": ["dine_in", "takeaway", "delivery"], "maxLength": 32 },
+        "identifier": { "type": "string", "maxLength": 160 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "paymentMethod": { "type": "string", "enum": ["workpay", "cash", "giftcard"], "maxLength": 32 },
+        "paymentMeta": { "type": "object" },
+        "cashier": { "type": "string", "maxLength": 100 },
+        "status": { "type": "string", "maxLength": 32 },
+        "isPrio": { "type": "boolean" },
+        "time": { "type": "string", "maxLength": 32 },
+        "timestamp": { "type": "number" },
+        "updatedAt": { "type": "number" }
       },
       "required": ["no", "total", "status", "orderType", "identifier"]
     },
     "BankAccount": {
       "title": "BankAccount",
-      "description": "User bank account",
+      "description": "WerkPay user bank account",
       "type": "object",
       "properties": {
         "id": { "type": "number" },
-        "username": { "type": "string" },
-        "balance": { "type": "number" }
+        "username": { "type": "string", "maxLength": 64 },
+        "password": { "type": "string", "maxLength": 128 },
+        "account_holder": { "type": "string", "maxLength": 120 },
+        "card_uid": { "type": "string", "maxLength": 64 },
+        "linked_uids": { "type": "array" },
+        "card_uids": { "type": "array" },
+        "pin_code": { "type": "string", "maxLength": 32 },
+        "balance": { "type": "number" },
+        "is_admin": { "type": "boolean" },
+        "is_banned": { "type": "boolean" },
+        "is_suspended": { "type": "boolean" },
+        "is_shadowbanned": { "type": "boolean" },
+        "is_2fa_enabled": { "type": "boolean" },
+        "totp_secret": { "type": "string", "maxLength": 128 },
+        "backup_codes": { "type": "array" },
+        "created_at": { "type": "string", "maxLength": 64 },
+        "updated_at": { "type": "string", "maxLength": 64 }
       },
       "required": ["id", "username", "balance"]
     },
-    "PosUser": {
-      "title": "PosUser",
-      "description": "POS User",
+    "BankTransaction": {
+      "title": "BankTransaction",
+      "description": "WerkPay transaction record",
       "type": "object",
       "properties": {
         "id": { "type": "number" },
-        "username": { "type": "string" },
-        "name": { "type": "string" }
+        "from_account": { "type": "string", "maxLength": 100 },
+        "to_account": { "type": "string", "maxLength": 100 },
+        "amount": { "type": "number" },
+        "label": { "type": "string", "maxLength": 160 },
+        "note": { "type": "string", "maxLength": 500 },
+        "order_no": { "type": "number" },
+        "when": { "type": "string", "maxLength": 64 },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["id", "from_account", "to_account", "amount", "label", "when", "timestamp"]
+    },
+    "PosUser": {
+      "title": "PosUser",
+      "description": "POS Staff or Terminal User",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "username": { "type": "string", "maxLength": 64 },
+        "name": { "type": "string", "maxLength": 120 },
+        "password": { "type": "string", "maxLength": 128 },
+        "perms": { "type": "array" },
+        "is_admin": { "type": "boolean" },
+        "is_banned": { "type": "boolean" },
+        "is_suspended": { "type": "boolean" },
+        "is_shadowbanned": { "type": "boolean" },
+        "is_2fa_enabled": { "type": "boolean" },
+        "totp_secret": { "type": "string", "maxLength": 128 },
+        "backup_codes": { "type": "array" },
+        "is_terminal_locked": { "type": "boolean" },
+        "assigned_screen": { "type": "string", "maxLength": 64 },
+        "session_token": { "type": "string", "maxLength": 128 },
+        "theme": { "type": "string", "maxLength": 64 },
+        "updated_at": { "type": "string", "maxLength": 64 }
       },
       "required": ["id", "username", "name"]
+    },
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Warehouse inventory item",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "item_name": { "type": "string", "maxLength": 160 },
+        "stock_qty": { "type": "number" },
+        "min_qty": { "type": "number" },
+        "unit": { "type": "string", "maxLength": 32 },
+        "cost_price": { "type": "number" },
+        "supplier_name": { "type": "string", "maxLength": 120 },
+        "updated_at": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "item_name", "stock_qty", "min_qty", "unit", "cost_price", "supplier_name"]
+    },
+    "Coupon": {
+      "title": "Coupon",
+      "description": "Discount coupon",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "code": { "type": "string", "maxLength": 64 },
+        "discount_type": { "type": "string", "maxLength": 32 },
+        "discount_val": { "type": "number" },
+        "min_subtotal": { "type": "number" },
+        "target_product_name": { "type": "string", "maxLength": 160 },
+        "target_category": { "type": "string", "maxLength": 80 },
+        "description": { "type": "string", "maxLength": 300 },
+        "is_active": { "type": "boolean" },
+        "updated_at": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "code", "discount_type", "discount_val", "is_active"]
+    },
+    "GiftCard": {
+      "title": "GiftCard",
+      "description": "Gift card",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "code": { "type": "string", "maxLength": 64 },
+        "initial_balance": { "type": "number" },
+        "current_balance": { "type": "number" },
+        "sender_name": { "type": "string", "maxLength": 120 },
+        "recipient_name": { "type": "string", "maxLength": 120 },
+        "recipient_phone": { "type": "string", "maxLength": 32 },
+        "message": { "type": "string", "maxLength": 500 },
+        "is_active": { "type": "boolean" },
+        "is_private": { "type": "boolean" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "created_at": { "type": "string", "maxLength": 64 },
+        "updated_at": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "code", "initial_balance", "current_balance", "is_active"]
+    },
+    "CashRequest": {
+      "title": "CashRequest",
+      "description": "Pending cash payment authorization request",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "orderNo": { "type": "number" },
+        "orderType": { "type": "string", "maxLength": 32 },
+        "identifier": { "type": "string", "maxLength": 160 },
+        "total": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "consumed"], "maxLength": 32 },
+        "requestedAt": { "type": "number" },
+        "cashier": { "type": "string", "maxLength": 100 },
+        "approvedBy": { "type": "string", "maxLength": 120 },
+        "approvedByUsername": { "type": "string", "maxLength": 64 },
+        "approvedAt": { "type": "number" },
+        "consumedAt": { "type": "number" },
+        "received": { "type": "number" },
+        "change": { "type": "number" },
+        "rejectedReason": { "type": "string", "maxLength": 300 }
+      },
+      "required": ["id", "orderNo", "orderType", "identifier", "total", "status", "requestedAt"]
+    },
+    "LoyaltyCustomer": {
+      "title": "LoyaltyCustomer",
+      "description": "WerkLoyalty customer profile and coins",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 32 },
+        "coins": { "type": "number" },
+        "totalSpent": { "type": "number" },
+        "ordersCount": { "type": "number" },
+        "tier": { "type": "string", "maxLength": 32 },
+        "level": { "type": "number" },
+        "currentMonthSpent": { "type": "number" },
+        "lastMonthSpent": { "type": "number" },
+        "currentMonthKey": { "type": "string", "maxLength": 16 },
+        "monthsBelowTarget": { "type": "number" },
+        "vipSubscriptionActive": { "type": "boolean" },
+        "vipSubscriptionExpires": { "type": "string", "maxLength": 32 },
+        "vipPlan": { "type": "string", "maxLength": 32 },
+        "vouchers": { "type": "array" },
+        "lastSpinDate": { "type": "string", "maxLength": 32 },
+        "totalSpins": { "type": "number" },
+        "lastOrderDate": { "type": "string", "maxLength": 32 },
+        "ordersTodayCount": { "type": "number" },
+        "joinedDate": { "type": "string", "maxLength": 32 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "name", "phone", "coins", "totalSpent", "ordersCount", "tier", "joinedDate"]
     },
     "HardwareTerminal": {
       "title": "HardwareTerminal",
@@ -73,41 +243,23 @@
     }
   },
   "firestore": {
-    "products/{productId}": {
-      "schema": "Product",
-      "description": "Collection of products"
-    },
-    "orders/{orderId}": {
-      "schema": "Order",
-      "description": "Collection of orders"
-    },
-    "bank_accounts/{accountId}": {
-      "schema": "BankAccount",
-      "description": "Collection of bank accounts"
-    },
-    "pos_users/{userId}": {
-      "schema": "PosUser",
-      "description": "Collection of POS users"
-    },
-    "hardware_terminals/{terminalId}": {
-      "schema": "HardwareTerminal",
-      "description": "Hardware pinpad terminal relay state documents"
-    },
-    "pos_settings/{settingId}": {
-      "description": "Collection of POS settings"
-    },
-    "bank_transactions/{transactionId}": { "description": "Collection of bank transactions" },
-    "cash_requests/{requestId}": { "description": "Collection of cash requests" },
-    "chat_groups/{groupId}": { "description": "Collection of chat groups" },
-    "coupons/{couponId}": { "description": "Collection of coupons" },
-    "gift_cards/{cardId}": { "description": "Collection of gift cards" },
-    "group_members/{memberId}": { "description": "Collection of group members" },
-    "group_messages/{messageId}": { "description": "Collection of group messages" },
-    "inventory/{itemId}": { "description": "Collection of inventory" },
-    "loyalty_customers/{customerId}": { "description": "Collection of loyalty customers" },
-    "phone_messages/{messageId}": { "description": "Collection of phone messages" },
-    "pos_audit_logs/{logId}": { "description": "Collection of audit logs" },
-    "pos_sessions/{sessionId}": { "description": "Collection of POS sessions" },
-    "tv_presets/{presetId}": { "description": "Collection of TV presets" }
+    "products/{productId}": { "schema": "Product", "description": "Collection of products" },
+    "orders/{orderId}": { "schema": "Order", "description": "Collection of orders" },
+    "bank_accounts/{accountId}": { "schema": "BankAccount", "description": "Collection of bank accounts" },
+    "bank_transactions/{transactionId}": { "schema": "BankTransaction", "description": "Collection of bank transactions" },
+    "pos_users/{userId}": { "schema": "PosUser", "description": "Collection of POS users" },
+    "inventory/{itemId}": { "schema": "InventoryItem", "description": "Collection of inventory" },
+    "coupons/{couponId}": { "schema": "Coupon", "description": "Collection of coupons" },
+    "gift_cards/{cardId}": { "schema": "GiftCard", "description": "Collection of gift cards" },
+    "cash_requests/{requestId}": { "schema": "CashRequest", "description": "Collection of cash requests" },
+    "loyalty_customers/{customerId}": { "schema": "LoyaltyCustomer", "description": "Collection of loyalty customers" },
+    "hardware_terminals/{terminalId}": { "schema": "HardwareTerminal", "description": "Hardware pinpad terminal relay state documents" },
+    "pos_settings/{settingId}": { "description": "POS settings, order stop, branding, table freeze, and news ticker config" },
+    "pos_sessions/{sessionId}": { "description": "Active device presence sessions" },
+    "pos_audit_logs/{logId}": { "description": "Security & audit log entries" },
+    "tv_presets/{presetId}": { "description": "Pickup screen TV layout presets" },
+    "phone_messages/{messageId}": { "description": "DigitalPhone SMS & chat messages" },
+    "phone_signals/{signalId}": { "description": "Ephemeral WebRTC and phone signaling events" },
+    "audio_events/{eventId}": { "description": "Cross-device live announcement & security alert relay" }
   }
 }

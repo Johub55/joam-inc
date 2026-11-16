@@ -7,8 +7,6 @@
   
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Supabase JS CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   
   <script>
     tailwind.config = {
@@ -87,7 +85,7 @@
     <!-- Right Controls: Status, Audio, User Profile & Actions -->
     <div class="flex items-center gap-2 sm:gap-3">
       <!-- Werkdonalds Kassa Switcher -->
-      <a href="werkpay.html" target="_blank" class="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-amber-300 border border-amber-500/30 text-xs font-bold transition" title="Open Werkdonalds Kassa">
+      <a href="./" class="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-amber-300 border border-amber-500/30 text-xs font-bold transition" title="Open Werkdonalds Kassa">
         <span>🍔</span> <span class="hidden lg:inline">Werkdonalds</span> Kassa ↗
       </a>
 
@@ -608,64 +606,166 @@
     </div>
   </div>
 
-  <!-- ==================== MODAL: CONFIG SUPABASE ==================== -->
+  <!-- ==================== MODAL: FIREBASE CLOUD STATUS ==================== -->
   <div id="modal-config" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-700 rounded-3xl w-full max-w-md overflow-hidden shadow-2xl">
       <div class="px-5 py-4 bg-slate-950 border-b border-slate-800 flex justify-between items-center">
         <h3 class="font-bold text-sm text-white flex items-center gap-2">
-          <span>⚙️</span> Supabase Cloud Synchronisatie
+          <span>🔥</span> Firebase Cloud Synchronisatie
         </h3>
         <button onclick="closeConfigModal()" class="text-slate-400 hover:text-white text-xs">✕</button>
       </div>
       <div class="p-5 space-y-4">
-        <p class="text-xs text-slate-400">
-          Koppel dezelfde Supabase database als Werkdonalds POS om saldo's en transacties realtime live tussen de kassa en deze portemonnee te synchroniseren.
-        </p>
-        <div class="space-y-3 text-xs">
+        <div class="p-3.5 rounded-2xl bg-emerald-950/30 border border-emerald-500/30 flex items-center justify-between">
           <div>
-            <label class="block font-bold text-slate-300 mb-1">Project URL</label>
-            <input type="text" id="cfg-url" class="w-full bg-slate-950 border border-slate-700 rounded-xl p-2.5 text-xs text-white font-mono" />
+            <div class="text-xs font-black text-emerald-300">Firebase Cloud Firestore</div>
+            <div class="text-[11px] text-slate-400 mt-0.5">Project: <span class="font-mono text-slate-300">gen-lang-client-0031413083</span></div>
           </div>
-          <div>
-            <label class="block font-bold text-slate-300 mb-1">Anon Public Key</label>
-            <input type="password" id="cfg-key" class="w-full bg-slate-950 border border-slate-700 rounded-xl p-2.5 text-xs text-white font-mono" />
-          </div>
+          <span id="modal-cloud-badge" class="text-[11px] font-bold px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+            🟢 Live
+          </span>
         </div>
+        <p class="text-xs text-slate-400">
+          Deze standalone WerkPay Wallet is direct gekoppeld aan dezelfde Firebase Cloud Firestore database als Werkdonalds POS. Saldo's, passen en transacties worden automatisch realtime gesynchroniseerd zonder handmatige sleutels.
+        </p>
         <div class="flex gap-2 pt-2">
-          <button onclick="saveConfig()" class="flex-1 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition">
-            Opslaan &amp; Verbinden
+          <button onclick="forceRefreshCloud()" class="flex-1 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs transition">
+            🔄 Nu Synchroniseren
           </button>
-          <button onclick="clearConfig()" class="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition">
-            Gebruik Lokaal
+          <button onclick="closeConfigModal()" class="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition">
+            Sluiten
           </button>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ==================== LOGICA & DATA ENGINE (JAVASCRIPT) ==================== -->
-  <script>
-    // --- 1. DEFAULT DATA ---
-    const DEFAULT_SB_URL = "https://qbncbzchrmbqhfbxgvbr.supabase.co";
-    const DEFAULT_SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFibmNiemNocm1icWhmYnhndmJyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4NjI4OTUsImV4cCI6MjEwNDQzODg5NX0.cBbcg-VQyZ8NoxkVlDWF2ddmyD8MAS2jtHjRvDtrlOo";
+  <!-- Toast Container -->
+  <div id="wp-toast" class="hidden fixed bottom-5 right-5 z-[100] px-4 py-3 rounded-2xl border shadow-2xl text-xs font-bold transition-all"></div>
+
+  <!-- ==================== LOGICA & FIREBASE FIRESTORE ENGINE ==================== -->
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js';
+    import {
+      getFirestore,
+      collection,
+      doc,
+      getDocs,
+      setDoc,
+      deleteDoc,
+      onSnapshot,
+      runTransaction
+    } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js';
+
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyD9k7jmxRN-Xs2vX598yaUKhUAijPPA9fg",
+      authDomain: "gen-lang-client-0031413083.firebaseapp.com",
+      projectId: "gen-lang-client-0031413083",
+      storageBucket: "gen-lang-client-0031413083.firebasestorage.app",
+      messagingSenderId: "289739546372",
+      appId: "1:289739546372:web:9bed8253a8d3f22b85ba51"
+    };
+    const FIRESTORE_DATABASE_ID = "ai-studio-werkpayposwe-c139ebd2-3939-4781-ab60-f1b99421ae53";
 
     const INITIAL_ACCOUNTS = [
       { id: 1, username: 'joas', password: 'admin123', account_holder: 'Joas Thorig', card_uid: '4129 8831 5504 9012', pin_code: '0000', balance: 999999.00, is_admin: true }
     ];
 
-    const INITIAL_TRANSACTIONS = [
-      { id: 101, username: 'joas', type: 'deposit', amount: 100.00, label: '⚡ Saldo Opwaardering (iDEAL)', note: 'Persoonlijke opwaardering', time: 'Vandaag 10:15' }
-    ];
+    const INITIAL_TRANSACTIONS = [];
 
-    // State
     let accounts = [];
     let transactions = [];
-    let currentUser = null; // Ingelogd account object
-    let supabaseClient = null;
+    let currentUser = null;
+    let db = null;
     let activeTab = 'wallet';
     let audioEnabled = true;
 
-    // --- 2. AUDIO FEEDBACK (WEB AUDIO SYNTHESIZER) ---
+    function sanitizeId(raw) {
+      const cleaned = String(raw || '').trim().replace(/[^a-zA-Z0-9_\-]/g, '_');
+      return (cleaned || 'doc').slice(0, 100);
+    }
+
+    const bankAccountDocId = (username) => `acc_${sanitizeId(String(username || '').toLowerCase())}`;
+    const bankTxDocId = (id) => `tx_${sanitizeId(String(id))}`;
+
+    function showToast(msg, type = 'info') {
+      const el = document.getElementById('wp-toast');
+      if (!el) return;
+      const styles = {
+        success: 'bg-emerald-950/95 border-emerald-500/50 text-emerald-200',
+        error: 'bg-rose-950/95 border-rose-500/50 text-rose-200',
+        info: 'bg-slate-900/95 border-blue-500/50 text-blue-200'
+      };
+      el.className = `fixed bottom-5 right-5 z-[100] px-4 py-3 rounded-2xl border shadow-2xl text-xs font-bold ${styles[type] || styles.info}`;
+      el.innerText = msg;
+      el.classList.remove('hidden');
+      clearTimeout(window.__wpToastTimer);
+      window.__wpToastTimer = setTimeout(() => el.classList.add('hidden'), 3500);
+    }
+
+    function normalizeAccount(raw) {
+      return {
+        id: raw.id ?? Date.now(),
+        username: String(raw.username || '').trim().toLowerCase(),
+        password: raw.password ? String(raw.password) : '',
+        account_holder: String(raw.account_holder || raw.username || ''),
+        card_uid: raw.card_uid ? formatCardUid(raw.card_uid) : '',
+        linked_uids: Array.isArray(raw.linked_uids) ? raw.linked_uids : [],
+        pin_code: raw.pin_code ? String(raw.pin_code) : '1234',
+        balance: Number(raw.balance ?? 0),
+        is_admin: Boolean(raw.is_admin),
+        is_banned: Boolean(raw.is_banned),
+        is_suspended: Boolean(raw.is_suspended)
+      };
+    }
+
+    function toFirestoreBankAccount(acc) {
+      const payload = {
+        id: acc.id,
+        username: String(acc.username || '').trim().toLowerCase().slice(0, 64),
+        account_holder: String(acc.account_holder || acc.username).slice(0, 120),
+        balance: Math.max(0, Math.min(100000000, Number(acc.balance || 0))),
+        is_admin: Boolean(acc.is_admin),
+        is_banned: Boolean(acc.is_banned),
+        is_suspended: Boolean(acc.is_suspended),
+        linked_uids: Array.isArray(acc.linked_uids) ? acc.linked_uids.slice(0, 50) : [],
+        updated_at: new Date().toISOString()
+      };
+      if (acc.password) payload.password = String(acc.password).slice(0, 128);
+      if (acc.card_uid) payload.card_uid = String(acc.card_uid).slice(0, 64);
+      if (acc.pin_code) payload.pin_code = String(acc.pin_code).slice(0, 32);
+      return payload;
+    }
+
+    function toFirestoreBankTransaction(tx) {
+      const payload = {
+        id: tx.id,
+        from_account: String(tx.from_account || 'onbekend').slice(0, 100),
+        to_account: String(tx.to_account || 'onbekend').slice(0, 100),
+        amount: Math.max(0, Math.min(100000000, Number(tx.amount || 0))),
+        label: String(tx.label || 'Transactie').slice(0, 160),
+        when: String(tx.when || new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })).slice(0, 64),
+        timestamp: Number(tx.timestamp || Date.now())
+      };
+      if (tx.note) payload.note = String(tx.note).slice(0, 500);
+      if (typeof tx.order_no === 'number' && Number.isFinite(tx.order_no)) {
+        payload.order_no = tx.order_no;
+      }
+      return payload;
+    }
+
+    function accountMatchesQuery(acc, query) {
+      const clean = String(query || '').replace(/\s+/g, '').toLowerCase();
+      if (!clean) return false;
+      if (acc.username.toLowerCase() === clean) return true;
+      if (String(acc.card_uid || '').replace(/\s+/g, '').toLowerCase() === clean) return true;
+      if (Array.isArray(acc.linked_uids)) {
+        return acc.linked_uids.some(t => String(t?.uid || '').replace(/\s+/g, '').toLowerCase() === clean);
+      }
+      return false;
+    }
+
+    // --- 2. AUDIO FEEDBACK ---
     class BankAudio {
       constructor() {
         this.ctx = null;
@@ -694,7 +794,7 @@
           gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + 0.08);
           osc.start();
           osc.stop(this.ctx.currentTime + 0.08);
-        } catch(e){}
+        } catch {}
       }
       successChime() {
         if (!audioEnabled) return;
@@ -714,7 +814,7 @@
             osc.start(now + (idx * 0.07));
             osc.stop(now + (idx * 0.07) + 0.35);
           });
-        } catch(e){}
+        } catch {}
       }
     }
     const Sound = new BankAudio();
@@ -737,12 +837,31 @@
       return raw.replace(/(.{4})/g, '$1 ').trim();
     }
 
-    // --- 4. INITIALISATIE ---
+    function saveLocal() {
+      localStorage.setItem('wp_bank_accounts', JSON.stringify(accounts));
+      localStorage.setItem('wp_bank_transactions', JSON.stringify(transactions));
+    }
+
+    // --- 4. INITIALISATIE & FIREBASE REALTIME ---
+    function setCloudStatus(online) {
+      const dot = document.getElementById('cloud-dot');
+      const text = document.getElementById('cloud-text');
+      const badge = document.getElementById('modal-cloud-badge');
+      if (online) {
+        if (dot) dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse';
+        if (text) text.innerText = 'Firebase Live';
+        if (badge) badge.innerText = '🟢 Live Verbonden';
+      } else {
+        if (dot) dot.className = 'w-2.5 h-2.5 rounded-full bg-amber-400';
+        if (text) text.innerText = 'Lokaal';
+        if (badge) badge.innerText = '🟡 Offline Cache';
+      }
+    }
+
     function init() {
-      // Laad data uit localStorage
       const savedAccounts = localStorage.getItem('wp_bank_accounts');
       if (savedAccounts) {
-        try { accounts = JSON.parse(savedAccounts); } catch(e) { accounts = [...INITIAL_ACCOUNTS]; }
+        try { accounts = JSON.parse(savedAccounts).map(normalizeAccount); } catch { accounts = [...INITIAL_ACCOUNTS]; }
       } else {
         accounts = [...INITIAL_ACCOUNTS];
         localStorage.setItem('wp_bank_accounts', JSON.stringify(accounts));
@@ -750,25 +869,20 @@
 
       const savedTx = localStorage.getItem('wp_bank_transactions');
       if (savedTx) {
-        try { transactions = JSON.parse(savedTx); } catch(e) { transactions = [...INITIAL_TRANSACTIONS]; }
+        try { transactions = JSON.parse(savedTx); } catch { transactions = [...INITIAL_TRANSACTIONS]; }
       } else {
         transactions = [...INITIAL_TRANSACTIONS];
         localStorage.setItem('wp_bank_transactions', JSON.stringify(transactions));
       }
 
-      // Check of er een ingelogde sessie bewaard is
       const activeUsername = localStorage.getItem('wp_active_user');
       if (activeUsername) {
         const found = accounts.find(a => a.username.toLowerCase() === activeUsername.toLowerCase());
-        if (found) {
-          currentUser = found;
-        }
+        if (found) currentUser = found;
       }
 
-      // Supabase initialiseren
-      initSupabase();
+      initFirebase();
 
-      // UI weergave updaten
       if (currentUser) {
         onUserLoggedIn();
       } else {
@@ -776,62 +890,112 @@
       }
     }
 
-    function initSupabase() {
-      const url = localStorage.getItem('wd_sb_url') || DEFAULT_SB_URL;
-      const key = localStorage.getItem('wd_sb_key') || DEFAULT_SB_KEY;
-
-      if (url && key && window.supabase) {
-        try {
-          supabaseClient = window.supabase.createClient(url, key);
-          document.getElementById('cloud-dot').className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse';
-          document.getElementById('cloud-text').innerText = 'Cloud Verbonden';
-          loadFromCloud();
-        } catch(e) {
-          useLocalMode();
-        }
-      } else {
-        useLocalMode();
+    function applyCloudAccounts(rawList) {
+      if (!Array.isArray(rawList) || rawList.length === 0) return;
+      accounts = rawList.map(normalizeAccount);
+      localStorage.setItem('wp_bank_accounts', JSON.stringify(accounts));
+      if (currentUser) {
+        const updated = accounts.find(a => a.username.toLowerCase() === currentUser.username.toLowerCase());
+        if (updated) currentUser = updated;
       }
+      renderDashboard();
+      if (activeTab === 'manager') renderManagerAccounts();
+      if (activeTab === 'transfer') renderTransferTab();
     }
 
-    function useLocalMode() {
-      document.getElementById('cloud-dot').className = 'w-2.5 h-2.5 rounded-full bg-blue-400';
-      document.getElementById('cloud-text').innerText = 'Lokaal';
+    function applyCloudTransactions(rawList) {
+      if (!Array.isArray(rawList)) return;
+      transactions = rawList
+        .map(t => ({
+          id: t.id,
+          from_account: String(t.from_account || ''),
+          to_account: String(t.to_account || ''),
+          amount: Number(t.amount || 0),
+          label: String(t.label || 'Transactie'),
+          note: String(t.note || ''),
+          order_no: t.order_no,
+          when: String(t.when || ''),
+          timestamp: Number(t.timestamp || t.id || Date.now())
+        }))
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+        .slice(0, 100);
+      localStorage.setItem('wp_bank_transactions', JSON.stringify(transactions));
+      renderDashboard();
+    }
+
+    function initFirebase() {
+      try {
+        const app = initializeApp(FIREBASE_CONFIG);
+        db = getFirestore(app, FIRESTORE_DATABASE_ID);
+        setCloudStatus(true);
+        loadFromCloud();
+
+        onSnapshot(
+          collection(db, 'bank_accounts'),
+          (snap) => {
+            setCloudStatus(true);
+            applyCloudAccounts(snap.docs.map(d => d.data()));
+          },
+          (err) => {
+            console.warn('Firestore bank_accounts listener error:', err);
+            setCloudStatus(false);
+          }
+        );
+
+        onSnapshot(
+          collection(db, 'bank_transactions'),
+          (snap) => {
+            applyCloudTransactions(snap.docs.map(d => d.data()));
+          },
+          (err) => {
+            console.warn('Firestore bank_transactions listener error:', err);
+          }
+        );
+      } catch (e) {
+        console.warn('Firebase init error:', e);
+        setCloudStatus(false);
+      }
     }
 
     async function loadFromCloud() {
-      if (!supabaseClient) return;
+      if (!db) return;
       try {
-        const { data: cloudAccounts } = await supabaseClient.from('bank_accounts').select('*');
-        if (cloudAccounts && cloudAccounts.length > 0) {
-          accounts = cloudAccounts;
-          localStorage.setItem('wp_bank_accounts', JSON.stringify(accounts));
-          if (currentUser) {
-            currentUser = accounts.find(a => a.id === currentUser.id || a.username === currentUser.username) || currentUser;
-          }
-        }
-        const { data: cloudTx } = await supabaseClient.from('bank_transactions').select('*').order('id', { ascending: false }).limit(40);
-        if (cloudTx && cloudTx.length > 0) {
-          transactions = cloudTx.map(t => ({
-            id: t.id,
-            username: t.from_account || t.to_account || 'joas',
-            type: t.amount < 0 ? 'payment' : 'deposit',
-            amount: Math.abs(t.amount),
-            label: t.label || 'Transactie',
-            note: t.note || '',
-            time: new Date(t.created_at || Date.now()).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })
-          }));
-          localStorage.setItem('wp_bank_transactions', JSON.stringify(transactions));
-        }
-        renderDashboard();
-      } catch(e) {
-        console.warn('Kon Supabase data niet ophalen:', e);
+        const [accSnap, txSnap] = await Promise.all([
+          getDocs(collection(db, 'bank_accounts')),
+          getDocs(collection(db, 'bank_transactions'))
+        ]);
+        applyCloudAccounts(accSnap.docs.map(d => d.data()));
+        applyCloudTransactions(txSnap.docs.map(d => d.data()));
+        setCloudStatus(true);
+      } catch (e) {
+        console.warn('Kon Firestore data niet ophalen:', e);
+        setCloudStatus(false);
       }
     }
 
-    function saveLocal() {
-      localStorage.setItem('wp_bank_accounts', JSON.stringify(accounts));
-      localStorage.setItem('wp_bank_transactions', JSON.stringify(transactions));
+    async function forceRefreshCloud() {
+      await loadFromCloud();
+      showToast('Firebase Cloud gegevens gesynchroniseerd!', 'success');
+      closeConfigModal();
+    }
+
+    async function adjustBalanceTransaction(username, delta, fallbackAcc) {
+      if (!db) return { success: true, newBalance: fallbackAcc ? fallbackAcc.balance + delta : 0 };
+      const docId = bankAccountDocId(username);
+      return await runTransaction(db, async (tx) => {
+        const ref = doc(db, 'bank_accounts', docId);
+        const snap = await tx.get(ref);
+        let baseData = snap.exists() ? snap.data() : (fallbackAcc ? toFirestoreBankAccount(fallbackAcc) : null);
+        if (!baseData) throw new Error('Rekening niet gevonden in Firebase');
+        const isAdmin = Boolean(baseData.is_admin);
+        const curr = Number(baseData.balance || 0);
+        if (!isAdmin && delta < 0 && curr + delta < -0.001) {
+          throw new Error('Onvoldoende saldo');
+        }
+        const nextBal = isAdmin ? curr : Math.max(0, Math.round((curr + delta) * 100) / 100);
+        tx.set(ref, { ...baseData, balance: nextBal, updated_at: new Date().toISOString() });
+        return { success: true, newBalance: nextBal };
+      });
     }
 
     // --- 5. INLOGGEN & SESSIE BEHEER ---
@@ -841,7 +1005,6 @@
     }
 
     function closeLoginModal() {
-      // Als er al een ingelogde gebruiker is, mag hij sluiten
       if (currentUser) {
         document.getElementById('modal-login').classList.add('hidden');
       }
@@ -867,16 +1030,25 @@
       document.getElementById('login-error-msg').classList.add('hidden');
     }
 
-    function submitLogin(event, type) {
+    async function submitLogin(event, type) {
       event.preventDefault();
       const errBox = document.getElementById('login-error-msg');
       errBox.classList.add('hidden');
 
+      if (db && accounts.length <= 1) {
+        await loadFromCloud();
+      }
+
       if (type === 'pwd') {
         const user = document.getElementById('login-input-user').value.trim().toLowerCase();
         const pwd = document.getElementById('login-input-pwd').value;
-        const acc = accounts.find(a => a.username.toLowerCase() === user && a.password === pwd);
+        const acc = accounts.find(a => a.username.toLowerCase() === user && (a.password === pwd || a.pin_code === pwd));
         if (acc) {
+          if (acc.is_banned || acc.is_suspended) {
+            errBox.innerText = '⛔ Dit account is geblokkeerd door de beheerder.';
+            errBox.classList.remove('hidden');
+            return;
+          }
           loginSuccess(acc);
         } else {
           errBox.innerText = '❌ Onjuiste gebruikersnaam of wachtwoord. Probeer opnieuw.';
@@ -885,42 +1057,19 @@
       } else {
         const rawCard = document.getElementById('login-input-card-uid').value.replace(/\s+/g, '').toLowerCase();
         const pin = document.getElementById('login-input-pincode').value.trim();
-        const acc = accounts.find(a => {
-          const matchCard = a.card_uid.replace(/\s+/g, '').toLowerCase() === rawCard || a.username.toLowerCase() === rawCard;
-          return matchCard && a.pin_code === pin;
-        });
+        const acc = accounts.find(a => accountMatchesQuery(a, rawCard) && (a.pin_code === pin || a.password === pin));
         if (acc) {
+          if (acc.is_banned || acc.is_suspended) {
+            errBox.innerText = '⛔ Dit account is geblokkeerd door de beheerder.';
+            errBox.classList.remove('hidden');
+            return;
+          }
           loginSuccess(acc);
         } else {
           errBox.innerText = '❌ Onjuiste kaart UID of pincode.';
           errBox.classList.remove('hidden');
         }
       }
-    }
-
-    function quickLoginUser(username, pwd) {
-      const acc = accounts.find(a => a.username.toLowerCase() === username.toLowerCase());
-      if (acc) {
-        loginSuccess(acc);
-      }
-    }
-
-    function quickCreateGuest() {
-      const r = Math.floor(1000 + Math.random() * 9000);
-      const guestUid = `9900 ${r} 2200 ${Math.floor(1000 + Math.random() * 9000)}`;
-      const guestAcc = {
-        id: Date.now(),
-        username: `gast_${r}`,
-        password: '123',
-        account_holder: `Gast ${r}`,
-        card_uid: guestUid,
-        pin_code: '1234',
-        balance: 30.00,
-        is_admin: false
-      };
-      accounts.push(guestAcc);
-      saveLocal();
-      loginSuccess(guestAcc);
     }
 
     function loginSuccess(account) {
@@ -932,15 +1081,12 @@
     }
 
     function handleLogout() {
-      if (confirm(`Weet je zeker dat je wilt uitloggen als ${currentUser?.account_holder}?`)) {
-        currentUser = null;
-        localStorage.removeItem('wp_active_user');
-        onUserLoggedOut();
-      }
+      currentUser = null;
+      localStorage.removeItem('wp_active_user');
+      onUserLoggedOut();
     }
 
     function onUserLoggedIn() {
-      // Header elementen zichtbaar maken
       document.getElementById('nav-tabs').classList.remove('hidden');
       document.getElementById('mobile-tabs').classList.remove('hidden');
       document.getElementById('user-header-block').classList.remove('hidden');
@@ -949,7 +1095,6 @@
       document.getElementById('header-user-name').innerText = currentUser.account_holder;
       document.getElementById('header-user-role').innerText = currentUser.is_admin ? '👑 Beheerder' : '👤 Klant';
 
-      // Manager Tab alleen tonen als admin
       const tabMgr = document.getElementById('tab-btn-manager');
       const mobMgr = document.getElementById('mob-tab-manager');
       if (currentUser.is_admin) {
@@ -969,8 +1114,6 @@
       document.getElementById('mobile-tabs').classList.add('hidden');
       document.getElementById('user-header-block').classList.add('hidden');
       document.getElementById('btn-show-login').classList.remove('hidden');
-
-      // Toon direct login modal
       openLoginModal();
     }
 
@@ -984,55 +1127,61 @@
 
         if (t === tab) {
           if (view) view.classList.remove('hidden');
-          if (btn) {
-            btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 bg-blue-600 text-white shadow';
-          }
-          if (mob) {
-            mob.className = 'flex-1 py-1.5 text-center text-xs font-bold text-blue-400';
-          }
+          if (btn) btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 bg-blue-600 text-white shadow';
+          if (mob) mob.className = 'flex-1 py-1.5 text-center text-xs font-bold text-blue-400';
         } else {
           if (view) view.classList.add('hidden');
-          if (btn) {
-            btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 text-slate-300 hover:text-white hover:bg-slate-900';
-          }
-          if (mob) {
-            mob.className = 'flex-1 py-1.5 text-center text-xs font-bold text-slate-400';
-          }
+          if (btn) btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 text-slate-300 hover:text-white hover:bg-slate-900';
+          if (mob) mob.className = 'flex-1 py-1.5 text-center text-xs font-bold text-slate-400';
         }
       });
 
-      if (tab === 'transfer') {
-        renderTransferTab();
-      } else if (tab === 'manager') {
-        renderManagerAccounts();
-      }
+      if (tab === 'transfer') renderTransferTab();
+      else if (tab === 'manager') renderManagerAccounts();
     }
 
     // --- 7. RENDERING: MIJN WALLET & PAS ---
     function renderDashboard() {
       if (!currentUser) return;
 
-      // Update Card Visuals
       document.getElementById('card-badge').innerText = currentUser.is_admin ? 'BEHEERDER' : 'KLANT';
       document.getElementById('card-uid-display').innerText = formatCardUid(currentUser.card_uid);
       document.getElementById('card-holder-display').innerText = currentUser.account_holder;
       document.getElementById('card-balance-display').innerText = euro(currentUser.balance);
       document.getElementById('current-pin-masked').innerText = `PIN: ${currentUser.pin_code}`;
 
-      // Bereken statistieken specifiek voor deze user
-      const userTx = transactions.filter(t => t.username === currentUser.username || (t.note && t.note.includes(currentUser.username)));
-      const deposits = userTx.filter(t => t.type === 'deposit').reduce((sum, t) => sum + t.amount, 0);
-      const payments = userTx.filter(t => t.type === 'payment').reduce((sum, t) => sum + t.amount, 0);
-      const transfersCount = userTx.filter(t => t.label.includes('Overboeking')).length;
+      const uname = currentUser.username.toLowerCase();
+      const userTx = transactions.filter(t =>
+        String(t.from_account || '').toLowerCase() === uname ||
+        String(t.to_account || '').toLowerCase() === uname ||
+        String(t.username || '').toLowerCase() === uname
+      );
+
+      let deposits = 0;
+      let payments = 0;
+      let transfersCount = 0;
+
+      const normalizedTx = userTx.map(t => {
+        const isIncoming = String(t.to_account || '').toLowerCase() === uname;
+        const amt = Math.abs(Number(t.amount || 0));
+        if (isIncoming) deposits += amt;
+        else payments += amt;
+        if (String(t.label || '').includes('Overboeking')) transfersCount++;
+        return {
+          ...t,
+          isPlus: isIncoming,
+          amount: amt,
+          timeLabel: t.when || t.time || ''
+        };
+      });
 
       document.getElementById('stat-total-deposits').innerText = euro(deposits);
       document.getElementById('stat-total-spent').innerText = euro(payments);
       document.getElementById('stat-total-transfers').innerText = transfersCount;
-      document.getElementById('tx-count-badge').innerText = `${userTx.length} transacties`;
+      document.getElementById('tx-count-badge').innerText = `${normalizedTx.length} transacties`;
 
-      // Render transactielijst
       const list = document.getElementById('transactions-list');
-      if (userTx.length === 0) {
+      if (normalizedTx.length === 0) {
         list.innerHTML = `
           <div class="py-12 text-center text-slate-500 text-xs">
             <span class="text-3xl block mb-2">💳</span>
@@ -1043,42 +1192,39 @@
         return;
       }
 
-      list.innerHTML = userTx.map(t => {
-        const isPlus = t.type === 'deposit';
-        return `
-          <div class="flex items-center justify-between p-3 rounded-2xl bg-slate-950/80 border border-slate-800/80 hover:border-blue-900/40 transition">
-            <div class="flex items-center gap-3">
-              <div class="w-8 h-8 rounded-xl ${isPlus ? 'bg-emerald-500/20 text-emerald-400' : 'bg-blue-500/20 text-blue-300'} flex items-center justify-center text-sm">
-                ${isPlus ? '↓' : '↑'}
-              </div>
-              <div>
-                <div class="font-bold text-xs text-white">${t.label}</div>
-                <div class="text-[10px] text-slate-400 flex items-center gap-2">
-                  <span>⏱️ ${t.time}</span>
-                  ${t.note ? `<span class="text-slate-500">· ${t.note}</span>` : ''}
-                </div>
-              </div>
+      list.innerHTML = normalizedTx.map(t => `
+        <div class="flex items-center justify-between p-3 rounded-2xl bg-slate-950/80 border border-slate-800/80 hover:border-blue-900/40 transition">
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-xl ${t.isPlus ? 'bg-emerald-500/20 text-emerald-400' : 'bg-blue-500/20 text-blue-300'} flex items-center justify-center text-sm">
+              ${t.isPlus ? '↓' : '↑'}
             </div>
-            <div class="text-right">
-              <span class="font-mono font-black text-xs ${isPlus ? 'text-emerald-400' : 'text-blue-300'}">
-                ${isPlus ? '+' : '-'} ${euro(t.amount)}
-              </span>
+            <div>
+              <div class="font-bold text-xs text-white">${t.label}</div>
+              <div class="text-[10px] text-slate-400 flex items-center gap-2">
+                <span>⏱️ ${t.timeLabel}</span>
+                ${t.note ? `<span class="text-slate-500">· ${t.note}</span>` : ''}
+              </div>
             </div>
           </div>
-        `;
-      }).join('');
+          <div class="text-right">
+            <span class="font-mono font-black text-xs ${t.isPlus ? 'text-emerald-400' : 'text-blue-300'}">
+              ${t.isPlus ? '+' : '-'} ${euro(t.amount)}
+            </span>
+          </div>
+        </div>
+      `).join('');
     }
 
     function copyCardUid() {
       if (!currentUser?.card_uid) return;
-      navigator.clipboard.writeText(currentUser.card_uid);
+      navigator.clipboard?.writeText(currentUser.card_uid).catch(() => {});
       Sound.beep();
       const label = document.getElementById('copy-label');
       label.innerText = 'Gekopieerd!';
       setTimeout(() => { label.innerText = 'Kopieer'; }, 2000);
     }
 
-    // --- 8. SALDO OPWAARDEREN (DEPOSIT) ---
+    // --- 8. SALDO OPWAARDEREN ---
     function quickDeposit(amount) {
       processDeposit(amount);
     }
@@ -1095,65 +1241,72 @@
 
     async function processDeposit(amount) {
       if (!currentUser) return;
-      currentUser.balance += amount;
+      if (!currentUser.is_admin) {
+        showToast('Klanten kunnen niet zelf saldo opwaarderen. Gebruik de kassa of beheerder.', 'error');
+        return;
+      }
 
-      // Account opslaan in accounts array
-      const idx = accounts.findIndex(a => a.id === currentUser.id);
+      const txId = Date.now();
+      const nowTime = new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
+      const newBal = Math.round((currentUser.balance + amount) * 100) / 100;
+      currentUser = { ...currentUser, balance: newBal };
+
+      const idx = accounts.findIndex(a => a.username === currentUser.username);
       if (idx !== -1) accounts[idx] = currentUser;
 
       const newTx = {
-        id: Date.now(),
-        username: currentUser.username,
-        type: 'deposit',
+        id: txId,
+        from_account: 'iDEAL / Bank Opwaardering',
+        to_account: currentUser.username,
         amount: amount,
         label: '⚡ Saldo Opwaardering (iDEAL)',
         note: 'Handmatig opgewaardeerd',
-        time: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })
+        when: nowTime,
+        timestamp: txId
       };
       transactions.unshift(newTx);
 
       saveLocal();
       Sound.successChime();
       renderDashboard();
+      showToast(`+ ${euro(amount)} bijgeschreven!`, 'success');
 
-      // Cloud sync
-      if (supabaseClient) {
+      if (db) {
         try {
-          await supabaseClient.from('bank_accounts').update({ balance: currentUser.balance }).eq('id', currentUser.id);
-          await supabaseClient.from('bank_transactions').insert([{
-            from_account: 'iDEAL',
-            to_account: currentUser.username,
-            amount: amount,
-            label: '⚡ Saldo Opwaardering',
-            note: 'iDEAL deposit'
-          }]);
-        } catch(e){}
+          await setDoc(doc(db, 'bank_accounts', bankAccountDocId(currentUser.username)), toFirestoreBankAccount(currentUser));
+          await setDoc(doc(db, 'bank_transactions', bankTxDocId(newTx.id)), toFirestoreBankTransaction(newTx));
+        } catch (e) {
+          console.warn('Firestore deposit sync error:', e);
+        }
       }
     }
 
     // --- 9. PINCODE WIJZIGEN ---
     async function handleChangePin(event) {
       event.preventDefault();
+      if (!currentUser) return;
       const pin = document.getElementById('input-new-pin').value.trim();
       if (pin.length !== 4 || !/^\d+$/.test(pin)) {
-        alert('Pincode moet exact 4 cijfers bevatten.');
+        showToast('Pincode moet exact 4 cijfers bevatten.', 'error');
         return;
       }
-      currentUser.pin_code = pin;
-      const idx = accounts.findIndex(a => a.id === currentUser.id);
+      currentUser = { ...currentUser, pin_code: pin };
+      const idx = accounts.findIndex(a => a.username === currentUser.username);
       if (idx !== -1) accounts[idx] = currentUser;
       saveLocal();
 
-      if (supabaseClient) {
+      if (db) {
         try {
-          await supabaseClient.from('bank_accounts').update({ pin_code: pin }).eq('id', currentUser.id);
-        } catch(e){}
+          await setDoc(doc(db, 'bank_accounts', bankAccountDocId(currentUser.username)), toFirestoreBankAccount(currentUser));
+        } catch (e) {
+          console.warn('Firestore PIN update error:', e);
+        }
       }
 
       document.getElementById('input-new-pin').value = '';
       Sound.successChime();
       renderDashboard();
-      alert(`✓ Pincode succesvol gewijzigd naar: ${pin}`);
+      showToast(`Pincode succesvol gewijzigd naar ${pin}`, 'success');
     }
 
     // --- 10. OVERBOEKEN LOGICA ---
@@ -1161,7 +1314,6 @@
       if (!currentUser) return;
       document.getElementById('transfer-current-balance').innerText = euro(currentUser.balance);
 
-      // Render snelle contacten pillen van de andere accounts
       const container = document.getElementById('quick-contacts-pills');
       const others = accounts.filter(a => a.username !== currentUser.username);
       container.innerHTML = others.map(a => `
@@ -1180,95 +1332,88 @@
       if (!currentUser) return;
 
       const recipientInput = document.getElementById('transfer-recipient').value.trim();
-      const amount = parseFloat(document.getElementById('transfer-amount').value);
+      const amount = Math.round((parseFloat(document.getElementById('transfer-amount').value) || 0) * 100) / 100;
       const note = document.getElementById('transfer-note').value.trim();
 
       if (!recipientInput) {
-        alert('Vul een ontvanger in.');
+        showToast('Vul een ontvanger in.', 'error');
         return;
       }
       if (isNaN(amount) || amount <= 0) {
-        alert('Vul een geldig bedrag in.');
+        showToast('Vul een geldig bedrag in.', 'error');
         return;
       }
       if (!currentUser.is_admin && currentUser.balance < amount) {
-        alert(`Onvoldoende saldo. Je hebt ${euro(currentUser.balance)} beschikbaar.`);
+        showToast(`Onvoldoende saldo (${euro(currentUser.balance)} beschikbaar).`, 'error');
         return;
       }
 
-      // Zoek ontvanger
-      const rawInput = recipientInput.replace(/\s+/g, '').toLowerCase();
-      const targetAcc = accounts.find(a => 
-        a.username.toLowerCase() === rawInput || 
-        a.card_uid.replace(/\s+/g, '').toLowerCase() === rawInput
-      );
-
-      // Verwerk afschrijving
-      if (!currentUser.is_admin) {
-        currentUser.balance -= amount;
+      const targetAcc = accounts.find(a => accountMatchesQuery(a, recipientInput));
+      if (!targetAcc) {
+        showToast(`Geen WerkPay rekening gevonden voor "${recipientInput}".`, 'error');
+        return;
       }
-      const senderIdx = accounts.findIndex(a => a.id === currentUser.id);
-      if (senderIdx !== -1) accounts[senderIdx] = currentUser;
-
-      // Als ontvanger lokaal bestaat, crediteer die ook direct
-      if (targetAcc) {
-        targetAcc.balance += amount;
-        const targetIdx = accounts.findIndex(a => a.id === targetAcc.id);
-        if (targetIdx !== -1) accounts[targetIdx] = targetAcc;
+      if (targetAcc.username === currentUser.username) {
+        showToast('Je kunt geen geld naar jezelf overboeken.', 'error');
+        return;
       }
 
+      try {
+        if (!currentUser.is_admin) {
+          const debitRes = await adjustBalanceTransaction(currentUser.username, -amount, currentUser);
+          currentUser.balance = debitRes.newBalance;
+        }
+        if (!targetAcc.is_admin) {
+          const creditRes = await adjustBalanceTransaction(targetAcc.username, amount, targetAcc);
+          targetAcc.balance = creditRes.newBalance;
+        }
+      } catch (e) {
+        showToast(e?.message || 'Overboeking mislukt.', 'error');
+        return;
+      }
+
+      const txId = Date.now();
       const timeStr = new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' });
       const newTx = {
-        id: Date.now(),
-        username: currentUser.username,
-        type: 'payment',
+        id: txId,
+        from_account: currentUser.username,
+        to_account: targetAcc.username,
         amount: amount,
-        label: `💸 Overboeking naar ${targetAcc ? targetAcc.account_holder : recipientInput}`,
-        note: note || 'Geen omschrijving',
-        time: timeStr
+        label: `💸 Overboeking naar ${targetAcc.account_holder}`,
+        note: note || 'Overboeking via WerkPay Wallet',
+        when: timeStr,
+        timestamp: txId
       };
       transactions.unshift(newTx);
-
       saveLocal();
-      Sound.successChime();
 
-      // Cloud sync
-      if (supabaseClient) {
+      if (db) {
         try {
-          await supabaseClient.from('bank_accounts').update({ balance: currentUser.balance }).eq('id', currentUser.id);
-          if (targetAcc) {
-            await supabaseClient.from('bank_accounts').update({ balance: targetAcc.balance }).eq('id', targetAcc.id);
-          }
-          await supabaseClient.from('bank_transactions').insert([{
-            from_account: currentUser.username,
-            to_account: targetAcc ? targetAcc.username : recipientInput,
-            amount: amount,
-            label: `Overboeking naar ${recipientInput}`,
-            note: note
-          }]);
-        } catch(e){}
+          await setDoc(doc(db, 'bank_transactions', bankTxDocId(newTx.id)), toFirestoreBankTransaction(newTx));
+        } catch {}
       }
 
-      // Form reset
+      Sound.successChime();
       document.getElementById('transfer-recipient').value = '';
       document.getElementById('transfer-amount').value = '';
       document.getElementById('transfer-note').value = '';
 
-      alert(`✓ ${euro(amount)} succesvol overgemaakt naar ${targetAcc ? targetAcc.account_holder : recipientInput}!`);
+      showToast(`${euro(amount)} overgemaakt naar ${targetAcc.account_holder}!`, 'success');
       switchTab('wallet');
+      renderDashboard();
     }
 
     // --- 11. MANAGER & REKENINGEN BEHEER ---
     function renderManagerAccounts() {
       const search = (document.getElementById('search-accounts')?.value || '').toLowerCase().trim();
-      const filtered = accounts.filter(a => 
+      const filtered = accounts.filter(a =>
         a.account_holder.toLowerCase().includes(search) ||
         a.username.toLowerCase().includes(search) ||
-        a.card_uid.replace(/\s+/g, '').includes(search.replace(/\s+/g, ''))
+        String(a.card_uid || '').replace(/\s+/g, '').includes(search.replace(/\s+/g, ''))
       );
 
       document.getElementById('mgr-stat-total-acc').innerText = accounts.length;
-      const totalBalances = accounts.filter(a => !a.is_admin).reduce((sum, a) => sum + a.balance, 0);
+      const totalBalances = accounts.filter(a => !a.is_admin).reduce((sum, a) => sum + Number(a.balance || 0), 0);
       document.getElementById('mgr-stat-total-money').innerText = euro(totalBalances);
 
       const tbody = document.getElementById('manager-accounts-tbody');
@@ -1293,11 +1438,14 @@
             </span>
           </td>
           <td class="p-3.5 text-right space-x-1.5">
-            <button onclick="managerAdjustBalance(${a.id})" class="px-2 py-1 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-[11px] font-bold transition">
-              + € Saldo
+            <button onclick="managerAdjustBalance('${a.username}', 10)" class="px-2 py-1 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-500/30 text-[11px] font-bold transition">
+              + €10
+            </button>
+            <button onclick="managerAdjustBalance('${a.username}', -10)" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[11px] font-bold transition">
+              - €10
             </button>
             ${!a.is_admin ? `
-              <button onclick="managerDeleteAccount(${a.id})" class="px-2 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 text-[11px] font-bold transition">
+              <button onclick="managerDeleteAccount('${a.username}')" class="px-2 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 text-[11px] font-bold transition">
                 Verwijder
               </button>
             ` : ''}
@@ -1324,11 +1472,10 @@
 
       if (!holder || !user) return;
       if (accounts.some(a => a.username.toLowerCase() === user)) {
-        alert('Er bestaat al een account met deze gebruikersnaam!');
+        showToast('Er bestaat al een account met deze gebruikersnaam!', 'error');
         return;
       }
 
-      // Genereer 16-cijferige Card UID
       const r1 = Math.floor(1000 + Math.random() * 9000);
       const r2 = Math.floor(1000 + Math.random() * 9000);
       const r3 = Math.floor(1000 + Math.random() * 9000);
@@ -1341,6 +1488,7 @@
         password: pwd,
         account_holder: holder,
         card_uid: newUid,
+        linked_uids: [],
         pin_code: pin,
         balance: bal,
         is_admin: isAdmin
@@ -1349,78 +1497,96 @@
       accounts.push(newAcc);
       saveLocal();
 
-      if (supabaseClient) {
+      if (db) {
         try {
-          await supabaseClient.from('bank_accounts').insert([newAcc]);
-        } catch(e){}
+          await setDoc(doc(db, 'bank_accounts', bankAccountDocId(newAcc.username)), toFirestoreBankAccount(newAcc));
+        } catch (e) {
+          console.warn('Firestore create account error:', e);
+        }
       }
 
       closeCreateAccountModal();
       Sound.successChime();
       renderManagerAccounts();
-      alert(`✓ Rekening voor ${holder} is aangemaakt! Kaartnummer: ${newUid}`);
+      showToast(`Rekening voor ${holder} aangemaakt (${newUid})!`, 'success');
     }
 
-    function managerAdjustBalance(id) {
-      const acc = accounts.find(a => a.id === id);
+    async function managerAdjustBalance(username, delta) {
+      const acc = accounts.find(a => a.username.toLowerCase() === String(username).toLowerCase());
       if (!acc) return;
-      const promptVal = prompt(`Pas saldo aan voor ${acc.account_holder} (Huidig: ${euro(acc.balance)}):`, acc.balance);
-      if (promptVal !== null) {
-        const newBal = parseFloat(promptVal);
-        if (!isNaN(newBal)) {
-          acc.balance = newBal;
-          saveLocal();
-          if (supabaseClient) {
-            supabaseClient.from('bank_accounts').update({ balance: newBal }).eq('id', acc.id).catch(() => {});
-          }
-          Sound.beep();
-          renderManagerAccounts();
-          if (currentUser.id === acc.id) renderDashboard();
-        }
+      const nextBal = Math.max(0, Math.round((acc.balance + delta) * 100) / 100);
+      acc.balance = nextBal;
+      saveLocal();
+
+      if (db) {
+        try {
+          await setDoc(doc(db, 'bank_accounts', bankAccountDocId(acc.username)), toFirestoreBankAccount(acc));
+        } catch {}
       }
+
+      Sound.beep();
+      renderManagerAccounts();
+      if (currentUser && currentUser.username === acc.username) {
+        currentUser.balance = nextBal;
+        renderDashboard();
+      }
+      showToast(`Saldo @${acc.username}: ${euro(nextBal)}`, 'success');
     }
 
-    function managerDeleteAccount(id) {
-      const acc = accounts.find(a => a.id === id);
-      if (!acc) return;
-      if (confirm(`Weet je zeker dat je het account van ${acc.account_holder} wilt verwijderen?`)) {
-        accounts = accounts.filter(a => a.id !== id);
-        saveLocal();
-        if (supabaseClient) {
-          supabaseClient.from('bank_accounts').delete().eq('id', id).catch(() => {});
-        }
-        renderManagerAccounts();
+    async function managerDeleteAccount(username) {
+      const acc = accounts.find(a => a.username.toLowerCase() === String(username).toLowerCase());
+      if (!acc || acc.is_admin) return;
+      accounts = accounts.filter(a => a.username.toLowerCase() !== String(username).toLowerCase());
+      saveLocal();
+
+      if (db) {
+        try {
+          await deleteDoc(doc(db, 'bank_accounts', bankAccountDocId(acc.username)));
+        } catch {}
       }
+      renderManagerAccounts();
+      showToast(`Rekening @${acc.username} verwijderd.`, 'info');
     }
 
     // --- 12. CONFIG MODAL ---
     function openConfigModal() {
-      document.getElementById('cfg-url').value = localStorage.getItem('wd_sb_url') || DEFAULT_SB_URL;
-      document.getElementById('cfg-key').value = localStorage.getItem('wd_sb_key') || DEFAULT_SB_KEY;
       document.getElementById('modal-config').classList.remove('hidden');
     }
     function closeConfigModal() {
       document.getElementById('modal-config').classList.add('hidden');
     }
-    function saveConfig() {
-      const u = document.getElementById('cfg-url').value.trim();
-      const k = document.getElementById('cfg-key').value.trim();
-      if (u && k) {
-        localStorage.setItem('wd_sb_url', u);
-        localStorage.setItem('wd_sb_key', k);
-      }
-      closeConfigModal();
-      initSupabase();
-    }
-    function clearConfig() {
-      localStorage.removeItem('wd_sb_url');
-      localStorage.removeItem('wd_sb_key');
-      closeConfigModal();
-      useLocalMode();
-    }
 
-    // Start bij pagina laden
-    window.addEventListener('DOMContentLoaded', init);
+    // Expose functions for inline HTML handlers
+    Object.assign(window, {
+      switchTab,
+      toggleAudio,
+      openConfigModal,
+      closeConfigModal,
+      forceRefreshCloud,
+      handleLogout,
+      openLoginModal,
+      closeLoginModal,
+      setLoginMethod,
+      submitLogin,
+      copyCardUid,
+      quickDeposit,
+      handleCustomDeposit,
+      handleChangePin,
+      renderDashboard,
+      handleTransferSubmit,
+      renderManagerAccounts,
+      openCreateAccountModal,
+      closeCreateAccountModal,
+      handleCreateAccount,
+      managerAdjustBalance,
+      managerDeleteAccount
+    });
+
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
   </script>
 </body>
 </html>

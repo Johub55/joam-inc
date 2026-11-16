@@ -1,5 +1,4 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, ReactNode } from 'react';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type {
   AppMode,
   PosScreenType,
@@ -16,7 +15,6 @@ import type {
   PosUser,
   BankAccount,
   BankTransaction,
-  SupabaseConfig,
   CashPaymentRequest,
   BrandType,
   BrandConfig,
@@ -26,10 +24,6 @@ import type {
 } from '../types';
 import { showToast } from '../services/appToast';
 import {
-  DEFAULT_SUPABASE_POS_URL,
-  DEFAULT_SUPABASE_POS_KEY,
-  DEFAULT_SUPABASE_PAY_URL,
-  DEFAULT_SUPABASE_PAY_KEY,
   INITIAL_BANK_ACCOUNTS,
   INITIAL_INVENTORY,
   INITIAL_COUPONS,
@@ -38,26 +32,58 @@ import {
   ORDER_KIOSK_USER,
   RPI_KIOSK_USER,
   BRAND_CONFIGS,
-  getSupabaseClient,
   normalizeCardUid,
   parseLinkedUids,
   accountMatchesUid,
   generateVirtualCardUid,
   isVirtualCardNumber
 } from '../services/store';
-import { DEFAULT_PRODUCTS, ALL_DEFAULT_PRODUCTS, KOEKPLOEG_PRODUCTS } from '../services/defaultProducts';
+import { ALL_DEFAULT_PRODUCTS } from '../services/defaultProducts';
 import { AudioFX } from '../services/audio';
-import { 
-  formatDbOrder, 
-  mergeOrders, 
-  broadcastSync, 
-  recordLocalOrderMutation, 
-  recordDeletedOrder, 
-  pendingOrderMutations 
+import {
+  formatDbOrder,
+  mergeOrders,
+  broadcastSync,
+  recordLocalOrderMutation,
+  recordDeletedOrder,
+  pendingOrderMutations
 } from '../services/syncHelpers';
 import { calculateDiscount } from '../services/discountService';
 import { redeemVoucherAnyCustomer, addCoinsToCustomer, isVipSubscriberPhone, issueVoucherForCustomer } from '../services/loyalty';
 import { verifyTotpCode } from '../services/totp';
+import {
+  fsGetCollection,
+  fsSubscribeCollection,
+  fsSubscribeDoc,
+  testFirestoreConnection
+} from '../services/firebase';
+import {
+  fromFirestoreProduct,
+  saveProductToFirestore,
+  deleteProductFromFirestore,
+  saveProductsBatchToFirestore,
+  saveOrderToFirestore,
+  deleteOrderFromFirestore,
+  fromFirestoreBankAccount,
+  saveBankAccountToFirestore,
+  deleteBankAccountFromFirestore,
+  saveBankTransactionToFirestore,
+  adjustBankBalanceTransaction,
+  savePosUserToFirestore,
+  deletePosUserFromFirestore,
+  saveInventoryItemToFirestore,
+  saveInventoryBatchToFirestore,
+  saveCouponToFirestore,
+  saveGiftCardToFirestore,
+  deleteGiftCardFromFirestore,
+  saveCashRequestToFirestore,
+  savePosSettingsToFirestore,
+  emitAudioBroadcastEvent,
+  saveAuditLogToFirestore,
+  savePosSessionToFirestore,
+  getAllBankAccountsFromFirestore,
+  getPosSettingsFromFirestore
+} from '../services/firestoreSync';
 
 const getMajorityStatus = (items: any[]): OrderStatus => {
   if (!items || items.length === 0) return 'wachten';
@@ -110,13 +136,8 @@ interface AppContextType {
   brandConfig: BrandConfig;
   brandProducts: Product[];
 
-  // Connection & Supabase
-  supabaseConfig: SupabaseConfig;
-  setSupabaseConfig: (cfg: Partial<SupabaseConfig>) => void;
-  posClient: SupabaseClient | null;
-  payClient: SupabaseClient | null;
+  // Connection & Firebase Cloud Sync
   isOnline: boolean;
-  isSupabaseConfigured: boolean;
   connectionText: string;
   syncStatus: 'synced' | 'syncing' | 'error' | 'offline';
   isRealtimeActive: boolean;
@@ -201,7 +222,7 @@ interface AppContextType {
   updateProduct: (product: Product) => Promise<void>;
   deleteProduct: (id: number) => Promise<void>;
   toggleProductSale: (id: number) => Promise<void>;
-  resetProductsToDefault: () => void;
+  resetProductsToDefault: () => Promise<void> | void;
   syncProducts: () => Promise<void>;
   buyInventory: (id: number, amount: number) => void;
   addInventoryItem: (item: Omit<InventoryItem, 'id'>) => void;
@@ -320,16 +341,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const clean = newPin.trim();
     setMasterPinState(clean);
     localStorage.setItem('wd_master_pin', clean);
-    if (posClient) {
-      try {
-        await posClient.from('pos_settings').upsert({
-          id: 'default',
-          master_security_pin: clean,
-          updated_at: new Date().toISOString()
-        });
-      } catch (e) {
-        console.warn('Fout bij opslaan master_security_pin in pos_settings:', e);
-      }
+    try {
+      await savePosSettingsToFirestore({ master_security_pin: clean });
+    } catch (e) {
+      console.warn('Fout bij opslaan master_security_pin in pos_settings:', e);
     }
   };
 
@@ -346,6 +361,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       localStorage.setItem('wd_audit_logs', JSON.stringify(updated));
       return updated;
     });
+    saveAuditLogToFirestore({
+      action,
+      user_name: newLog.user_name,
+      details,
+      timestamp: new Date().toISOString()
+    }).catch(() => {});
   };
 
   // Helper: Encode security & theme flags inside existing JSONB `perms` array so Supabase sync works 100% WITHOUT needing new SQL columns!
@@ -411,58 +432,40 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   };
 
-  const syncUserSecurityToSupabase = async (targetUser: PosUser, overrideFreeze?: boolean) => {
-    const client = posClient || payClient;
-    if (!client) return;
+  const syncUserSecurityToFirestore = async (targetUser: PosUser, overrideFreeze?: boolean) => {
     const cleanU = targetUser.username.trim().toLowerCase();
     const dbPerms = buildDbPermsForUser(targetUser, overrideFreeze);
     try {
-      // 1. Update via standard `perms` JSONB column (always exists in every Supabase setup, 0 SQL changes needed!)
-      const { data: existingRows } = await client.from('pos_users').select('id, username').ilike('username', cleanU);
-      if (existingRows && existingRows.length > 0) {
-        await client.from('pos_users').update({ perms: dbPerms }).ilike('username', cleanU);
-      } else {
-        await client.from('pos_users').insert({
-          name: targetUser.name || cleanU,
-          username: targetUser.username,
-          password: targetUser.password || '1234',
-          perms: dbPerms,
-          is_admin: Boolean(targetUser.is_admin)
+      await savePosUserToFirestore(
+        { ...targetUser, perms: targetUser.perms || ['pos', 'pickup'] },
+        dbPerms
+      );
+
+      // Sync security flags on matching bank_account if present
+      const allAccs = await getAllBankAccountsFromFirestore().catch(() => []);
+      const matchingBank =
+        allAccs.find(a => a.username.toLowerCase() === cleanU) ||
+        bankAccountsRef.current.find(a => a.username.toLowerCase() === cleanU);
+      if (matchingBank) {
+        await saveBankAccountToFirestore({
+          ...matchingBank,
+          is_shadowbanned: Boolean(targetUser.is_shadowbanned),
+          is_banned: Boolean(targetUser.is_banned),
+          is_suspended: Boolean(targetUser.is_suspended),
+          is_2fa_enabled: Boolean(targetUser.is_2fa_enabled),
+          totp_secret: targetUser.totp_secret || '',
+          backup_codes: targetUser.backup_codes || []
         });
       }
-      // 2. Also update dedicated columns if they exist
-      try {
-        await client.from('pos_users').update({
-          is_shadowbanned: Boolean(targetUser.is_shadowbanned),
-          is_banned: Boolean(targetUser.is_banned),
-          is_suspended: Boolean(targetUser.is_suspended),
-          is_2fa_enabled: Boolean(targetUser.is_2fa_enabled),
-          totp_secret: targetUser.totp_secret || '',
-          backup_codes: targetUser.backup_codes || []
-        }).ilike('username', cleanU);
-        await client.from('bank_accounts').update({
-          is_shadowbanned: Boolean(targetUser.is_shadowbanned),
-          is_banned: Boolean(targetUser.is_banned),
-          is_suspended: Boolean(targetUser.is_suspended),
-          is_2fa_enabled: Boolean(targetUser.is_2fa_enabled),
-          totp_secret: targetUser.totp_secret || '',
-          backup_codes: targetUser.backup_codes || []
-        }).ilike('username', cleanU);
-      } catch {}
 
-      // 3. Broadcast live to all open tabs & GitHub Pages sessions
-      const bc = client.channel('global_audio_broadcast');
-      bc.send({
-        type: 'broadcast',
-        event: 'wd_security_state_sync',
-        payload: {
-          username: cleanU,
-          is_shadowbanned: Boolean(targetUser.is_shadowbanned),
-          is_banned: Boolean(targetUser.is_banned),
-          is_suspended: Boolean(targetUser.is_suspended),
-          tables_frozen: overrideFreeze !== undefined ? overrideFreeze : tablesFrozen
-        }
-      }).catch(() => {});
+      // Broadcast live via Firestore audio_events
+      await emitAudioBroadcastEvent('wd_security_state_sync', {
+        username: cleanU,
+        is_shadowbanned: Boolean(targetUser.is_shadowbanned),
+        is_banned: Boolean(targetUser.is_banned),
+        is_suspended: Boolean(targetUser.is_suspended),
+        tables_frozen: overrideFreeze !== undefined ? overrideFreeze : tablesFrozen
+      });
     } catch (e) {
       console.warn('Security sync warning:', e);
     }
@@ -485,34 +488,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setTablesFrozenState(nextFreeze);
     localStorage.setItem('wd_tables_frozen', String(nextFreeze));
 
-    const client = posClient || payClient;
-    if (client) {
-      try {
-        // 1. Sync via existing `pos_users.perms` on joas/admin so 0 SQL changes are required
-        const adminTarget = posUsers.find(u => u.username.toLowerCase() === 'joas') || posUsers[0];
-        if (adminTarget) {
-          await syncUserSecurityToSupabase(adminTarget, nextFreeze);
-        }
-        // 2. Also store in pos_settings.news_config (which already exists)
-        const currentNewsCfgRaw = localStorage.getItem('wd_pickup_news_config_v2');
-        let newsCfg: any = {};
-        try { if (currentNewsCfgRaw) newsCfg = JSON.parse(currentNewsCfgRaw); } catch {}
-        newsCfg.tables_frozen = nextFreeze;
-        newsCfg.lastUpdated = Date.now();
-        localStorage.setItem('wd_pickup_news_config_v2', JSON.stringify(newsCfg));
-        await client.from('pos_settings').upsert({
-          id: 'default',
-          order_stop_active: orderStopActive,
-          pickup_closed: pickupClosed,
-          news_config: newsCfg,
-          updated_at: new Date().toISOString()
-        });
-        // 3. Try server-side PostgreSQL REVOKE/GRANT RPC if installed
-        try {
-          await client.rpc('werkpay_set_tables_readonly', { p_lock: nextFreeze, p_allow_orders: true });
-        } catch {}
-      } catch {}
-    }
+    try {
+      const adminTarget = posUsers.find(u => u.username.toLowerCase() === 'joas') || posUsers[0];
+      if (adminTarget) {
+        await syncUserSecurityToFirestore(adminTarget, nextFreeze);
+      }
+      const currentNewsCfgRaw = localStorage.getItem('wd_pickup_news_config_v2');
+      let newsCfg: any = {};
+      try { if (currentNewsCfgRaw) newsCfg = JSON.parse(currentNewsCfgRaw); } catch {}
+      newsCfg.tables_frozen = nextFreeze;
+      newsCfg.lastUpdated = Date.now();
+      localStorage.setItem('wd_pickup_news_config_v2', JSON.stringify(newsCfg));
+      await savePosSettingsToFirestore({
+        order_stop_active: orderStopActive,
+        pickup_closed: pickupClosed,
+        tables_frozen: nextFreeze,
+        news_config: newsCfg
+      });
+    } catch {}
 
     logAuditAction(
       nextFreeze ? 'TABELLEN_BEVROREN' : 'TABELLEN_ONTGRENDELD',
@@ -600,10 +593,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       is_banned: true,
       is_suspended: true
     };
-    await syncUserSecurityToSupabase(fallbackUser);
+    await syncUserSecurityToFirestore(fallbackUser);
 
     logAuditAction('ACCOUNT_GESCHORST', `Account @${cleanU} geschorst en geblokkeerd (zichtbare rechten behouden)! ${reason || ''}`);
-    return { success: true, message: `Account @${cleanU} is direct online geblokkeerd (zonder SQL aanpassing nodig)!` };
+    return { success: true, message: `Account @${cleanU} is direct online geblokkeerd via Firebase!` };
   };
 
   const unbanUser = async (username: string): Promise<{ success: boolean; message: string }> => {
@@ -624,7 +617,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     await unblockDeviceOrIp(cleanU);
 
     if (targetObj) {
-      await syncUserSecurityToSupabase(targetObj);
+      await syncUserSecurityToFirestore(targetObj);
     }
 
     logAuditAction('ACCOUNT_GEDEBLOKKEERD', `Blokkade voor @${cleanU} opgeheven.`);
@@ -655,7 +648,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setBankAccounts(prev => prev.map(a => a.username.toLowerCase() === cleanU ? { ...a, is_shadowbanned: nextState } : a));
 
     if (targetObj) {
-      await syncUserSecurityToSupabase(targetObj);
+      await syncUserSecurityToFirestore(targetObj);
     }
 
     logAuditAction(
@@ -714,7 +707,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       totp_secret: secret,
       backup_codes: backupCodes
     };
-    await syncUserSecurityToSupabase(userToSync);
+    await syncUserSecurityToFirestore(userToSync);
 
     logAuditAction('2FA_INGESCHAKELD', `🔐 2FA Tweestapsverificatie succesvol geactiveerd voor @${cleanU}`);
     return { success: true, message: `2FA Tweestapsverificatie succesvol geactiveerd voor @${cleanU}!` };
@@ -762,7 +755,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       totp_secret: '',
       backup_codes: []
     };
-    await syncUserSecurityToSupabase(disabledUser);
+    await syncUserSecurityToFirestore(disabledUser);
 
     logAuditAction('2FA_UITGESCHAKELD', `2FA Tweestapsverificatie uitgeschakeld voor @${cleanU}`);
     return { success: true, message: `2FA uitgeschakeld voor @${cleanU}.` };
@@ -785,35 +778,33 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       };
     }
 
-    // Fallback: check live Supabase in case 2FA was just toggled on another device or before initial poll finished
-    if (posClient) {
-      try {
-        const { data: dbU } = await posClient.from('pos_users').select('*').ilike('username', cleanU).maybeSingle();
-        if (dbU) {
-          const parsed = parsePosUserFromDb(dbU);
-          if (parsed.is_2fa_enabled && parsed.totp_secret) {
-            return {
-              is_2fa_enabled: true,
-              totp_secret: parsed.totp_secret,
-              backup_codes: parsed.backup_codes || []
-            };
-          }
-        }
-      } catch {}
-    }
-    const targetPay = payClient || posClient;
-    if (targetPay) {
-      try {
-        const { data: dbA } = await targetPay.from('bank_accounts').select('is_2fa_enabled, totp_secret, backup_codes').ilike('username', cleanU).maybeSingle();
-        if (dbA && dbA.is_2fa_enabled && dbA.totp_secret) {
+    // Fallback: check live Firestore in case 2FA was just toggled on another device or before initial sync finished
+    try {
+      const dbUsers = await fsGetCollection('pos_users');
+      const dbU = dbUsers.find((u: any) => String(u.username || '').toLowerCase() === cleanU);
+      if (dbU) {
+        const parsed = parsePosUserFromDb(dbU);
+        if (parsed.is_2fa_enabled && parsed.totp_secret) {
           return {
             is_2fa_enabled: true,
-            totp_secret: dbA.totp_secret,
-            backup_codes: Array.isArray(dbA.backup_codes) ? dbA.backup_codes : []
+            totp_secret: parsed.totp_secret,
+            backup_codes: parsed.backup_codes || []
           };
         }
-      } catch {}
-    }
+      }
+    } catch {}
+
+    try {
+      const allAccs = await getAllBankAccountsFromFirestore();
+      const dbA = allAccs.find(a => a.username.toLowerCase() === cleanU);
+      if (dbA && dbA.is_2fa_enabled && dbA.totp_secret) {
+        return {
+          is_2fa_enabled: true,
+          totp_secret: dbA.totp_secret,
+          backup_codes: Array.isArray(dbA.backup_codes) ? dbA.backup_codes : []
+        };
+      }
+    } catch {}
 
     return null;
   };
@@ -928,56 +919,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const brandConfig = BRAND_CONFIGS[activeBrand] || BRAND_CONFIGS.koekploeg;
 
-  // Supabase Config
-  const [supabaseConfig, setSupabaseConfigState] = useState<SupabaseConfig>(() => {
-    const saved = localStorage.getItem('wd_sb_cfg');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        const resolvedUrl = parsed.unifiedUrl || parsed.supabaseUrl || '';
-        const resolvedKey = parsed.unifiedKey || parsed.supabaseAnonKey || '';
-        
-        // Ensure both URL and KEY are present and the URL is not a known bad value
-        if (resolvedUrl && resolvedKey && !resolvedUrl.includes('ezndrnnywjznxpzxgksb')) {
-          return {
-            unifiedUrl: resolvedUrl,
-            unifiedKey: resolvedKey,
-            useSeparatePay: Boolean(parsed.useSeparatePay),
-            payUrl: parsed.payUrl || resolvedUrl,
-            payKey: parsed.payKey || resolvedKey,
-            supabaseUrl: resolvedUrl,
-            supabaseAnonKey: resolvedKey
-          };
-        } else {
-          // If the config in localStorage is incomplete or invalid, remove it
-          localStorage.removeItem('wd_sb_cfg');
-        }
-      } catch (e) {
-        // If JSON parsing fails, remove the invalid config
-        localStorage.removeItem('wd_sb_cfg');
-      }
-    }
-    // Fallback to defaults
-    return {
-      unifiedUrl: DEFAULT_SUPABASE_POS_URL,
-      unifiedKey: DEFAULT_SUPABASE_POS_KEY,
-      useSeparatePay: false,
-      payUrl: DEFAULT_SUPABASE_PAY_URL,
-      payKey: DEFAULT_SUPABASE_PAY_KEY,
-      supabaseUrl: DEFAULT_SUPABASE_POS_URL,
-      supabaseAnonKey: DEFAULT_SUPABASE_POS_KEY
-    };
-  });
-
-  const [isOnline, setIsOnline] = useState<boolean>(false);
-  const [connectionText, setConnectionText] = useState<string>('Verbinden met Supabase...');
+  // Firebase Cloud Firestore Connection State
+  const [isOnline, setIsOnline] = useState<boolean>(true);
+  const [connectionText, setConnectionText] = useState<string>('Verbinden met Firebase Cloud...');
   const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'error' | 'offline'>('synced');
-  const [isRealtimeActive, setIsRealtimeActive] = useState<boolean>(false);
+  const [isRealtimeActive, setIsRealtimeActive] = useState<boolean>(true);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(new Date());
-
-  // Clients
-  const [posClient, setPosClient] = useState<SupabaseClient | null>(null);
-  const [payClient, setPayClient] = useState<SupabaseClient | null>(null);
 
   // POS State
   const [products, setProducts] = useState<Product[]>(() => {
@@ -1325,93 +1272,56 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [currentBankAccount]);
 
-  const setSupabaseConfig = (cfg: Partial<SupabaseConfig>) => {
-    const resolvedUrl = cfg.unifiedUrl || cfg.supabaseUrl || supabaseConfig.unifiedUrl || DEFAULT_SUPABASE_POS_URL;
-    const resolvedKey = cfg.unifiedKey || cfg.supabaseAnonKey || supabaseConfig.unifiedKey || DEFAULT_SUPABASE_POS_KEY;
-    const normalized: SupabaseConfig = {
-      unifiedUrl: resolvedUrl,
-      unifiedKey: resolvedKey,
-      useSeparatePay: cfg.useSeparatePay ?? supabaseConfig.useSeparatePay ?? false,
-      payUrl: cfg.payUrl || (cfg.useSeparatePay ? (cfg.payUrl || resolvedUrl) : resolvedUrl),
-      payKey: cfg.payKey || (cfg.useSeparatePay ? (cfg.payKey || resolvedKey) : resolvedKey),
-      supabaseUrl: resolvedUrl,
-      supabaseAnonKey: resolvedKey
-    };
-    setSupabaseConfigState(normalized);
-    localStorage.setItem('wd_sb_cfg', JSON.stringify(normalized));
-  };
-
-  // Initialize Supabase Clients with Realtime configuration
+  // Initialize Firebase Cloud Firestore connection status
   useEffect(() => {
-    console.log("DEBUG: AppContext init, config:", supabaseConfig);
-    console.log("DEBUG: Component mounted in AppContext");
-    try {
-      const pUrl = supabaseConfig.unifiedUrl || supabaseConfig.supabaseUrl;
-      const pKey = supabaseConfig.unifiedKey || supabaseConfig.supabaseAnonKey;
-      console.log("DEBUG: Resolved pUrl:", pUrl, "resolved pKey:", pKey);
-      const bUrl = supabaseConfig.useSeparatePay ? (supabaseConfig.payUrl || pUrl) : pUrl;
-      const bKey = supabaseConfig.useSeparatePay ? (supabaseConfig.payKey || pKey) : pKey;
-
-      if (!pUrl || !pKey) {
-        console.warn("DEBUG: pUrl or pKey is missing!");
-      }
-      
-      if (bUrl === pUrl && bKey === pKey) {
-        if (pUrl && pKey) {
-          const pc = getSupabaseClient(pUrl, pKey, {
-            realtime: { params: { eventsPerSecond: 10 } }
-          });
-          if (pc) {
-            console.log("DEBUG: Successfully set posClient and payClient");
-            setPosClient(pc);
-            setPayClient(pc);
-          } else {
-             console.error("DEBUG: Failed to get supabase client");
-          }
+    let active = true;
+    testFirestoreConnection()
+      .then((res) => {
+        if (!active) return;
+        if (res.success) {
+          setIsOnline(true);
+          setIsRealtimeActive(true);
+          setSyncStatus('synced');
+          setConnectionText('🟢 Firebase Cloud Firestore Live');
+        } else {
+          setIsOnline(false);
+          setSyncStatus('offline');
+          setConnectionText('Offline / Lokale Cache');
         }
-      } else {
-        if (pUrl && pKey) {
-          const pc = getSupabaseClient(pUrl, pKey, {
-            realtime: { params: { eventsPerSecond: 10 } }
-          });
-          if (pc) setPosClient(pc);
-          else console.error("DEBUG: Failed to get posClient");
-        }
-        if (bUrl && bKey) {
-          const bc = getSupabaseClient(bUrl, bKey, {
-            auth: { persistSession: false, autoRefreshToken: false },
-            realtime: { params: { eventsPerSecond: 10 } }
-          });
-          if (bc) setPayClient(bc);
-          else console.error("DEBUG: Failed to get payClient");
-        }
-      }
-
-      setConnectionText('Verbonden (Live Supabase & Lokale Cache)');
-      setIsOnline(true);
-      console.log("DEBUG: AppContext set to ONLINE");
-    } catch (e: any) {
-      console.error("DEBUG: Kritieke fout in client init:", e);
-      setConnectionText('Offline / Lokale Simulatiemodus');
-      setIsOnline(false);
-      setSyncStatus('offline');
-    }
-  }, [supabaseConfig]);
+      })
+      .catch(() => {
+        if (!active) return;
+        setIsOnline(false);
+        setSyncStatus('offline');
+        setConnectionText('Offline / Lokale Cache');
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
 // Helper to convert DB cash_request row to CashPaymentRequest
 const formatDbCashRequest = (row: any): CashPaymentRequest => {
   return {
-    id: row.req_id || `req_${row.id}`,
-    orderNo: Number(row.order_no || 0),
-    orderType: row.order_type || 'takeaway',
-    identifier: row.identifier || row.cashier || '',
-    total: Number(row.amount || 0),
+    id: String(row.id || row.req_id || ''),
+    orderNo: Number(row.orderNo ?? row.order_no ?? 0),
+    orderType: (row.orderType || row.order_type || 'takeaway') as CashPaymentRequest['orderType'],
+    identifier: String(row.identifier || row.cashier || ''),
+    total: Number(row.total ?? row.amount ?? 0),
     status: (row.status || 'pending') as CashPaymentRequest['status'],
-    requestedAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
-    approvedBy: row.approved_by || undefined,
+    requestedAt:
+      typeof row.requestedAt === 'number'
+        ? row.requestedAt
+        : row.created_at
+        ? new Date(row.created_at).getTime()
+        : Date.now(),
+    approvedBy: row.approvedBy || row.approved_by || undefined,
+    approvedByUsername: row.approvedByUsername || undefined,
+    approvedAt: typeof row.approvedAt === 'number' ? row.approvedAt : undefined,
+    consumedAt: typeof row.consumedAt === 'number' ? row.consumedAt : undefined,
     received: row.received !== null && row.received !== undefined ? Number(row.received) : undefined,
     change: row.change !== null && row.change !== undefined ? Number(row.change) : undefined,
-    rejectedReason: row.rejected_reason || undefined
+    rejectedReason: row.rejectedReason || row.rejected_reason || undefined
   };
 };
 
@@ -1419,14 +1329,18 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   currentPosUserRef.current = currentPosUser;
   const currentBankAccountRef = useRef(currentBankAccount);
   currentBankAccountRef.current = currentBankAccount;
+  const ordersRef = useRef(orders);
+  ordersRef.current = orders;
+  const bankAccountsRef = useRef(bankAccounts);
+  bankAccountsRef.current = bankAccounts;
   const tablesFrozenRef = useRef(tablesFrozen);
   tablesFrozenRef.current = tablesFrozen;
-  const isRealtimeActiveRef = useRef(isRealtimeActive);
-  isRealtimeActiveRef.current = isRealtimeActive;
+  const lastHandledAudioTsRef = useRef<number>(Date.now());
 
   const cloudSnapshotsRef = useRef<{
     bank: string;
     users: string;
+    products: string;
     coupons: string;
     giftCards: string;
     cashReqs: string;
@@ -1437,6 +1351,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   }>({
     bank: '',
     users: '',
+    products: '',
     coupons: '',
     giftCards: '',
     cashReqs: '',
@@ -1446,9 +1361,91 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     news: ''
   });
 
-  // Unified cloud data fetch
+  // Apply parsed settings snapshot helper (reused by fetchCloudData and pos_settings subscription)
+  const applyRemoteSettings = useCallback((dbSettings: Record<string, any> | null) => {
+    if (!dbSettings) return;
+    const localOrderStop = localStorage.getItem('wd_order_stop') === 'true';
+    setOrderStopActive(localOrderStop || Boolean(dbSettings.order_stop_active));
+    setPickupClosed(Boolean(dbSettings.pickup_closed));
+
+    if (dbSettings.order_stop_text) {
+      setOrderStopTextState(dbSettings.order_stop_text);
+      localStorage.setItem('wd_order_stop_text', dbSettings.order_stop_text);
+    } else if (dbSettings.news_config && typeof dbSettings.news_config === 'object' && dbSettings.news_config.orderStopText) {
+      setOrderStopTextState(dbSettings.news_config.orderStopText);
+      localStorage.setItem('wd_order_stop_text', dbSettings.news_config.orderStopText);
+    }
+
+    if (dbSettings.order_stop_config && typeof dbSettings.order_stop_config === 'object') {
+      setOrderStopConfig(dbSettings.order_stop_config);
+      localStorage.setItem('wd_order_stop_config', JSON.stringify(dbSettings.order_stop_config));
+    }
+
+    const brandingObj = dbSettings.branding_config || dbSettings.custom_branding;
+    if (brandingObj && typeof brandingObj === 'object') {
+      setCustomBranding(brandingObj);
+      localStorage.setItem('wd_custom_branding', JSON.stringify(brandingObj));
+    }
+
+    const pinValRaw = dbSettings.master_security_pin || dbSettings.master_pin;
+    if (pinValRaw) {
+      const pinVal = String(pinValRaw).trim();
+      if (pinVal) {
+        setMasterPinState(pinVal);
+        localStorage.setItem('wd_master_pin', pinVal);
+      }
+    }
+
+    if (dbSettings.tables_frozen !== undefined) {
+      const isFrz = Boolean(dbSettings.tables_frozen);
+      if (isFrz !== tablesFrozenRef.current) {
+        setTablesFrozenState(isFrz);
+        localStorage.setItem('wd_tables_frozen', String(isFrz));
+      }
+    } else if (dbSettings.news_config && typeof dbSettings.news_config === 'object' && dbSettings.news_config.tables_frozen !== undefined) {
+      const isFrz = Boolean(dbSettings.news_config.tables_frozen);
+      if (isFrz !== tablesFrozenRef.current) {
+        setTablesFrozenState(isFrz);
+        localStorage.setItem('wd_tables_frozen', String(isFrz));
+      }
+    }
+
+    if (dbSettings.news_config && typeof dbSettings.news_config === 'object') {
+      const remoteNewsCfg = dbSettings.news_config;
+      const currentNewsCfgRaw = localStorage.getItem('wd_pickup_news_config_v2');
+      let currentNewsCfg: any = null;
+      try { if (currentNewsCfgRaw) currentNewsCfg = JSON.parse(currentNewsCfgRaw); } catch {}
+      const remoteNewsStr = JSON.stringify(remoteNewsCfg);
+      if (
+        remoteNewsStr !== cloudSnapshotsRef.current.news &&
+        (!currentNewsCfg || !currentNewsCfg.lastUpdated || (remoteNewsCfg.lastUpdated && remoteNewsCfg.lastUpdated >= currentNewsCfg.lastUpdated))
+      ) {
+        cloudSnapshotsRef.current.news = remoteNewsStr;
+        localStorage.setItem('wd_pickup_news_config_v2', remoteNewsStr);
+        window.dispatchEvent(new Event('wd_news_config_updated'));
+      }
+    }
+
+    if (dbSettings.custom_news_items && Array.isArray(dbSettings.custom_news_items)) {
+      const itemsStr = JSON.stringify(dbSettings.custom_news_items);
+      if (localStorage.getItem('wd_pickup_custom_items_v2') !== itemsStr) {
+        localStorage.setItem('wd_pickup_custom_items_v2', itemsStr);
+        window.dispatchEvent(new Event('wd_news_config_updated'));
+      }
+    }
+
+    if (dbSettings.blocked_devices && Array.isArray(dbSettings.blocked_devices)) {
+      const blockedSnap = JSON.stringify(dbSettings.blocked_devices);
+      if (blockedSnap !== cloudSnapshotsRef.current.blocked) {
+        cloudSnapshotsRef.current.blocked = blockedSnap;
+        setBlockedDevices(dbSettings.blocked_devices);
+        localStorage.setItem('wd_blocked_devices', blockedSnap);
+      }
+    }
+  }, []);
+
+  // Unified Firebase Cloud Firestore fetch
   const fetchCloudData = useCallback(async (isBackground = false) => {
-    if (!posClient) return;
     if (isBackground && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
       return;
     }
@@ -1461,15 +1458,38 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const isShadowbanned = Boolean(activePosUser?.is_shadowbanned);
 
     try {
-      // 1. Fetch orders (unless current user is shadowbanned so their fake local changes stay visible to them)
-      const { data: dbOrders, error: orderErr } = await posClient
-        .from('orders')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(60);
+      const [
+        dbOrders,
+        dbAccounts,
+        dbBankTxs,
+        dbUsers,
+        dbProducts,
+        dbCoupons,
+        dbGiftCards,
+        dbSettings,
+        dbCashReqs,
+        dbLoyalty,
+        dbSessions
+      ] = await Promise.all([
+        fsGetCollection('orders').catch(() => []),
+        getAllBankAccountsFromFirestore().catch(() => []),
+        fsGetCollection('bank_transactions').catch(() => []),
+        fsGetCollection('pos_users').catch(() => []),
+        fsGetCollection('products').catch(() => []),
+        fsGetCollection('coupons').catch(() => []),
+        fsGetCollection('gift_cards').catch(() => []),
+        getPosSettingsFromFirestore().catch(() => null),
+        fsGetCollection('cash_requests').catch(() => []),
+        fsGetCollection('loyalty_customers').catch(() => []),
+        fsGetCollection('pos_sessions').catch(() => [])
+      ]);
 
-      if (!orderErr && dbOrders && !isShadowbanned) {
-        const parsed: Order[] = dbOrders.map(formatDbOrder);
+      // 1. Orders
+      if (Array.isArray(dbOrders) && dbOrders.length > 0 && !isShadowbanned) {
+        const parsed: Order[] = dbOrders
+          .map(formatDbOrder)
+          .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+          .slice(0, 80);
         setOrders(prev => {
           const { merged, hasNewRemoteOrder } = mergeOrders(prev, parsed);
           if (hasNewRemoteOrder && isBackground) {
@@ -1484,37 +1504,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 2. Fetch bank accounts (preserving local linked_uids if SQL column doesn't exist yet)
-      const targetPay = payClient || posClient;
-      const { data: dbAccounts, error: payErr } = await targetPay
-        .from('bank_accounts')
-        .select('*');
-
+      // 2. Bank accounts
       let mergedDbAccounts: BankAccount[] | null = null;
-      if (!payErr && dbAccounts && dbAccounts.length > 0 && !isShadowbanned) {
-        const localBankMap = new Map<string, BankAccount>();
-        try {
-          const savedRaw = localStorage.getItem('wd_bank_accounts');
-          if (savedRaw) {
-            for (const la of JSON.parse(savedRaw)) {
-              if (la?.username) localBankMap.set(String(la.username).toLowerCase(), la);
-            }
-          }
-        } catch {}
-
-        mergedDbAccounts = dbAccounts.map((row: any) => {
-          const localMatch = localBankMap.get(String(row.username || '').toLowerCase());
-          const hasRemoteLinkedCol = row.linked_uids !== undefined;
-          return {
-            ...row,
-            balance: Number(row.balance || 0),
-            is_admin: Boolean(row.is_admin),
-            linked_uids: hasRemoteLinkedCol
-              ? parseLinkedUids(row.linked_uids)
-              : parseLinkedUids(localMatch?.linked_uids || [])
-          } as BankAccount;
-        });
-
+      if (Array.isArray(dbAccounts) && dbAccounts.length > 0 && !isShadowbanned) {
+        mergedDbAccounts = dbAccounts;
         const bankSnap = JSON.stringify(mergedDbAccounts);
         if (bankSnap !== cloudSnapshotsRef.current.bank) {
           cloudSnapshotsRef.current.bank = bankSnap;
@@ -1537,18 +1530,31 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 3. Fetch POS users from Supabase (with Zero-SQL `perms` marker decoding for Shadowban, Ban & Table Freeze!)
-      const { data: dbUsers, error: userErr } = await posClient
-        .from('pos_users')
-        .select('*');
+      // 2b. Bank transactions
+      if (Array.isArray(dbBankTxs) && dbBankTxs.length > 0 && !isShadowbanned) {
+        const parsedTxs: BankTransaction[] = dbBankTxs
+          .map((t: any) => ({
+            id: t.id,
+            from_account: String(t.from_account || ''),
+            to_account: String(t.to_account || ''),
+            amount: Number(t.amount || 0),
+            label: String(t.label || 'Transactie'),
+            note: t.note ? String(t.note) : undefined,
+            order_no: typeof t.order_no === 'number' ? t.order_no : undefined,
+            when: String(t.when || ''),
+            timestamp: Number(t.timestamp || 0)
+          }))
+          .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+          .slice(0, 100);
+        setBankTransactions(parsedTxs);
+      }
 
-      if (!userErr && dbUsers && dbUsers.length > 0) {
-        // Check if any admin user has __tables_frozen__ marker in perms
-        const remoteFreezeFromPerms = dbUsers.some(u => {
-          const rawP = Array.isArray(u.perms) ? u.perms : (typeof u.perms === 'string' ? (() => { try { return JSON.parse(u.perms); } catch { return []; } })() : []);
+      // 3. POS users
+      if (Array.isArray(dbUsers) && dbUsers.length > 0) {
+        const remoteFreezeFromPerms = dbUsers.some((u: any) => {
+          const rawP = Array.isArray(u.perms) ? u.perms : [];
           return rawP.includes('__tables_frozen__');
         });
-
         const parsedUsers: PosUser[] = dbUsers.map(u => parsePosUserFromDb(u));
         const usersSnap = JSON.stringify(parsedUsers);
         if (usersSnap !== cloudSnapshotsRef.current.users) {
@@ -1582,7 +1588,6 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
                 totp_secret: mergedSecret || undefined,
                 backup_codes: mergedBackups
               };
-
               if (
                 enrichedSyncedMe.is_shadowbanned !== activePosUser.is_shadowbanned ||
                 enrichedSyncedMe.is_2fa_enabled !== activePosUser.is_2fa_enabled ||
@@ -1604,18 +1609,30 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 4. Fetch coupons from Supabase
-      const { data: dbCoupons, error: couponErr } = await posClient
-        .from('coupons')
-        .select('*');
-      if (!couponErr && dbCoupons && !isShadowbanned) {
-        const parsedCoupons: Coupon[] = dbCoupons.map(c => ({
+      // 4. Products (full sync incl. keuzemenu's / options, brand, recipe)
+      if (Array.isArray(dbProducts) && dbProducts.length > 0 && !isShadowbanned) {
+        const parsedProducts = dbProducts
+          .map(fromFirestoreProduct)
+          .sort((a, b) => Number(a.id) - Number(b.id));
+        const prodSnap = JSON.stringify(parsedProducts);
+        if (prodSnap !== cloudSnapshotsRef.current.products) {
+          cloudSnapshotsRef.current.products = prodSnap;
+          setProducts(parsedProducts);
+          localStorage.setItem('wd_products', prodSnap);
+        }
+      }
+
+      // 5. Coupons
+      if (Array.isArray(dbCoupons) && dbCoupons.length > 0 && !isShadowbanned) {
+        const parsedCoupons: Coupon[] = dbCoupons.map((c: any) => ({
           id: Number(c.id),
-          code: c.code,
+          code: String(c.code || ''),
           discount_type: c.discount_type as any,
-          discount_val: Number(c.discount_val),
+          discount_val: Number(c.discount_val || 0),
           min_subtotal: c.min_subtotal ? Number(c.min_subtotal) : undefined,
           target_product_name: c.target_product_name || undefined,
+          target_category: c.target_category || undefined,
+          description: c.description || undefined,
           is_active: Boolean(c.is_active)
         }));
         const couponsSnap = JSON.stringify(parsedCoupons);
@@ -1626,17 +1643,21 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 5. Fetch gift cards from Supabase
-      const { data: dbGiftCards, error: gcErr } = await posClient
-        .from('gift_cards')
-        .select('*');
-      if (!gcErr && dbGiftCards && !isShadowbanned) {
-        const parsedGiftCards: GiftCard[] = dbGiftCards.map(g => ({
+      // 6. Gift cards
+      if (Array.isArray(dbGiftCards) && dbGiftCards.length > 0 && !isShadowbanned) {
+        const parsedGiftCards: GiftCard[] = dbGiftCards.map((g: any) => ({
           id: Number(g.id),
-          code: g.code,
-          initial_balance: Number(g.initial_balance),
-          current_balance: Number(g.current_balance),
-          is_active: Boolean(g.is_active)
+          code: String(g.code || ''),
+          initial_balance: Number(g.initial_balance || 0),
+          current_balance: Number(g.current_balance || 0),
+          is_active: Boolean(g.is_active),
+          sender_name: g.sender_name || undefined,
+          recipient_name: g.recipient_name || undefined,
+          recipient_phone: g.recipient_phone || undefined,
+          message: g.message || undefined,
+          is_private: Boolean(g.is_private),
+          notes: g.notes || undefined,
+          created_at: g.created_at || undefined
         }));
         const gcSnap = JSON.stringify(parsedGiftCards);
         if (gcSnap !== cloudSnapshotsRef.current.giftCards) {
@@ -1646,102 +1667,19 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 6. Fetch pos_settings from Supabase
-      const { data: dbSettings, error: settingsErr } = await posClient
-        .from('pos_settings')
-        .select('*')
-        .eq('id', 'default')
-        .maybeSingle();
-
-      // Check local intent FIRST
-      const localOrderStop = localStorage.getItem('wd_order_stop') === 'true';
-
-      if (!settingsErr && dbSettings) {
-        setOrderStopActive(localOrderStop || Boolean(dbSettings.order_stop_active));
-        setPickupClosed(Boolean(dbSettings.pickup_closed));
-
-        if (dbSettings.order_stop_text) {
-          setOrderStopTextState(dbSettings.order_stop_text);
-          localStorage.setItem('wd_order_stop_text', dbSettings.order_stop_text);
-        } else if (dbSettings.news_config && typeof dbSettings.news_config === 'object' && dbSettings.news_config.orderStopText) {
-          setOrderStopTextState(dbSettings.news_config.orderStopText);
-          localStorage.setItem('wd_order_stop_text', dbSettings.news_config.orderStopText);
-        }
-
-        if (dbSettings.order_stop_config && typeof dbSettings.order_stop_config === 'object') {
-          setOrderStopConfig(dbSettings.order_stop_config);
-          localStorage.setItem('wd_order_stop_config', JSON.stringify(dbSettings.order_stop_config));
-        }
-
-        if (dbSettings.branding_config && typeof dbSettings.branding_config === 'object') {
-          setCustomBranding(dbSettings.branding_config);
-          localStorage.setItem('wd_custom_branding', JSON.stringify(dbSettings.branding_config));
-        }
-
-        if (dbSettings.master_security_pin) {
-          const pinVal = String(dbSettings.master_security_pin).trim();
-          if (pinVal) {
-            setMasterPinState(pinVal);
-            localStorage.setItem('wd_master_pin', pinVal);
-          }
-        }
-
-        if (dbSettings.tables_frozen !== undefined) {
-          const isFrz = Boolean(dbSettings.tables_frozen);
-          if (isFrz !== tablesFrozenRef.current) {
-            setTablesFrozenState(isFrz);
-            localStorage.setItem('wd_tables_frozen', String(isFrz));
-          }
-        } else if (dbSettings.news_config && typeof dbSettings.news_config === 'object' && dbSettings.news_config.tables_frozen !== undefined) {
-          const isFrz = Boolean(dbSettings.news_config.tables_frozen);
-          if (isFrz !== tablesFrozenRef.current) {
-            setTablesFrozenState(isFrz);
-            localStorage.setItem('wd_tables_frozen', String(isFrz));
-          }
-        }
-
-        if (dbSettings.news_config && typeof dbSettings.news_config === 'object') {
-          const remoteNewsCfg = dbSettings.news_config;
-          const currentNewsCfgRaw = localStorage.getItem('wd_pickup_news_config_v2');
-          let currentNewsCfg: any = null;
-          try { if (currentNewsCfgRaw) currentNewsCfg = JSON.parse(currentNewsCfgRaw); } catch {}
-
-          const remoteNewsStr = JSON.stringify(remoteNewsCfg);
-          if (remoteNewsStr !== cloudSnapshotsRef.current.news && (!currentNewsCfg || !currentNewsCfg.lastUpdated || (remoteNewsCfg.lastUpdated && remoteNewsCfg.lastUpdated > currentNewsCfg.lastUpdated))) {
-            cloudSnapshotsRef.current.news = remoteNewsStr;
-            localStorage.setItem('wd_pickup_news_config_v2', remoteNewsStr);
-            window.dispatchEvent(new Event('wd_news_config_updated'));
-          }
-        }
-
-        if (dbSettings.custom_news_items && Array.isArray(dbSettings.custom_news_items)) {
-          const itemsStr = JSON.stringify(dbSettings.custom_news_items);
-          if (localStorage.getItem('wd_pickup_custom_items_v2') !== itemsStr) {
-            localStorage.setItem('wd_pickup_custom_items_v2', itemsStr);
-            window.dispatchEvent(new Event('wd_news_config_updated'));
-          }
-        }
-
-        if (dbSettings.blocked_devices && Array.isArray(dbSettings.blocked_devices)) {
-          const blockedSnap = JSON.stringify(dbSettings.blocked_devices);
-          if (blockedSnap !== cloudSnapshotsRef.current.blocked) {
-            cloudSnapshotsRef.current.blocked = blockedSnap;
-            setBlockedDevices(dbSettings.blocked_devices);
-            localStorage.setItem('wd_blocked_devices', blockedSnap);
-          }
-        }
-      } else if (!settingsErr && !dbSettings) {
-        await posClient.from('pos_settings').insert({ id: 'default', order_stop_active: false, pickup_closed: false });
+      // 7. POS Settings
+      if (dbSettings) {
+        applyRemoteSettings(dbSettings);
+      } else {
+        await savePosSettingsToFirestore({ order_stop_active: false, pickup_closed: false }).catch(() => {});
       }
 
-      // 7. Fetch cash_requests from Supabase (for cross-terminal staff notifications)
-      const { data: dbCashReqs, error: cashErr } = await posClient
-        .from('cash_requests')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(50);
-      if (!cashErr && dbCashReqs) {
-        const parsedCashReqs = dbCashReqs.map(formatDbCashRequest);
+      // 8. Cash requests
+      if (Array.isArray(dbCashReqs) && dbCashReqs.length > 0) {
+        const parsedCashReqs = dbCashReqs
+          .map(formatDbCashRequest)
+          .sort((a, b) => Number(b.requestedAt || 0) - Number(a.requestedAt || 0))
+          .slice(0, 50);
         const cashSnap = JSON.stringify(parsedCashReqs);
         if (cashSnap !== cloudSnapshotsRef.current.cashReqs) {
           cloudSnapshotsRef.current.cashReqs = cashSnap;
@@ -1750,36 +1688,32 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 8. Fetch loyalty_customers from Supabase (for WerkLoyalty cross-terminal sync)
-      const { data: dbLoyalty, error: loyaltyErr } = await posClient
-        .from('loyalty_customers')
-        .select('*');
-      if (!loyaltyErr && dbLoyalty && dbLoyalty.length > 0) {
+      // 9. Loyalty customers
+      if (Array.isArray(dbLoyalty) && dbLoyalty.length > 0) {
         const parsedLoyalty = dbLoyalty.map((c: any) => {
           const phone = String(c.phone || '');
           const activeVipRec = isVipSubscriberPhone(phone);
-          const isVip = Boolean(c.vip_subscription_active || activeVipRec);
-
+          const isVip = Boolean(c.vipSubscriptionActive || c.vip_subscription_active || activeVipRec);
           return {
             id: String(c.id),
             name: String(c.name || ''),
             phone,
             coins: Number(c.coins || 0),
-            totalSpent: Number(c.total_spent || 0),
-            ordersCount: Number(c.orders_count || 0),
+            totalSpent: Number(c.totalSpent ?? c.total_spent ?? 0),
+            ordersCount: Number(c.ordersCount ?? c.orders_count ?? 0),
             tier: isVip ? 'VIP Diamant' : ((c.tier as any) || 'Brons'),
-            level: isVip ? 4 : undefined,
-            currentMonthSpent: Number(c.current_month_spent || 0),
-            lastMonthSpent: Number(c.last_month_spent || 0),
-            currentMonthKey: c.current_month_key || '',
-            monthsBelowTarget: Number(c.months_below_target || 0),
+            level: isVip ? 4 : c.level,
+            currentMonthSpent: Number(c.currentMonthSpent ?? c.current_month_spent ?? 0),
+            lastMonthSpent: Number(c.lastMonthSpent ?? c.last_month_spent ?? 0),
+            currentMonthKey: c.currentMonthKey || c.current_month_key || '',
+            monthsBelowTarget: Number(c.monthsBelowTarget ?? c.months_below_target ?? 0),
             vipSubscriptionActive: isVip,
-            vipSubscriptionExpires: activeVipRec?.expiresAt || c.vip_subscription_expires || undefined,
-            vipPlan: activeVipRec?.plan || c.vip_plan || undefined,
-            vouchers: Array.isArray(c.vouchers) ? c.vouchers : (typeof c.vouchers === 'string' ? JSON.parse(c.vouchers) : []),
-            lastSpinDate: c.last_spin_date || undefined,
-            ordersTodayCount: Number(c.orders_today_count || 0),
-            joinedDate: c.joined_date || new Date().toISOString().split('T')[0]
+            vipSubscriptionExpires: activeVipRec?.expiresAt || c.vipSubscriptionExpires || c.vip_subscription_expires || undefined,
+            vipPlan: activeVipRec?.plan || c.vipPlan || c.vip_plan || undefined,
+            vouchers: Array.isArray(c.vouchers) ? c.vouchers : [],
+            lastSpinDate: c.lastSpinDate || c.last_spin_date || undefined,
+            ordersTodayCount: Number(c.ordersTodayCount ?? c.orders_today_count ?? 0),
+            joinedDate: c.joinedDate || c.joined_date || new Date().toISOString().split('T')[0]
           };
         });
         const loyaltySnap = JSON.stringify(parsedLoyalty);
@@ -1791,26 +1725,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 9. Fetch active connected pos_sessions
-      const { data: dbSessions, error: sessErr } = await posClient
-        .from('pos_sessions')
-        .select('*')
-        .order('last_seen', { ascending: false });
-
-      if (!sessErr && dbSessions) {
+      // 10. Active sessions
+      if (Array.isArray(dbSessions)) {
         const now = Date.now();
-        const recent = dbSessions.filter((s: any) => {
-          const t = new Date(s.last_seen).getTime();
-          return (now - t) < 60000; // seen within last 60s
-        }).map((s: any) => ({
-          device_id: String(s.device_id),
-          ip_address: String(s.ip_address || 'Onbekend'),
-          user_name: String(s.user_name || 'Gast'),
-          app_mode: String(s.app_mode || 'pos'),
-          pos_screen: String(s.pos_screen || 'kassa'),
-          user_agent: String(s.user_agent || 'Browser'),
-          last_seen: String(s.last_seen)
-        }));
+        const recent = dbSessions
+          .filter((s: any) => {
+            const t = new Date(s.last_seen).getTime();
+            return Number.isFinite(t) && (now - t) < 60000;
+          })
+          .map((s: any) => ({
+            device_id: String(s.device_id),
+            ip_address: String(s.ip_address || 'Onbekend'),
+            user_name: String(s.user_name || 'Gast'),
+            app_mode: String(s.app_mode || 'pos'),
+            pos_screen: String(s.pos_screen || 'kassa'),
+            user_agent: String(s.user_agent || 'Browser'),
+            last_seen: String(s.last_seen)
+          }));
         const sessSnap = JSON.stringify(recent.map(s => `${s.device_id}:${s.user_name}:${s.pos_screen}:${s.app_mode}`));
         if (sessSnap !== cloudSnapshotsRef.current.sessions) {
           cloudSnapshotsRef.current.sessions = sessSnap;
@@ -1821,116 +1752,45 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       setSyncStatus('synced');
       setLastSyncTime(new Date());
       setIsOnline(true);
+      setIsRealtimeActive(true);
+      setConnectionText('🟢 Firebase Cloud Firestore Live');
     } catch (err: any) {
-      console.error('Cloud sync failure details:', err);
+      console.error('Firebase sync failure details:', err);
       setIsOnline(false);
       if (!isBackground) {
         setSyncStatus('error');
       }
     }
-  }, [posClient, payClient]);
+  }, [applyRemoteSettings]);
 
   const forceSyncNow = async () => {
     await fetchCloudData(false);
   };
 
-  // Initial products seed & check
+  // Initial Firebase seed check for products & bank accounts
   useEffect(() => {
-    if (!posClient) return;
-    const initProducts = async () => {
+    const initSeedData = async () => {
       try {
-        console.log("DEBUG: Initializing products...");
-        const { data: dbProds, error: fetchErr } = await posClient.from('products').select('*');
-        if (fetchErr) {
-          console.error("DEBUG: Error fetching products from Supabase:", fetchErr);
-          throw fetchErr;
-        }
-        
-        console.log("DEBUG: Fetched products from DB:", dbProds?.length || 0);
-
-        if (dbProds && dbProds.length >= 1) { // Changed threshold to 1 for safer testing
-          let localList: Product[] = [];
-          try {
-            const rawLocal = localStorage.getItem('wd_products');
-            if (rawLocal) localList = JSON.parse(rawLocal);
-          } catch {}
-          setProducts(dbProds.map(p => {
-            const defP = ALL_DEFAULT_PRODUCTS.find(d => d.id === p.id);
-            const locP = localList.find(l => l.id === p.id);
-            return {
-              id: p.id,
-              name: p.name,
-              price: Number(p.price),
-              salePrice: Number(p.sale_price || 0),
-              onSale: Boolean(p.on_sale),
-              cat: p.cat,
-              emoji: p.emoji,
-              inStock: Boolean(p.in_stock),
-              options: p.options || locP?.options || defP?.options,
-              brand: p.brand || locP?.brand || defP?.brand,
-              recipe: p.recipe || locP?.recipe || defP?.recipe,
-              recipeDescription: p.recipe_description || locP?.recipeDescription || defP?.recipeDescription
-            };
-          }));
-          console.log("DEBUG: Successfully set products from DB");
+        const dbProds = await fsGetCollection('products').catch(() => []);
+        if (Array.isArray(dbProds) && dbProds.length >= 1) {
+          const parsed = dbProductsToSorted(dbProds);
+          setProducts(parsed);
         } else {
-          console.log("DEBUG: No products found, upserting defaults...");
-          const rows = ALL_DEFAULT_PRODUCTS.map(p => ({
-            id: p.id,
-            name: p.name,
-            price: p.price,
-            sale_price: p.salePrice || 0,
-            on_sale: p.onSale || false,
-            cat: p.cat,
-            emoji: p.emoji,
-            in_stock: p.inStock
-          }));
-          const { error: upsertErr } = await posClient.from('products').upsert(rows);
-          if (upsertErr) {
-            console.error("DEBUG: Error upserting default products:", upsertErr);
-          } else {
-            console.log("DEBUG: Successfully upserted default products");
-            setProducts(ALL_DEFAULT_PRODUCTS);
-          }
+          await saveProductsBatchToFirestore(ALL_DEFAULT_PRODUCTS);
+          setProducts(ALL_DEFAULT_PRODUCTS);
         }
       } catch (err) {
         console.error('Product init error:', err);
       }
     };
-    initProducts();
-  }, [posClient]);
+    const dbProductsToSorted = (rows: any[]) =>
+      rows.map(fromFirestoreProduct).sort((a, b) => Number(a.id) - Number(b.id));
+    initSeedData();
+  }, []);
 
-  // Continuous Adaptive Polling (pauses when tab hidden, slower when Realtime WebSocket is live)
+  // Active Device Heartbeat to pos_sessions (lightweight 15s heartbeat, skips hidden tabs)
   useEffect(() => {
-    if (!posClient) return;
-
-    fetchCloudData(false);
-
-    const pollMs = isRealtimeActive ? 15000 : 6000;
-    const intervalId = setInterval(() => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      fetchCloudData(true);
-    }, pollMs);
-
-    const onVisibilityOrFocus = () => {
-      if (document.visibilityState === 'visible') {
-        fetchCloudData(false);
-      }
-    };
-
-    document.addEventListener('visibilitychange', onVisibilityOrFocus);
-    window.addEventListener('focus', onVisibilityOrFocus);
-
-    return () => {
-      clearInterval(intervalId);
-      document.removeEventListener('visibilitychange', onVisibilityOrFocus);
-      window.removeEventListener('focus', onVisibilityOrFocus);
-    };
-  }, [fetchCloudData, posClient, isRealtimeActive]);
-
-  // Active Device Heartbeat to pos_sessions (lightweight 12s heartbeat, skips hidden tabs)
-  useEffect(() => {
-    if (!posClient || !deviceId) return;
+    if (!deviceId) return;
 
     const sendHeartbeat = async () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
@@ -1945,7 +1805,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (/tablet|ipad/i.test(ua)) deviceType = 'Tablet';
         if (currentPosUser?.username === 'rpi') deviceType = 'Raspberry Pi Kiosk';
 
-        await posClient.from('pos_sessions').upsert({
+        await savePosSessionToFirestore({
           device_id: deviceId,
           ip_address: clientIp || 'Detecteren...',
           user_name: userLabel,
@@ -1960,453 +1820,403 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     };
 
     sendHeartbeat();
-    const interval = setInterval(sendHeartbeat, 12000);
+    const interval = setInterval(sendHeartbeat, 15000);
     return () => clearInterval(interval);
-  }, [posClient, deviceId, clientIp, currentPosUser, currentBankAccount, appMode, posScreen]);
+  }, [deviceId, clientIp, currentPosUser, currentBankAccount, appMode, posScreen]);
 
-  // Live Supabase Realtime WebSocket Subscriptions
+  // Live Firebase Cloud Firestore Realtime Subscriptions
   useEffect(() => {
-    if (!posClient) return;
     let isMounted = true;
-    let orderChannel: any = null;
-    let bankChannel: any = null;
-    let prodChannel: any = null;
-    let couponChannel: any = null;
-    let gcChannel: any = null;
-    let settingsChannel: any = null;
-    let cashReqChannel: any = null;
-    let broadcastChannelRef: any = null;
+    const audioMountTs = Date.now();
+    lastHandledAudioTsRef.current = audioMountTs;
 
-    try {
-      // 1. Orders Realtime
-      orderChannel = posClient
-        .channel('realtime_orders_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'orders' },
-          (payload) => {
-            if (!isMounted) return;
-            console.log('⚡ Realtime Order Event received:', payload.eventType);
-            if (payload.eventType === 'INSERT') {
-              const newOrder = formatDbOrder(payload.new);
-              setOrders(prev => {
-                if (prev.some(o => o.no === newOrder.no)) return prev;
-                AudioFX.bell();
-                return [newOrder, ...prev];
-              });
-              setOrderNo(prev => Math.max(prev, newOrder.no + 1));
-              setLastSyncTime(new Date());
-              setSyncStatus('synced');
-            } else if (payload.eventType === 'UPDATE') {
-              const updatedOrder = formatDbOrder(payload.new);
-              let statusChangedToDone = false;
-              setOrders(prev => prev.map(o => {
-                if (o.no !== updatedOrder.no) return o;
-                const localMutation = pendingOrderMutations.get(o.no);
-                const isMutationFresh = localMutation && Date.now() - localMutation.timestamp < 15000;
-                const finalStatus = (isMutationFresh && localMutation.status) ? localMutation.status : updatedOrder.status;
-                const finalItems = (isMutationFresh && localMutation.items) 
-                  ? localMutation.items 
-                  : (updatedOrder.items && updatedOrder.items.length > 0 ? updatedOrder.items : o.items);
-                const finalPrio = (isMutationFresh && localMutation.isPrio !== undefined) 
-                  ? localMutation.isPrio 
-                  : (o.isPrio ?? updatedOrder.isPrio ?? false);
+    fetchCloudData(false);
 
-                const isOldStatusDone = o.status === 'done' || o.status === 'klaar';
-                const isNewStatusDone = finalStatus === 'done' || finalStatus === 'klaar';
-                if (isNewStatusDone && !isOldStatusDone) {
-                  statusChangedToDone = true;
-                }
+    AudioFX.setBroadcastSender((event: string, pld: any) => {
+      emitAudioBroadcastEvent(event, pld || {}).catch((e: any) => console.warn('Broadcast send error:', e));
+    });
 
-                return {
-                  ...o,
-                  ...updatedOrder,
-                  status: finalStatus,
-                  items: finalItems,
-                  isPrio: finalPrio,
-                  updatedAt: Math.max(o.updatedAt || 0, updatedOrder.updatedAt || 0)
-                };
-              }));
-              if (statusChangedToDone) {
-                AudioFX.speakOrder(updatedOrder.no, updatedOrder.identifier, updatedOrder.orderType);
-              }
-              setLastSyncTime(new Date());
-              setSyncStatus('synced');
-            } else if (payload.eventType === 'DELETE') {
-              const orderNoToDelete = payload.old?.order_no;
-              if (orderNoToDelete) {
-                setOrders(prev => prev.filter(o => o.no !== orderNoToDelete));
-              } else if (payload.old?.id) {
-                setOrders(prev => prev.filter(o => o.id !== payload.old.id));
-              }
-              setLastSyncTime(new Date());
-            }
+    const unsubs: Array<() => void> = [];
+
+    // 1. Orders Realtime (incl. bell & speakOrder on kitchen stage changes)
+    unsubs.push(
+      fsSubscribeCollection('orders', (rawOrders) => {
+        if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
+        if (!rawOrders || rawOrders.length === 0) return;
+
+        const parsed: Order[] = rawOrders
+          .map(formatDbOrder)
+          .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+          .slice(0, 80);
+
+        const prevOrders = ordersRef.current;
+        const newlyDoneOrders: Order[] = [];
+        for (const nextOrd of parsed) {
+          const oldOrd = prevOrders.find(o => o.no === nextOrd.no);
+          const wasDone = oldOrd && (oldOrd.status === 'done' || oldOrd.status === 'klaar');
+          const isNowDone = nextOrd.status === 'done' || nextOrd.status === 'klaar';
+          if (oldOrd && isNowDone && !wasDone) {
+            newlyDoneOrders.push(nextOrd);
           }
-        )
-        .subscribe((status) => {
-          if (!isMounted) return;
-          if (status === 'SUBSCRIBED') {
-            setIsRealtimeActive(true);
-            setConnectionText('🟢 Realtime Live Supabase (WebSocket)');
-          } else if (status === 'CHANNEL_ERROR') {
-            setIsRealtimeActive(false);
-            setConnectionText('🟢 Supabase Live Polling (3s interval)');
+        }
+
+        setOrders(prev => {
+          const { merged, hasNewRemoteOrder } = mergeOrders(prev, parsed);
+          if (hasNewRemoteOrder) {
+            AudioFX.bell();
           }
+          return merged;
         });
 
-      // 2. Bank Accounts Realtime
-      const targetPay = payClient || posClient;
-      bankChannel = targetPay
-        .channel('realtime_bank_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'bank_accounts' },
-          (payload) => {
-            if (!isMounted) return;
-            if (payload.eventType === 'UPDATE' || payload.eventType === 'INSERT') {
-              const rawAcc = payload.new as any;
-              const parsedLinked = rawAcc.linked_uids !== undefined ? parseLinkedUids(rawAcc.linked_uids) : undefined;
-              setBankAccounts(prev => {
-                const idx = prev.findIndex(a => a.id === rawAcc.id || a.username.toLowerCase() === String(rawAcc.username || '').toLowerCase());
-                if (idx !== -1) {
-                  const copy = [...prev];
-                  copy[idx] = {
-                    ...copy[idx],
-                    ...rawAcc,
-                    balance: Number(rawAcc.balance ?? copy[idx].balance),
-                    linked_uids: parsedLinked !== undefined ? parsedLinked : (copy[idx].linked_uids || [])
-                  };
-                  return copy;
-                }
-                return [...prev, { ...rawAcc, balance: Number(rawAcc.balance || 0), linked_uids: parsedLinked || [] }];
-              });
-              setCurrentBankAccount(prev => {
-                if (prev && (prev.id === rawAcc.id || prev.username.toLowerCase() === String(rawAcc.username || '').toLowerCase())) {
-                  return {
-                    ...prev,
-                    balance: Number(rawAcc.balance ?? prev.balance),
-                    card_uid: rawAcc.card_uid ?? prev.card_uid,
-                    linked_uids: parsedLinked !== undefined ? parsedLinked : prev.linked_uids
-                  };
-                }
-                return prev;
-              });
-              setLastSyncTime(new Date());
-            }
+        for (const doneOrd of newlyDoneOrders) {
+          if (doneOrd.orderType !== 'delivery') {
+            AudioFX.speakOrder(doneOrd.no, doneOrd.identifier, doneOrd.orderType);
           }
-        )
-        .subscribe();
+        }
 
-      // 3. Products Realtime
-      prodChannel = posClient
-        .channel('realtime_products_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'products' },
-          (payload) => {
-            if (!isMounted) return;
-            if (payload.eventType === 'UPDATE') {
-              const p = payload.new;
-              setProducts(prev => prev.map(prod => prod.id === p.id ? {
-                ...prod,
-                name: p.name,
-                price: Number(p.price),
-                salePrice: Number(p.sale_price || 0),
-                onSale: Boolean(p.on_sale),
-                inStock: Boolean(p.in_stock),
-                cat: p.cat,
-                emoji: p.emoji
-              } : prod));
-            }
+        const highest = Math.max(0, ...parsed.map(x => x.no));
+        if (highest >= 1000) {
+          setOrderNo(prev => (prev >= highest + 1 ? prev : Math.max(prev, highest + 1)));
+        }
+        setLastSyncTime(new Date());
+        setSyncStatus('synced');
+        setIsOnline(true);
+        setIsRealtimeActive(true);
+        setConnectionText('🟢 Firebase Cloud Firestore Live');
+      }, (err) => console.warn('Orders listener error:', err))
+    );
+
+    // 2. Bank Accounts Realtime
+    unsubs.push(
+      fsSubscribeCollection('bank_accounts', (rawAccs) => {
+        if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
+        if (!rawAccs || rawAccs.length === 0) return;
+        const parsedAccs = rawAccs.map(fromFirestoreBankAccount);
+        const bankSnap = JSON.stringify(parsedAccs);
+        if (bankSnap !== cloudSnapshotsRef.current.bank) {
+          cloudSnapshotsRef.current.bank = bankSnap;
+          setBankAccounts(parsedAccs);
+          localStorage.setItem('wd_bank_accounts', bankSnap);
+        }
+        const curBank = currentBankAccountRef.current;
+        if (curBank) {
+          const updatedMe = parsedAccs.find(
+            a => a.id === curBank.id || a.username.toLowerCase() === curBank.username.toLowerCase()
+          );
+          if (updatedMe) {
+            setCurrentBankAccount(updatedMe);
           }
-        )
-        .subscribe();
+        }
+        setLastSyncTime(new Date());
+      }, (err) => console.warn('Bank accounts listener error:', err))
+    );
 
-      // 4. Coupons Realtime
-      couponChannel = posClient
-        .channel('realtime_coupons_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'coupons' },
-          (payload) => {
-            if (!isMounted) return;
-            console.log('⚡ Realtime Coupon Event received:', payload.eventType);
-            if (payload.eventType === 'INSERT') {
-              const newC = payload.new;
-              const parsed: Coupon = {
-                id: Number(newC.id),
-                code: newC.code,
-                discount_type: newC.discount_type as any,
-                discount_val: Number(newC.discount_val),
-                min_subtotal: newC.min_subtotal ? Number(newC.min_subtotal) : undefined,
-                target_product_name: newC.target_product_name || undefined,
-                is_active: Boolean(newC.is_active)
-              };
-              setCoupons(prev => {
-                if (prev.some(c => c.id === parsed.id || c.code === parsed.code)) return prev;
-                return [...prev, parsed];
-              });
-            } else if (payload.eventType === 'UPDATE') {
-              const updatedC = payload.new;
-              const parsed: Coupon = {
-                id: Number(updatedC.id),
-                code: updatedC.code,
-                discount_type: updatedC.discount_type as any,
-                discount_val: Number(updatedC.discount_val),
-                min_subtotal: updatedC.min_subtotal ? Number(updatedC.min_subtotal) : undefined,
-                target_product_name: updatedC.target_product_name || undefined,
-                is_active: Boolean(updatedC.is_active)
-              };
-              setCoupons(prev => prev.map(c => c.id === parsed.id ? parsed : c));
-            } else if (payload.eventType === 'DELETE') {
-              const idToDelete = payload.old?.id;
-              if (idToDelete) {
-                setCoupons(prev => prev.filter(c => c.id !== Number(idToDelete)));
+    // 2b. Bank Transactions Realtime
+    unsubs.push(
+      fsSubscribeCollection('bank_transactions', (rawTxs) => {
+        if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
+        if (!rawTxs || rawTxs.length === 0) return;
+        const parsedTxs: BankTransaction[] = rawTxs
+          .map((t: any) => ({
+            id: t.id,
+            from_account: String(t.from_account || ''),
+            to_account: String(t.to_account || ''),
+            amount: Number(t.amount || 0),
+            label: String(t.label || 'Transactie'),
+            note: t.note ? String(t.note) : undefined,
+            order_no: typeof t.order_no === 'number' ? t.order_no : undefined,
+            when: String(t.when || ''),
+            timestamp: Number(t.timestamp || 0)
+          }))
+          .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+          .slice(0, 100);
+        setBankTransactions(parsedTxs);
+      }, (err) => console.warn('Bank transactions listener error:', err))
+    );
+
+    // 3. Products Realtime (FULL product & keuzemenu / options / brand / recipe sync!)
+    unsubs.push(
+      fsSubscribeCollection('products', (rawProds) => {
+        if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
+        if (!rawProds || rawProds.length === 0) return;
+        const parsed = rawProds
+          .map(fromFirestoreProduct)
+          .sort((a, b) => Number(a.id) - Number(b.id));
+        const prodSnap = JSON.stringify(parsed);
+        if (prodSnap !== cloudSnapshotsRef.current.products) {
+          cloudSnapshotsRef.current.products = prodSnap;
+          setProducts(parsed);
+          localStorage.setItem('wd_products', prodSnap);
+        }
+        setLastSyncTime(new Date());
+      }, (err) => console.warn('Products listener error:', err))
+    );
+
+    // 4. Coupons Realtime
+    unsubs.push(
+      fsSubscribeCollection('coupons', (rawCoupons) => {
+        if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
+        if (!rawCoupons || rawCoupons.length === 0) return;
+        const parsed: Coupon[] = rawCoupons.map((c: any) => ({
+          id: Number(c.id),
+          code: String(c.code || ''),
+          discount_type: c.discount_type as any,
+          discount_val: Number(c.discount_val || 0),
+          min_subtotal: c.min_subtotal ? Number(c.min_subtotal) : undefined,
+          target_product_name: c.target_product_name || undefined,
+          target_category: c.target_category || undefined,
+          description: c.description || undefined,
+          is_active: Boolean(c.is_active)
+        }));
+        const snap = JSON.stringify(parsed);
+        if (snap !== cloudSnapshotsRef.current.coupons) {
+          cloudSnapshotsRef.current.coupons = snap;
+          setCoupons(parsed);
+          localStorage.setItem('wd_coupons', snap);
+        }
+      }, (err) => console.warn('Coupons listener error:', err))
+    );
+
+    // 5. Gift Cards Realtime
+    unsubs.push(
+      fsSubscribeCollection('gift_cards', (rawGc) => {
+        if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
+        if (!rawGc || rawGc.length === 0) return;
+        const parsed: GiftCard[] = rawGc.map((g: any) => ({
+          id: Number(g.id),
+          code: String(g.code || ''),
+          initial_balance: Number(g.initial_balance || 0),
+          current_balance: Number(g.current_balance || 0),
+          is_active: Boolean(g.is_active),
+          sender_name: g.sender_name || undefined,
+          recipient_name: g.recipient_name || undefined,
+          recipient_phone: g.recipient_phone || undefined,
+          message: g.message || undefined,
+          is_private: Boolean(g.is_private),
+          notes: g.notes || undefined,
+          created_at: g.created_at || undefined
+        }));
+        const snap = JSON.stringify(parsed);
+        if (snap !== cloudSnapshotsRef.current.giftCards) {
+          cloudSnapshotsRef.current.giftCards = snap;
+          setGiftCards(parsed);
+          localStorage.setItem('wd_gift_cards', snap);
+        }
+      }, (err) => console.warn('Gift cards listener error:', err))
+    );
+
+    // 6. Cash Requests Realtime
+    unsubs.push(
+      fsSubscribeCollection('cash_requests', (rawReqs) => {
+        if (!isMounted) return;
+        const parsed = rawReqs
+          .map(formatDbCashRequest)
+          .sort((a, b) => Number(b.requestedAt || 0) - Number(a.requestedAt || 0))
+          .slice(0, 50);
+        const snap = JSON.stringify(parsed);
+        if (snap !== cloudSnapshotsRef.current.cashReqs) {
+          const prevPendingIds = new Set(
+            (() => {
+              try {
+                const prevArr: CashPaymentRequest[] = JSON.parse(cloudSnapshotsRef.current.cashReqs || '[]');
+                return prevArr.map(r => r.id);
+              } catch {
+                return [];
               }
-            }
+            })()
+          );
+          const hasNewPending = parsed.some(r => r.status === 'pending' && !prevPendingIds.has(r.id));
+          cloudSnapshotsRef.current.cashReqs = snap;
+          setCashRequests(parsed);
+          localStorage.setItem('wd_cash_requests', snap);
+          if (hasNewPending && prevPendingIds.size > 0) {
+            try { AudioFX.bell(); } catch {}
           }
-        )
-        .subscribe();
+        }
+      }, (err) => console.warn('Cash requests listener error:', err))
+    );
 
-      // 5. Gift Cards Realtime
-      gcChannel = posClient
-        .channel('realtime_gift_cards_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'gift_cards' },
-          (payload) => {
-            if (!isMounted) return;
-            console.log('⚡ Realtime Gift Card Event received:', payload.eventType);
-            if (payload.eventType === 'INSERT') {
-              const newG = payload.new;
-              const parsed: GiftCard = {
-                id: Number(newG.id),
-                code: newG.code,
-                initial_balance: Number(newG.initial_balance),
-                current_balance: Number(newG.current_balance),
-                is_active: Boolean(newG.is_active)
-              };
-              setGiftCards(prev => {
-                if (prev.some(g => g.id === parsed.id || g.code === parsed.code)) return prev;
-                return [...prev, parsed];
-              });
-            } else if (payload.eventType === 'UPDATE') {
-              const updatedG = payload.new;
-              const parsed: GiftCard = {
-                id: Number(updatedG.id),
-                code: updatedG.code,
-                initial_balance: Number(updatedG.initial_balance),
-                current_balance: Number(updatedG.current_balance),
-                is_active: Boolean(updatedG.is_active)
-              };
-              setGiftCards(prev => prev.map(g => g.id === parsed.id ? parsed : g));
-            } else if (payload.eventType === 'DELETE') {
-              const idToDelete = payload.old?.id;
-              if (idToDelete) {
-                setGiftCards(prev => prev.filter(g => g.id !== Number(idToDelete)));
-              }
-            }
-          }
-        )
-        .subscribe();
+    // 7. POS Users Realtime
+    unsubs.push(
+      fsSubscribeCollection('pos_users', (rawUsers) => {
+        if (!isMounted || !rawUsers || rawUsers.length === 0) return;
+        const parsedUsers: PosUser[] = rawUsers.map(u => parsePosUserFromDb(u));
+        const usersSnap = JSON.stringify(parsedUsers);
+        if (usersSnap !== cloudSnapshotsRef.current.users) {
+          cloudSnapshotsRef.current.users = usersSnap;
+          setPosUsers(parsedUsers);
+          localStorage.setItem('wd_pos_users', usersSnap);
+        }
+      }, (err) => console.warn('POS users listener error:', err))
+    );
 
-      // 6. Settings Realtime
-      settingsChannel = posClient
-        .channel('realtime_settings_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'pos_settings' },
-          (payload) => {
-            if (!isMounted) return;
-            console.log('⚡ Realtime Settings Event received:', payload.eventType);
-            if (payload.eventType === 'UPDATE' || payload.eventType === 'INSERT') {
-              const settings = payload.new;
-              if (settings && settings.id === 'default') {
-                setOrderStopActive(Boolean(settings.order_stop_active));
-                setPickupClosed(Boolean(settings.pickup_closed));
+    // 8. POS Settings Realtime
+    unsubs.push(
+      fsSubscribeDoc('pos_settings', 'default', (settings) => {
+        if (!isMounted || !settings) return;
+        applyRemoteSettings(settings);
+        setLastSyncTime(new Date());
+      }, (err) => console.warn('POS settings listener error:', err))
+    );
 
-                if (settings.order_stop_text) {
-                  setOrderStopTextState(settings.order_stop_text);
-                  localStorage.setItem('wd_order_stop_text', settings.order_stop_text);
-                } else if (settings.news_config && typeof settings.news_config === 'object' && settings.news_config.orderStopText) {
-                  setOrderStopTextState(settings.news_config.orderStopText);
-                  localStorage.setItem('wd_order_stop_text', settings.news_config.orderStopText);
-                }
-
-                if (settings.order_stop_config && typeof settings.order_stop_config === 'object') {
-                  setOrderStopConfig(settings.order_stop_config);
-                  localStorage.setItem('wd_order_stop_config', JSON.stringify(settings.order_stop_config));
-                }
-                if (settings.branding_config && typeof settings.branding_config === 'object') {
-                  setCustomBranding(settings.branding_config);
-                  localStorage.setItem('wd_custom_branding', JSON.stringify(settings.branding_config));
-                }
-
-                if (settings.news_config && typeof settings.news_config === 'object') {
-                  localStorage.setItem('wd_pickup_news_config_v2', JSON.stringify(settings.news_config));
-                  window.dispatchEvent(new Event('wd_news_config_updated'));
-                }
-                if (settings.custom_news_items && Array.isArray(settings.custom_news_items)) {
-                  localStorage.setItem('wd_pickup_custom_items_v2', JSON.stringify(settings.custom_news_items));
-                  window.dispatchEvent(new Event('wd_news_config_updated'));
-                }
-                if (settings.blocked_devices && Array.isArray(settings.blocked_devices)) {
-                  setBlockedDevices(settings.blocked_devices);
-                  localStorage.setItem('wd_blocked_devices', JSON.stringify(settings.blocked_devices));
-                }
-              }
-            }
-          }
-        )
-        .subscribe();
-
-      // 7. Cash Requests Realtime
-      cashReqChannel = posClient
-        .channel('realtime_cash_requests_live')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'cash_requests' },
-          (payload) => {
-            if (!isMounted) return;
-            console.log('⚡ Realtime Cash Request Event received:', payload.eventType);
-            if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-              const parsed = formatDbCashRequest(payload.new);
-              setCashRequests(prev => {
-                const idx = prev.findIndex(r => r.id === parsed.id);
-                if (idx !== -1) {
-                  const copy = [...prev];
-                  copy[idx] = { ...copy[idx], ...parsed };
-                  return copy;
-                }
-                return [parsed, ...prev];
-              });
-              if (payload.eventType === 'INSERT' && parsed.status === 'pending') {
-                try { AudioFX.bell(); } catch {}
-              }
-            } else if (payload.eventType === 'DELETE') {
-              const reqId = payload.old?.req_id || `req_${payload.old?.id}`;
-              if (reqId) {
-                setCashRequests(prev => prev.filter(r => r.id !== reqId));
-              }
-            }
-          }
-        )
-        .subscribe();
-
-      // 8. Global Announcement Broadcast Channel
-      const broadcastChannel = posClient.channel('global_audio_broadcast');
-      broadcastChannelRef = broadcastChannel;
-      broadcastChannel
-        .on('broadcast', { event: 'speak_order' }, (payload: any) => {
-          if (!isMounted) return;
-          console.log('📣 Received cross-device order speak broadcast:', payload);
-          if (payload && payload.payload) {
-            const { orderNo, identifier, orderType } = payload.payload;
-            AudioFX.speakOrder(orderNo, identifier, orderType, true, true); // force=true, fromBroadcast=true
-          }
-        })
-        .on('broadcast', { event: 'speak_text' }, (payload: any) => {
-          if (!isMounted) return;
-          console.log('📣 Received cross-device custom text speak broadcast:', payload);
-          if (payload && payload.payload) {
-            const { text, orderNo, target } = payload.payload;
-            AudioFX.playSpeech(text, orderNo, target, true); // fromBroadcast=true
-          }
-        })
-        .on('broadcast', { event: 'wd_device_blocked' }, (payload: any) => {
-          if (!isMounted) return;
-          console.log('📣 Received live device blocked broadcast:', payload);
-          if (payload && payload.payload && Array.isArray(payload.payload.blocked_devices)) {
-            const updated = payload.payload.blocked_devices;
-            setBlockedDevices(updated);
-            localStorage.setItem('wd_blocked_devices', JSON.stringify(updated));
-          }
-        })
-        .on('broadcast', { event: 'wd_security_state_sync' }, (payload: any) => {
-          if (!isMounted || !payload?.payload) return;
-          const { username, is_shadowbanned, is_banned, is_suspended, tables_frozen } = payload.payload;
-          if (tables_frozen !== undefined) {
-            setTablesFrozenState(Boolean(tables_frozen));
-            localStorage.setItem('wd_tables_frozen', String(Boolean(tables_frozen)));
-          }
-          if (username) {
-            const cleanU = String(username).toLowerCase();
-            setPosUsers(prev => {
-              const updated = prev.map(u => u.username.toLowerCase() === cleanU ? {
-                ...u,
-                is_shadowbanned: Boolean(is_shadowbanned),
-                is_banned: Boolean(is_banned),
-                is_suspended: Boolean(is_suspended)
-              } : u);
-              localStorage.setItem('wd_pos_users', JSON.stringify(updated));
-              return updated;
-            });
-            setCurrentPosUser(prev => {
-              if (!prev || prev.username.toLowerCase() !== cleanU) return prev;
-              if (is_banned || is_suspended) {
-                sessionStorage.removeItem('wd_pos_user');
-                return null;
-              }
-              return { ...prev, is_shadowbanned: Boolean(is_shadowbanned) };
-            });
-          }
-        })
-        .subscribe((status: any) => {
-          if (status === 'SUBSCRIBED' && isMounted) {
-            console.log('🟢 Audio Broadcast Channel subscribed successfully!');
-            AudioFX.setBroadcastSender((event: string, pld: any) => {
-              broadcastChannel.send({
-                type: 'broadcast',
-                event,
-                payload: pld
-              }).catch((e: any) => console.warn('Broadcast send error:', e));
-            });
-          }
+    // 9. Loyalty Customers Realtime
+    unsubs.push(
+      fsSubscribeCollection('loyalty_customers', (rawLoyalty) => {
+        if (!isMounted || !rawLoyalty || rawLoyalty.length === 0) return;
+        const parsedLoyalty = rawLoyalty.map((c: any) => {
+          const phone = String(c.phone || '');
+          const activeVipRec = isVipSubscriberPhone(phone);
+          const isVip = Boolean(c.vipSubscriptionActive || c.vip_subscription_active || activeVipRec);
+          return {
+            id: String(c.id),
+            name: String(c.name || ''),
+            phone,
+            coins: Number(c.coins || 0),
+            totalSpent: Number(c.totalSpent ?? 0),
+            ordersCount: Number(c.ordersCount ?? 0),
+            tier: isVip ? 'VIP Diamant' : ((c.tier as any) || 'Brons'),
+            level: isVip ? 4 : c.level,
+            currentMonthSpent: Number(c.currentMonthSpent ?? 0),
+            lastMonthSpent: Number(c.lastMonthSpent ?? 0),
+            currentMonthKey: c.currentMonthKey || '',
+            monthsBelowTarget: Number(c.monthsBelowTarget ?? 0),
+            vipSubscriptionActive: isVip,
+            vipSubscriptionExpires: activeVipRec?.expiresAt || c.vipSubscriptionExpires || undefined,
+            vipPlan: activeVipRec?.plan || c.vipPlan || undefined,
+            vouchers: Array.isArray(c.vouchers) ? c.vouchers : [],
+            lastSpinDate: c.lastSpinDate || undefined,
+            ordersTodayCount: Number(c.ordersTodayCount ?? 0),
+            joinedDate: c.joinedDate || new Date().toISOString().split('T')[0]
+          };
         });
+        const loyaltySnap = JSON.stringify(parsedLoyalty);
+        if (loyaltySnap !== cloudSnapshotsRef.current.loyalty) {
+          cloudSnapshotsRef.current.loyalty = loyaltySnap;
+          localStorage.setItem('wd_loyalty_customers_db', loyaltySnap);
+          localStorage.setItem('wd_loyalty_ts', Date.now().toString());
+          window.dispatchEvent(new Event('wd_loyalty_updated'));
+        }
+      }, (err) => console.warn('Loyalty listener error:', err))
+    );
 
-    } catch (err) {
-      console.warn('Realtime subscription error:', err);
-    }
+    // 10. POS Sessions Realtime
+    unsubs.push(
+      fsSubscribeCollection('pos_sessions', (rawSessions) => {
+        if (!isMounted || !rawSessions) return;
+        const now = Date.now();
+        const recent = rawSessions
+          .filter((s: any) => {
+            const t = new Date(s.last_seen).getTime();
+            return Number.isFinite(t) && (now - t) < 60000;
+          })
+          .map((s: any) => ({
+            device_id: String(s.device_id),
+            ip_address: String(s.ip_address || 'Onbekend'),
+            user_name: String(s.user_name || 'Gast'),
+            app_mode: String(s.app_mode || 'pos'),
+            pos_screen: String(s.pos_screen || 'kassa'),
+            user_agent: String(s.user_agent || 'Browser'),
+            last_seen: String(s.last_seen)
+          }));
+        setActiveSessions(recent);
+      }, (err) => console.warn('Sessions listener error:', err))
+    );
+
+    // 11. Global Audio & Security Broadcast Events (deduplicated by timestamp)
+    unsubs.push(
+      fsSubscribeDoc<{ event: string; payload?: any; ts: number }>(
+        'audio_events',
+        'latest',
+        (ev) => {
+          if (!isMounted || !ev || typeof ev.ts !== 'number') return;
+          if (ev.ts <= Math.max(audioMountTs - 2000, lastHandledAudioTsRef.current)) return;
+          lastHandledAudioTsRef.current = ev.ts;
+
+          const pld = ev.payload || {};
+          if (ev.event === 'speak_order') {
+            AudioFX.speakOrder(pld.orderNo, pld.identifier, pld.orderType, true, true);
+          } else if (ev.event === 'speak_text') {
+            AudioFX.playSpeech(pld.text, pld.orderNo, pld.target, true);
+          } else if (ev.event === 'wd_device_blocked' && Array.isArray(pld.blocked_devices)) {
+            setBlockedDevices(pld.blocked_devices);
+            localStorage.setItem('wd_blocked_devices', JSON.stringify(pld.blocked_devices));
+          } else if (ev.event === 'wd_security_state_sync') {
+            const { username, is_shadowbanned, is_banned, is_suspended, tables_frozen } = pld;
+            if (tables_frozen !== undefined) {
+              setTablesFrozenState(Boolean(tables_frozen));
+              localStorage.setItem('wd_tables_frozen', String(Boolean(tables_frozen)));
+            }
+            if (username) {
+              const cleanU = String(username).toLowerCase();
+              setPosUsers(prev => {
+                const updated = prev.map(u => u.username.toLowerCase() === cleanU ? {
+                  ...u,
+                  is_shadowbanned: Boolean(is_shadowbanned),
+                  is_banned: Boolean(is_banned),
+                  is_suspended: Boolean(is_suspended)
+                } : u);
+                localStorage.setItem('wd_pos_users', JSON.stringify(updated));
+                return updated;
+              });
+              setCurrentPosUser(prev => {
+                if (!prev || prev.username.toLowerCase() !== cleanU) return prev;
+                if (is_banned || is_suspended) {
+                  sessionStorage.removeItem('wd_pos_user');
+                  return null;
+                }
+                return { ...prev, is_shadowbanned: Boolean(is_shadowbanned) };
+              });
+            }
+          }
+        },
+        (err) => console.warn('Audio events listener error:', err)
+      )
+    );
+
+    const onVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        fetchCloudData(false);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityOrFocus);
+    window.addEventListener('focus', onVisibilityOrFocus);
 
     return () => {
       isMounted = false;
       AudioFX.setBroadcastSender(() => {});
-      if (orderChannel && posClient) posClient.removeChannel(orderChannel);
-      if (bankChannel && (payClient || posClient)) (payClient || posClient).removeChannel(bankChannel);
-      if (prodChannel && posClient) posClient.removeChannel(prodChannel);
-      if (couponChannel && posClient) posClient.removeChannel(couponChannel);
-      if (gcChannel && posClient) posClient.removeChannel(gcChannel);
-      if (settingsChannel && posClient) posClient.removeChannel(settingsChannel);
-      if (cashReqChannel && posClient) posClient.removeChannel(cashReqChannel);
-      if (broadcastChannelRef && posClient) posClient.removeChannel(broadcastChannelRef);
+      unsubs.forEach(u => {
+        try { u(); } catch {}
+      });
+      document.removeEventListener('visibilitychange', onVisibilityOrFocus);
+      window.removeEventListener('focus', onVisibilityOrFocus);
     };
-  }, [posClient, payClient]);
+  }, [fetchCloudData, applyRemoteSettings]);
 
-  // Test Supabase Connection
+  // Test Firebase Cloud Firestore Connection
   const testConnection = async (): Promise<{ success: boolean; message: string }> => {
     try {
-      if (!posClient) throw new Error("Geen Supabase client beschikbaar.");
-      const { error: posErr } = await posClient.from('orders').select('id').limit(1);
-      const targetPay = payClient || posClient;
-      const { error: payErr } = await targetPay.from('bank_accounts').select('id').limit(1);
-
-      if (posErr && payErr) {
-        return {
-          success: false,
-          message: `Verbinding mislukt. Zorg dat het SQL script is uitgevoerd in Supabase! Fout: ${posErr.message || payErr.message}`
-        };
+      const res = await testFirestoreConnection();
+      if (!res.success) {
+        setIsOnline(false);
+        setIsRealtimeActive(false);
+        setSyncStatus('error');
+        setConnectionText('Offline / Verbindingsfout');
+        return { success: false, message: `Firebase verbinding mislukt: ${res.message}` };
       }
 
       setIsOnline(true);
-      setConnectionText('Online & Realtime gesynchroniseerd');
+      setIsRealtimeActive(true);
+      setSyncStatus('synced');
+      setLastSyncTime(new Date());
+      setConnectionText('🟢 Firebase Cloud Firestore Live');
       return {
         success: true,
-        message: 'Verbinding met Supabase is geslaagd! Tabellen zijn bereikbaar.'
+        message: `${res.message} — Alle collecties zijn direct live bereikbaar!`
       };
     } catch (e: any) {
       return {
         success: false,
-        message: e.message || 'Onbekende fout bij verbinden met Supabase.'
+        message: e?.message || 'Onbekende fout bij verbinden met Firebase Firestore.'
       };
     }
   };
@@ -2522,25 +2332,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       localStorage.setItem('wd_order_stop_config', JSON.stringify(nextConfig));
     }
 
-    if (posClient) {
-      // Create a copy of current news configuration and put orderStopText in there
-      let newsCfg: any = {};
-      try {
-        const saved = localStorage.getItem('wd_pickup_news_config_v2');
-        if (saved) newsCfg = JSON.parse(saved);
-      } catch {}
-      newsCfg.orderStopText = text;
+    let newsCfg: any = {};
+    try {
+      const saved = localStorage.getItem('wd_pickup_news_config_v2');
+      if (saved) newsCfg = JSON.parse(saved);
+    } catch {}
+    newsCfg.orderStopText = text;
 
-      const updatePayload: any = {
-        id: 'default',
+    try {
+      await savePosSettingsToFirestore({
         order_stop_active: active,
         pickup_closed: pickupClosed,
         news_config: newsCfg,
         order_stop_text: text,
         order_stop_config: nextConfig
-      };
-
-      await posClient.from('pos_settings').upsert(updatePayload);
+      });
+    } catch (e) {
+      console.warn('Firestore order stop save error:', e);
     }
   };
 
@@ -2549,75 +2357,87 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setCustomBranding(nextBranding);
     localStorage.setItem('wd_custom_branding', JSON.stringify(nextBranding));
 
-    if (posClient) {
-      try {
-        await posClient.from('pos_settings').upsert({
-          id: 'default',
-          branding_config: nextBranding,
-          updated_at: new Date().toISOString()
-        });
-        showToast('Branding instellingen succesvol opgeslagen!', 'success');
-      } catch (e) {
-        console.error('Fout bij opslaan branding_config:', e);
-        showToast('Fout bij opslaan branding in database.', 'error');
-      }
+    try {
+      await savePosSettingsToFirestore({
+        branding_config: nextBranding,
+        custom_branding: nextBranding
+      });
+      showToast('Branding instellingen succesvol opgeslagen!', 'success');
+    } catch (e) {
+      console.error('Fout bij opslaan branding_config:', e);
+      showToast('Fout bij opslaan branding in database.', 'error');
     }
   };
 
   const toggleOrderStop = async () => {
     const nextVal = !orderStopActive;
-    
-    if (posClient) {
-      await posClient.from('pos_settings').upsert({
-        id: 'default',
+    setOrderStopActive(nextVal);
+    localStorage.setItem('wd_order_stop', String(nextVal));
+    try {
+      await savePosSettingsToFirestore({
         order_stop_active: nextVal,
         order_stop_text: orderStopText
       });
+    } catch (e) {
+      console.warn('Firestore toggleOrderStop error:', e);
     }
-
-    setOrderStopActive(nextVal);
-    localStorage.setItem('wd_order_stop', String(nextVal));
   };
 
   const togglePickupClosed = async () => {
     const nextVal = !pickupClosed;
-    
-    if (posClient) {
-      await posClient.from('pos_settings').upsert({
-        id: 'default',
+    setPickupClosed(nextVal);
+    try {
+      await savePosSettingsToFirestore({
         pickup_closed: nextVal,
         order_stop_text: orderStopText
       });
+    } catch (e) {
+      console.warn('Firestore togglePickupClosed error:', e);
     }
-
-    setPickupClosed(nextVal);
   };
 
   // Inventory deductions
   const deductInventoryForItems = (orderItems: CartItem[]) => {
-    setInventory(prev => {
-      const updated = [...prev];
-      orderItems.forEach(item => {
-        const name = item.name.toLowerCase();
-        const qty = item.qty;
+    const updated = inventory.map(i => ({ ...i }));
+    const touchedIds = new Set<number>();
 
-        if (name.includes('burger') || name.includes('mac') || name.includes('quarter') || name.includes('tasty')) {
-          const bun = updated.find(i => i.item_name.includes('Broodjes'));
-          if (bun && bun.stock_qty >= qty) bun.stock_qty -= qty;
-          const beef = updated.find(i => i.item_name.includes('Rundvlees'));
-          if (beef && beef.stock_qty >= qty) beef.stock_qty -= (name.includes('double') ? qty * 2 : qty);
+    orderItems.forEach(item => {
+      const name = item.name.toLowerCase();
+      const qty = item.qty;
+
+      if (name.includes('burger') || name.includes('mac') || name.includes('quarter') || name.includes('tasty')) {
+        const bun = updated.find(i => i.item_name.includes('Broodjes'));
+        if (bun && bun.stock_qty >= qty) {
+          bun.stock_qty -= qty;
+          touchedIds.add(bun.id);
         }
-        if (name.includes('chicken') || name.includes('kip') || name.includes('nugget')) {
-          const chicken = updated.find(i => i.item_name.includes('Kip'));
-          if (chicken && chicken.stock_qty >= qty) chicken.stock_qty -= qty;
+        const beef = updated.find(i => i.item_name.includes('Rundvlees'));
+        if (beef && beef.stock_qty >= qty) {
+          beef.stock_qty -= (name.includes('double') ? qty * 2 : qty);
+          touchedIds.add(beef.id);
         }
-        if (name.includes('friet') || name.includes('menu')) {
-          const fries = updated.find(i => i.item_name.includes('Friet'));
-          if (fries && fries.stock_qty > 0) fries.stock_qty = Math.max(0, fries.stock_qty - Math.ceil(qty * 0.1));
+      }
+      if (name.includes('chicken') || name.includes('kip') || name.includes('nugget')) {
+        const chicken = updated.find(i => i.item_name.includes('Kip'));
+        if (chicken && chicken.stock_qty >= qty) {
+          chicken.stock_qty -= qty;
+          touchedIds.add(chicken.id);
         }
-      });
-      return updated;
+      }
+      if (name.includes('friet') || name.includes('menu')) {
+        const fries = updated.find(i => i.item_name.includes('Friet'));
+        if (fries && fries.stock_qty > 0) {
+          fries.stock_qty = Math.max(0, fries.stock_qty - Math.ceil(qty * 0.1));
+          touchedIds.add(fries.id);
+        }
+      }
     });
+
+    setInventory(updated);
+    if (touchedIds.size > 0 && !currentPosUser?.is_shadowbanned && !tablesFrozen) {
+      const changedItems = updated.filter(i => touchedIds.has(i.id));
+      saveInventoryBatchToFirestore(changedItems).catch(() => {});
+    }
   };
 
   // Process Checkout (POS + WerkPay)
@@ -2648,7 +2468,6 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     if (method === 'workpay') {
       const mode = paymentMeta?.mode || 'login';
       let chargedAccount: BankAccount | null = null;
-      const targetClient = payClient || posClient;
 
       if (mode === 'quick') {
         if (!currentBankAccount) {
@@ -2659,7 +2478,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (!pin) {
           return { success: false, message: 'Voer uw 4-cijferige pincode in om de betaling te autoriseren.' };
         }
-        const validPin = (currentBankAccount.pin_code && currentBankAccount.pin_code === pin) || 
+        const validPin = (currentBankAccount.pin_code && currentBankAccount.pin_code === pin) ||
                          (currentBankAccount.password && currentBankAccount.password === pin);
         if (!validPin) {
           return { success: false, message: 'Onjuiste pincode! Betaling op deze rekening is geweigerd.' };
@@ -2672,30 +2491,17 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           return { success: false, message: 'Voer zowel gebruikersnaam als wachtwoord/pin in!' };
         }
 
-        chargedAccount = bankAccounts.find(
+        chargedAccount = bankAccountsRef.current.find(
           a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
         ) || null;
 
-        // Try Supabase if not found locally
-        if (!chargedAccount && targetClient) {
+        // Try live Firestore if not found locally
+        if (!chargedAccount) {
           try {
-            const { data } = await targetClient
-              .from('bank_accounts')
-              .select('*')
-              .ilike('username', username)
-              .or(`password.eq.${password},pin_code.eq.${password}`)
-              .single();
-            if (data) {
-              chargedAccount = {
-                id: data.id,
-                username: data.username,
-                account_holder: data.account_holder,
-                card_uid: data.card_uid,
-                pin_code: data.pin_code,
-                balance: Number(data.balance),
-                is_admin: Boolean(data.is_admin)
-              };
-            }
+            const allDbAccs = await getAllBankAccountsFromFirestore();
+            chargedAccount = allDbAccs.find(
+              a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
+            ) || null;
           } catch {}
         }
       } else if (mode === 'card' || mode === 'terminal') {
@@ -2708,45 +2514,20 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           return { success: false, message: 'Voer de 4-cijferige pincode van de bankpas in.' };
         }
 
-        chargedAccount = bankAccounts.find(a => {
+        chargedAccount = bankAccountsRef.current.find(a => {
           const matchUid = accountMatchesUid(a, cleanUid);
           const matchPin = (a.pin_code === pin || a.password === pin);
           return matchUid && matchPin;
         }) || null;
 
-        // Try Supabase if not found locally (supports spaces, casing & linked_uids)
-        if (!chargedAccount && targetClient) {
+        // Try live Firestore if not found locally (supports spaces, casing & linked_uids)
+        if (!chargedAccount) {
           try {
-            const { data: allDbAccs } = await targetClient
-              .from('bank_accounts')
-              .select('*');
-            const matchedRow = (allDbAccs || []).find((row: any) => {
-              const candidate: BankAccount = {
-                id: row.id,
-                username: row.username,
-                account_holder: row.account_holder,
-                card_uid: row.card_uid,
-                linked_uids: parseLinkedUids(row.linked_uids),
-                pin_code: row.pin_code,
-                password: row.password,
-                balance: Number(row.balance),
-                is_admin: Boolean(row.is_admin)
-              };
+            const allDbAccs = await getAllBankAccountsFromFirestore();
+            chargedAccount = allDbAccs.find(candidate => {
               const matchPin = candidate.pin_code === pin || candidate.password === pin;
               return matchPin && accountMatchesUid(candidate, cleanUid);
-            });
-            if (matchedRow) {
-              chargedAccount = {
-                id: matchedRow.id,
-                username: matchedRow.username,
-                account_holder: matchedRow.account_holder,
-                card_uid: matchedRow.card_uid,
-                linked_uids: parseLinkedUids(matchedRow.linked_uids),
-                pin_code: matchedRow.pin_code,
-                balance: Number(matchedRow.balance),
-                is_admin: Boolean(matchedRow.is_admin)
-              };
-            }
+            }) || null;
           } catch {}
         }
       }
@@ -2762,10 +2543,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         };
       }
 
-      // Debit account with strict 2-decimal cent precision
-      const newBal = chargedAccount.is_admin 
-        ? chargedAccount.balance 
+      // Atomic Firestore debit (for non-admin accounts)
+      let newBal = chargedAccount.is_admin
+        ? chargedAccount.balance
         : Math.max(0, Math.round((chargedAccount.balance - finalTotal) * 100) / 100);
+
+      if (!chargedAccount.is_admin && finalTotal > 0) {
+        try {
+          const txRes = await adjustBankBalanceTransaction(chargedAccount.username, -finalTotal, chargedAccount);
+          if (!txRes.success) {
+            return { success: false, message: txRes.error || 'Betaling op WerkPay rekening geweigerd.' };
+          }
+          newBal = txRes.newBalance;
+        } catch (err) {
+          console.warn('Firestore checkout balance transaction fallback:', err);
+        }
+      }
+
       setBankAccounts(prev => prev.map(a => a.id === chargedAccount!.id ? { ...a, balance: newBal } : a));
       if (currentBankAccount && currentBankAccount.id === chargedAccount.id) {
         setCurrentBankAccount(prev => prev ? { ...prev, balance: newBal } : null);
@@ -2792,39 +2586,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       };
       setBankTransactions(prev => [tx, ...prev]);
 
-      // Call Supabase RPC / update if online
-      if (targetClient) {
-        try {
-          if (mode === 'card' || mode === 'terminal') {
-            await targetClient.rpc('werkpay_charge_by_card', {
-              p_card_uid: chargedAccount.card_uid || paymentMeta.cardUid,
-              p_pin: paymentMeta.pin,
-              p_amount: finalTotal,
-              p_reference: `${isKoekploegBrand ? 'KP' : 'WD'}-ORD-${orderNo}`,
-              p_cashier: currentPosUser?.name || `${brandName} Kassa`,
-              p_order_no: orderNo,
-              p_brand: brandName
-            });
-          } else {
-            await targetClient.rpc('werkpay_charge_by_login', {
-              p_username: chargedAccount.username,
-              p_password: chargedAccount.password || paymentMeta.password || paymentMeta.pin,
-              p_amount: finalTotal,
-              p_reference: `${isKoekploegBrand ? 'KP' : 'WD'}-ORD-${orderNo}`,
-              p_cashier: currentPosUser?.name || `${brandName} Kassa`,
-              p_order_no: orderNo,
-              p_brand: brandName
-            });
-          }
-          // Direct table update fallback
-          await targetClient
-            .from('bank_accounts')
-            .update({ balance: newBal })
-            .eq('id', chargedAccount.id);
-        } catch {
-          // Handled gracefully
-        }
-      }
+      saveBankTransactionToFirestore(tx).catch((err) => {
+        console.warn('Firestore save bank transaction error:', err);
+      });
 
       paymentMeta.account = chargedAccount.username;
       paymentMeta.balance_after = newBal;
@@ -2908,36 +2672,32 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       if (card.current_balance < finalTotal) {
         return { success: false, message: `Onvoldoende saldo op cadeaubon (${card.current_balance.toFixed(2)})` };
       }
-      const nextBalance = card.current_balance - finalTotal;
-      setGiftCards(prev => prev.map(g => g.id === card.id ? { ...g, current_balance: nextBalance } : g));
-      if (posClient) {
-        try {
-          await posClient.from('gift_cards').update({ current_balance: nextBalance }).eq('id', card.id);
-        } catch (err) {
-          console.error('Error updating gift card balance in DB during checkout:', err);
-        }
+      const nextBalance = Math.max(0, Math.round((card.current_balance - finalTotal) * 100) / 100);
+      const updatedCard = { ...card, current_balance: nextBalance };
+      setGiftCards(prev => prev.map(g => g.id === card.id ? updatedCard : g));
+      try {
+        await saveGiftCardToFirestore(updatedCard);
+      } catch (err) {
+        console.error('Error updating gift card balance in Firestore during checkout:', err);
       }
     }
 
     // 2.5 Consume cash approval request immediately to prevent replay
     if (consumedCashRequestId) {
       const consumedAt = Date.now();
-      const nextReqs = cashRequests.map(r =>
-        r.id === consumedCashRequestId
-          ? { ...r, status: 'consumed' as const, consumedAt }
-          : r
-      );
+      let consumedReqObj: CashPaymentRequest | null = null;
+      const nextReqs = cashRequests.map(r => {
+        if (r.id === consumedCashRequestId) {
+          consumedReqObj = { ...r, status: 'consumed' as const, consumedAt };
+          return consumedReqObj;
+        }
+        return r;
+      });
       syncCashRequests(nextReqs);
-      if (posClient) {
-        try {
-          const isNumericOnly = /^req_\d+$/.test(consumedCashRequestId);
-          const q = posClient.from('cash_requests').update({ status: 'consumed' });
-          if (isNumericOnly) {
-            await q.or(`req_id.eq.${consumedCashRequestId},id.eq.${consumedCashRequestId.replace('req_', '')}`);
-          } else {
-            await q.eq('req_id', consumedCashRequestId);
-          }
-        } catch {}
+      if (consumedReqObj) {
+        saveCashRequestToFirestore(consumedReqObj).catch((err) => {
+          console.warn('Firestore consume cash request error:', err);
+        });
       }
     }
 
@@ -2971,7 +2731,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     // 4. Deduct inventory & empty cart
     deductInventoryForItems(cart);
-    
+
     // If a discount voucher was applied, mark it used in loyalty system
     if (appliedDiscount.code) {
       redeemVoucherAnyCustomer(appliedDiscount.code, newOrder.no);
@@ -2990,25 +2750,11 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setTrackedOrderNo(newOrder.no);
     addMyOrderNumber(newOrder.no);
 
-    // 6. Push to Supabase if online
-    if (posClient) {
-      try {
-        await posClient.from('orders').insert({
-          order_no: newOrder.no,
-          items: newOrder.items,
-          total: newOrder.total,
-          discount: newOrder.discount,
-          order_type: newOrder.orderType,
-          identifier: newOrder.identifier,
-          notes: newOrder.notes,
-          payment_method: newOrder.paymentMethod,
-          payment_meta: newOrder.paymentMeta,
-          cashier: newOrder.cashier,
-          status: newOrder.status
-        });
-      } catch (err) {
-        console.warn('Supabase insert order error:', err);
-      }
+    // 6. Push to Firebase Cloud Firestore
+    try {
+      await saveOrderToFirestore(newOrder);
+    } catch (err) {
+      console.warn('Firestore insert order error:', err);
     }
 
     // Instant cross-tab broadcast for other open windows
@@ -3046,7 +2792,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: false, message: 'Voer een geldig bedrag hoger dan € 0,00 in.' };
     }
 
-    const desc = (params.description || '').trim() || 'SumUp Betaling';
+    const desc = (params.description || '').trim() || 'WerkPin Betaling';
     const currentBrandKey = activeBrand || 'koekploeg';
     const isKoekploegBrand = currentBrandKey === 'koekploeg';
     const brandName = isKoekploegBrand ? 'De Koekploeg' : 'Werkdonalds';
@@ -3068,8 +2814,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
       if (!hasCashStaffAuth && !pinCheck.valid) {
         logAuditAction(
-          'SUMUP_CONTANT_GEBLOKKEERD',
-          `Onbevoegde SumUp contante betaling (€ ${finalTotal.toFixed(2)}) geblokkeerd voor ${currentPosUser?.username || 'gast'}.`
+          'WERKPIN_CONTANT_GEBLOKKEERD',
+          `Onbevoegde WerkPin contante betaling (€ ${finalTotal.toFixed(2)}) geblokkeerd voor ${currentPosUser?.username || 'gast'}.`
         );
         return {
           success: false,
@@ -3087,22 +2833,21 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
       const approver = pinCheck.valid
         ? (pinCheck.approverName || 'Medewerker')
-        : (currentPosUser?.name || 'SumUp Kassier');
+        : (currentPosUser?.name || 'WerkPin Kassier');
       meta.received = Math.round(receivedAmount * 100) / 100;
       meta.change = Math.max(0, Math.round((receivedAmount - finalTotal) * 100) / 100);
       meta.accepted_by = approver;
       meta.cashier = approver;
 
       logAuditAction(
-        'SUMUP_CONTANT_GOEDGEKEURD',
-        `SumUp contante betaling #${orderNo} (€ ${finalTotal.toFixed(2)}) geaccepteerd door ${approver}.`
+        'WERKPIN_CONTANT_GOEDGEKEURD',
+        `WerkPin contante betaling #${orderNo} (€ ${finalTotal.toFixed(2)}) geaccepteerd door ${approver}.`
       );
     }
 
     if (params.method === 'workpay') {
       const mode = meta.mode || 'terminal';
       let chargedAccount: BankAccount | null = null;
-      const targetClient = payClient || posClient;
 
       if (mode === 'quick') {
         if (!currentBankAccount) {
@@ -3120,29 +2865,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (!username || !password) {
           return { success: false, message: 'Vul gebruikersnaam en wachtwoord/PIN in.' };
         }
-        chargedAccount = bankAccounts.find(
+        chargedAccount = bankAccountsRef.current.find(
           a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
         ) || null;
-        if (!chargedAccount && targetClient) {
+        if (!chargedAccount) {
           try {
-            const { data } = await targetClient
-              .from('bank_accounts')
-              .select('*')
-              .ilike('username', username)
-              .or(`password.eq.${password},pin_code.eq.${password}`)
-              .single();
-            if (data) {
-              chargedAccount = {
-                id: data.id,
-                username: data.username,
-                account_holder: data.account_holder,
-                card_uid: data.card_uid,
-                linked_uids: parseLinkedUids(data.linked_uids),
-                pin_code: data.pin_code,
-                balance: Number(data.balance),
-                is_admin: Boolean(data.is_admin)
-              };
-            }
+            const allDbAccs = await getAllBankAccountsFromFirestore();
+            chargedAccount = allDbAccs.find(
+              a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
+            ) || null;
           } catch {}
         }
       } else {
@@ -3151,39 +2882,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (!cleanUid) return { success: false, message: 'Geen pasnummer of NFC kaart gescand!' };
         if (!pin) return { success: false, message: 'Voer de 4-cijferige pincode in.' };
 
-        chargedAccount = bankAccounts.find(a =>
+        chargedAccount = bankAccountsRef.current.find(a =>
           accountMatchesUid(a, cleanUid) && (a.pin_code === pin || a.password === pin)
         ) || null;
 
-        if (!chargedAccount && targetClient) {
+        if (!chargedAccount) {
           try {
-            const { data: allDbAccs } = await targetClient.from('bank_accounts').select('*');
-            const matchedRow = (allDbAccs || []).find((row: any) => {
-              const candidate: BankAccount = {
-                id: row.id,
-                username: row.username,
-                account_holder: row.account_holder,
-                card_uid: row.card_uid,
-                linked_uids: parseLinkedUids(row.linked_uids),
-                pin_code: row.pin_code,
-                password: row.password,
-                balance: Number(row.balance),
-                is_admin: Boolean(row.is_admin)
-              };
-              return (candidate.pin_code === pin || candidate.password === pin) && accountMatchesUid(candidate, cleanUid);
-            });
-            if (matchedRow) {
-              chargedAccount = {
-                id: matchedRow.id,
-                username: matchedRow.username,
-                account_holder: matchedRow.account_holder,
-                card_uid: matchedRow.card_uid,
-                linked_uids: parseLinkedUids(matchedRow.linked_uids),
-                pin_code: matchedRow.pin_code,
-                balance: Number(matchedRow.balance),
-                is_admin: Boolean(matchedRow.is_admin)
-              };
-            }
+            const allDbAccs = await getAllBankAccountsFromFirestore();
+            chargedAccount = allDbAccs.find(candidate =>
+              (candidate.pin_code === pin || candidate.password === pin) && accountMatchesUid(candidate, cleanUid)
+            ) || null;
           } catch {}
         }
       }
@@ -3199,9 +2907,21 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         };
       }
 
-      const newBal = chargedAccount.is_admin
+      let newBal = chargedAccount.is_admin
         ? chargedAccount.balance
         : Math.max(0, Math.round((chargedAccount.balance - finalTotal) * 100) / 100);
+
+      if (!chargedAccount.is_admin && finalTotal > 0) {
+        try {
+          const txRes = await adjustBankBalanceTransaction(chargedAccount.username, -finalTotal, chargedAccount);
+          if (!txRes.success) {
+            return { success: false, message: txRes.error || 'WerkPin betaling op WerkPay rekening mislukt.' };
+          }
+          newBal = txRes.newBalance;
+        } catch (err) {
+          console.warn('Firestore WerkPin balance transaction fallback:', err);
+        }
+      }
 
       setBankAccounts(prev => prev.map(a => a.id === chargedAccount!.id ? { ...a, balance: newBal } : a));
       if (currentBankAccount && currentBankAccount.id === chargedAccount.id) {
@@ -3211,42 +2931,19 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       const tx: BankTransaction = {
         id: Date.now(),
         from_account: chargedAccount.username,
-        to_account: `${brandName} SumUp`,
+        to_account: `${brandName} WerkPin`,
         amount: finalTotal,
-        label: `SumUp: ${desc} (#${orderNo})`,
-        note: `SumUp terminal via ${mode === 'terminal' ? 'Pico W Pinapparaat' : mode === 'card' ? 'NFC Pas' : 'WerkPay'} (${brandName})`,
+        label: `WerkPin: ${desc} (#${orderNo})`,
+        note: `WerkPin terminal via ${mode === 'terminal' ? 'Pico W Pinapparaat' : mode === 'card' ? 'NFC Pas' : 'WerkPay'} (${brandName})`,
         order_no: orderNo,
         when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
         timestamp: Date.now()
       };
       setBankTransactions(prev => [tx, ...prev]);
 
-      if (targetClient) {
-        try {
-          if (mode === 'card' || mode === 'terminal') {
-            await targetClient.rpc('werkpay_charge_by_card', {
-              p_card_uid: chargedAccount.card_uid || meta.cardUid,
-              p_pin: meta.pin,
-              p_amount: finalTotal,
-              p_reference: `SUMUP-${orderNo}`,
-              p_cashier: currentPosUser?.name || 'SumUp Terminal',
-              p_order_no: orderNo,
-              p_brand: `${brandName} SumUp`
-            });
-          } else {
-            await targetClient.rpc('werkpay_charge_by_login', {
-              p_username: chargedAccount.username,
-              p_password: chargedAccount.password || meta.password || meta.pin,
-              p_amount: finalTotal,
-              p_reference: `SUMUP-${orderNo}`,
-              p_cashier: currentPosUser?.name || 'SumUp Terminal',
-              p_order_no: orderNo,
-              p_brand: `${brandName} SumUp`
-            });
-          }
-          await targetClient.from('bank_accounts').update({ balance: newBal }).eq('id', chargedAccount.id);
-        } catch {}
-      }
+      saveBankTransactionToFirestore(tx).catch((err) => {
+        console.warn('Firestore SumUp tx save error:', err);
+      });
 
       meta.account = chargedAccount.username;
       meta.balance_after = newBal;
@@ -3271,7 +2968,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (tipAmount > 0) {
       sumupItems.push({
-        name: 'Fooi (SumUp)',
+        name: 'Fooi (WerkPin)',
         qty: 1,
         price: tipAmount,
         done: true,
@@ -3287,10 +2984,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       discount: 0,
       orderType: params.orderType || 'takeaway',
       identifier: (params.identifier || '').trim() || desc,
-      notes: (params.notes || '').trim() || `SumUp Terminal (${currentPosUser?.name || 'Medewerker'})`,
+      notes: (params.notes || '').trim() || `WerkPin Terminal (${currentPosUser?.name || 'Medewerker'})`,
       paymentMethod: params.method,
       paymentMeta: meta,
-      cashier: meta.accepted_by || currentPosUser?.name || 'SumUp Terminal',
+      cashier: meta.accepted_by || currentPosUser?.name || 'WerkPin Terminal',
       status: sendToKitchen ? 'new' : 'afgehaald',
       time: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
       timestamp: Date.now()
@@ -3312,35 +3009,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
     AudioFX.bell();
 
-    if (posClient) {
-      try {
-        await posClient.from('orders').insert({
-          order_no: newOrder.no,
-          items: newOrder.items,
-          total: newOrder.total,
-          discount: newOrder.discount,
-          order_type: newOrder.orderType,
-          identifier: newOrder.identifier,
-          notes: newOrder.notes,
-          payment_method: newOrder.paymentMethod,
-          payment_meta: newOrder.paymentMeta,
-          cashier: newOrder.cashier,
-          status: newOrder.status
-        });
-      } catch {}
+    try {
+      await saveOrderToFirestore(newOrder);
+    } catch (err) {
+      console.warn('Firestore SumUp order save error:', err);
     }
 
     broadcastSync('SYNC_ORDER_NEW', newOrder);
 
     return {
       success: true,
-      message: `SumUp betaling #${newOrder.no} (€ ${finalTotal.toFixed(2)}) geslaagd!`,
+      message: `WerkPin betaling #${newOrder.no} (€ ${finalTotal.toFixed(2)}) geslaagd!`,
       order: newOrder
     };
   };
 
   const refundSumUpTransaction = async (targetOrderNo: number): Promise<{ success: boolean; message: string }> => {
-    const targetOrder = orders.find(o => o.no === targetOrderNo);
+    const targetOrder = ordersRef.current.find(o => o.no === targetOrderNo);
     if (!targetOrder) {
       return { success: false, message: 'Transactie niet gevonden.' };
     }
@@ -3348,7 +3033,6 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: false, message: 'Deze transactie is al terugbetaald/geannuleerd.' };
     }
 
-    const targetClient = payClient || posClient;
     const refundedBy = currentPosUser?.name || 'Medewerker';
     const nextMeta = {
       ...(targetOrder.paymentMeta || {}),
@@ -3359,32 +3043,25 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (targetOrder.paymentMethod === 'workpay' && targetOrder.paymentMeta?.account) {
       const accUsername = targetOrder.paymentMeta.account.toLowerCase();
-      let acc = bankAccounts.find(a => a.username.toLowerCase() === accUsername) || null;
-      if (!acc && targetClient) {
+      let acc = bankAccountsRef.current.find(a => a.username.toLowerCase() === accUsername) || null;
+      if (!acc) {
         try {
-          const { data } = await targetClient
-            .from('bank_accounts')
-            .select('*')
-            .ilike('username', accUsername)
-            .single();
-          if (data) {
-            acc = {
-              id: data.id,
-              username: data.username,
-              account_holder: data.account_holder,
-              card_uid: data.card_uid,
-              pin_code: data.pin_code,
-              balance: Number(data.balance),
-              is_admin: Boolean(data.is_admin)
-            };
-          }
+          const allDbAccs = await getAllBankAccountsFromFirestore();
+          acc = allDbAccs.find(a => a.username.toLowerCase() === accUsername) || null;
         } catch {}
       }
 
       if (acc) {
-        const nextBalance = acc.is_admin
+        let nextBalance = acc.is_admin
           ? acc.balance
           : Math.round((acc.balance + targetOrder.total) * 100) / 100;
+
+        if (!acc.is_admin && targetOrder.total > 0) {
+          try {
+            const res = await adjustBankBalanceTransaction(acc.username, targetOrder.total, acc);
+            if (res.success) nextBalance = res.newBalance;
+          } catch {}
+        }
 
         setBankAccounts(prev => prev.map(a => a.id === acc!.id ? { ...a, balance: nextBalance } : a));
         if (currentBankAccount && currentBankAccount.id === acc.id) {
@@ -3393,53 +3070,37 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
         const refundTx: BankTransaction = {
           id: Date.now(),
-          from_account: `${targetOrder.paymentMeta?.brandName || 'Werkdonalds'} SumUp`,
+          from_account: `${targetOrder.paymentMeta?.brandName || 'Werkdonalds'} WerkPin`,
           to_account: acc.username,
           amount: targetOrder.total,
           label: `Terugbetaling #${targetOrder.no}`,
-          note: `SumUp refund door ${refundedBy}`,
+          note: `WerkPin refund door ${refundedBy}`,
           order_no: targetOrder.no,
           when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
           timestamp: Date.now()
         };
         setBankTransactions(prev => [refundTx, ...prev]);
 
-        if (targetClient) {
-          try {
-            await targetClient.from('bank_accounts').update({ balance: nextBalance }).eq('id', acc.id);
-            await targetClient.from('bank_transactions').insert({
-              from_account: refundTx.from_account,
-              to_account: refundTx.to_account,
-              amount: refundTx.amount,
-              label: refundTx.label,
-              note: refundTx.note,
-              order_no: refundTx.order_no
-            });
-          } catch {}
-        }
+        saveBankTransactionToFirestore(refundTx).catch(() => {});
       }
     }
 
     const now = Date.now();
-    setOrders(prev => prev.map(o => o.no === targetOrderNo ? {
-      ...o,
+    const updatedOrder: Order = {
+      ...targetOrder,
       status: 'geannuleerd',
       paymentMeta: nextMeta,
       updatedAt: now
-    } : o));
+    };
+    setOrders(prev => prev.map(o => o.no === targetOrderNo ? updatedOrder : o));
     recordLocalOrderMutation(targetOrderNo, { status: 'geannuleerd' });
     broadcastSync('SYNC_ORDER_STATUS', { orderNo: targetOrderNo, status: 'geannuleerd', updatedAt: now });
 
-    if (posClient) {
-      try {
-        await posClient.from('orders').update({
-          status: 'geannuleerd',
-          payment_meta: nextMeta
-        }).eq('order_no', targetOrderNo);
-      } catch {}
-    }
+    try {
+      await saveOrderToFirestore(updatedOrder);
+    } catch {}
 
-    logAuditAction('SUMUP_REFUND', `Transactie #${targetOrderNo} (€ ${targetOrder.total.toFixed(2)}) terugbetaald door ${refundedBy}.`);
+    logAuditAction('WERKPIN_REFUND', `Transactie #${targetOrderNo} (€ ${targetOrder.total.toFixed(2)}) terugbetaald door ${refundedBy}.`);
     return {
       success: true,
       message: `€ ${targetOrder.total.toFixed(2)} succesvol terugbetaald!`
@@ -3448,300 +3109,227 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
   const updateOrderStatus = async (orderNum: number, newStatus: OrderStatus) => {
     const now = Date.now();
+    const currentOrder = ordersRef.current.find(o => o.no === orderNum);
+    if (!currentOrder) return;
+
+    let items = currentOrder.items;
     let updatedItemsList: any[] | undefined = undefined;
-    let currentOrder: Order | undefined;
+
+    if (newStatus === 'klaar' || newStatus === 'done') {
+      items = currentOrder.items.map(it => ({
+        ...it,
+        stage: 'klaar' as OrderItemStage,
+        done: true
+      }));
+      updatedItemsList = items;
+    } else if (newStatus === 'inpakken') {
+      items = currentOrder.items.map(it => ({
+        ...it,
+        stage: (it.stage === 'wachten' || it.stage === 'bereiden') ? ('inpakken' as OrderItemStage) : it.stage
+      }));
+      updatedItemsList = items;
+    }
+
+    const updatedOrder: Order = {
+      ...currentOrder,
+      status: newStatus,
+      items,
+      updatedAt: now
+    };
 
     setOrders(prev => {
-      currentOrder = prev.find(o => o.no === orderNum);
-      return prev.map(o => {
-        if (o.no !== orderNum) return o;
-
-        // User directive: "als het is ingepakt moeten de statussen van de producten ook naar klaar"
-        let items = o.items;
-        if (newStatus === 'klaar' || newStatus === 'done') {
-          items = o.items.map(it => ({
-            ...it,
-            stage: 'klaar' as OrderItemStage,
-            done: true
-          }));
-          updatedItemsList = items;
-        } else if (newStatus === 'inpakken') {
-          items = o.items.map(it => ({
-            ...it,
-            stage: (it.stage === 'wachten' || it.stage === 'bereiden') ? ('inpakken' as OrderItemStage) : it.stage
-          }));
-          updatedItemsList = items;
-        }
-
-        return {
-          ...o,
-          status: newStatus,
-          items,
-          updatedAt: now
-        };
-      });
+      const next = prev.map(o => (o.no === orderNum ? updatedOrder : o));
+      try {
+        localStorage.setItem('wd_orders', JSON.stringify(next));
+      } catch {}
+      return next;
     });
 
     recordLocalOrderMutation(orderNum, { status: newStatus, items: updatedItemsList });
 
-    if (newStatus === 'done' || newStatus === 'klaar') {
-      const orderToAnnounce = currentOrder || orders.find(o => o.no === orderNum);
-      if (orderToAnnounce && orderToAnnounce.orderType !== 'delivery') {
-        AudioFX.speakOrder(orderNum, orderToAnnounce.identifier, orderToAnnounce.orderType);
-      }
+    const wasAlreadyDone = currentOrder.status === 'done' || currentOrder.status === 'klaar';
+    if ((newStatus === 'done' || newStatus === 'klaar') && !wasAlreadyDone && currentOrder.orderType !== 'delivery') {
+      AudioFX.speakOrder(orderNum, currentOrder.identifier, currentOrder.orderType);
     }
 
     broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: newStatus, items: updatedItemsList, updatedAt: now });
 
-    if (posClient) {
-      try {
-        const updatePayload: any = { status: newStatus };
-        if (updatedItemsList) {
-          updatePayload.items = updatedItemsList;
-        }
-        const { error } = await posClient.from('orders').update(updatePayload).eq('order_no', orderNum);
-        if (error) {
-          console.warn('⚠️ Supabase order status update niet opgeslagen in cloud:', error.message);
-        }
-      } catch (err) {
-        console.warn('Supabase order status update error:', err);
-      }
+    try {
+      await saveOrderToFirestore(updatedOrder);
+    } catch (err) {
+      console.warn('Firestore order status update error:', err);
     }
   };
 
   const updateOrderItemStage = async (orderNum: number, itemIndex: number, stage: OrderItemStage) => {
     const now = Date.now();
-    let nextItems: any[] | null = null;
-    let calculatedNextStatus: OrderStatus | null = null;
-    let statusChanged = false;
-    let targetOrderBefore: Order | undefined;
+    const targetOrder = ordersRef.current.find(o => o.no === orderNum);
+    if (!targetOrder) return;
+
+    const nextItems = [...targetOrder.items];
+    if (nextItems[itemIndex]) {
+      nextItems[itemIndex] = {
+        ...nextItems[itemIndex],
+        stage,
+        done: stage === 'klaar'
+      };
+    }
+
+    const calculatedNextStatus = getMajorityStatus(nextItems);
+    const statusChanged = targetOrder.status !== calculatedNextStatus;
+    const updatedOrder: Order = {
+      ...targetOrder,
+      items: nextItems,
+      status: statusChanged ? calculatedNextStatus : targetOrder.status,
+      updatedAt: now
+    };
 
     setOrders(prev => {
-      const targetOrder = prev.find(o => o.no === orderNum);
-      if (!targetOrder) return prev;
-      targetOrderBefore = targetOrder;
-
-      nextItems = [...targetOrder.items];
-      if (nextItems[itemIndex]) {
-        nextItems[itemIndex] = {
-          ...nextItems[itemIndex],
-          stage,
-          done: stage === 'klaar'
-        };
-      }
-
-      calculatedNextStatus = getMajorityStatus(nextItems);
-      statusChanged = targetOrder.status !== calculatedNextStatus;
-
-      // Sync to LocalStorage inside the state updater so we are guaranteed to have the correct state
-      const currentStored = localStorage.getItem('wd_orders');
-      if (currentStored) {
-        try {
-          const parsed: Order[] = JSON.parse(currentStored);
-          const updated = parsed.map(o => o.no === orderNum ? { 
-            ...o, 
-            items: nextItems!, 
-            status: statusChanged ? calculatedNextStatus! : o.status,
-            updatedAt: now 
-          } : o);
-          localStorage.setItem('wd_orders', JSON.stringify(updated));
-        } catch {}
-      }
-
-      return prev.map(o => o.no === orderNum ? { 
-        ...o, 
-        items: nextItems!, 
-        status: statusChanged ? calculatedNextStatus! : o.status,
-        updatedAt: now 
-      } : o);
+      const next = prev.map(o => (o.no === orderNum ? updatedOrder : o));
+      try {
+        localStorage.setItem('wd_orders', JSON.stringify(next));
+      } catch {}
+      return next;
     });
 
-    // Run this in the next microtask or slightly deferred so we have the calculated nextItems
-    setTimeout(async () => {
-      if (nextItems) {
-        recordLocalOrderMutation(orderNum, { items: nextItems });
-        broadcastSync('SYNC_ORDER_ITEMS', { orderNo: orderNum, items: nextItems, updatedAt: now });
+    recordLocalOrderMutation(orderNum, { items: nextItems });
+    broadcastSync('SYNC_ORDER_ITEMS', { orderNo: orderNum, items: nextItems, updatedAt: now });
 
-        if (statusChanged && calculatedNextStatus) {
-          recordLocalOrderMutation(orderNum, { status: calculatedNextStatus });
-          broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: calculatedNextStatus, updatedAt: now });
+    if (statusChanged) {
+      recordLocalOrderMutation(orderNum, { status: calculatedNextStatus });
+      broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: calculatedNextStatus, updatedAt: now });
 
-          if (calculatedNextStatus === 'klaar') {
-            const orderToAnnounce = targetOrderBefore;
-            if (orderToAnnounce && orderToAnnounce.orderType !== 'delivery') {
-              AudioFX.speakOrder(orderNum, orderToAnnounce.identifier, orderToAnnounce.orderType);
-            }
-          }
-        }
-
-        if (posClient) {
-          try {
-            const updatePayload: any = { items: nextItems };
-            if (statusChanged && calculatedNextStatus) {
-              updatePayload.status = calculatedNextStatus;
-            }
-            await posClient.from('orders').update(updatePayload).eq('order_no', orderNum);
-          } catch {}
-        }
+      if (calculatedNextStatus === 'klaar' && targetOrder.orderType !== 'delivery') {
+        AudioFX.speakOrder(orderNum, targetOrder.identifier, targetOrder.orderType);
       }
-    }, 10);
+    }
+
+    try {
+      await saveOrderToFirestore(updatedOrder);
+    } catch (err) {
+      console.warn('Firestore order item stage update error:', err);
+    }
   };
 
   const toggleOrderItemDone = async (orderNum: number, itemIndex: number) => {
     const now = Date.now();
-    let nextItems: any[] | null = null;
-    let calculatedNextStatus: OrderStatus | null = null;
-    let statusChanged = false;
-    let targetOrderBefore: Order | undefined;
+    const targetOrder = ordersRef.current.find(o => o.no === orderNum);
+    if (!targetOrder) return;
+
+    const nextItems = [...targetOrder.items];
+    if (nextItems[itemIndex]) {
+      const nextDone = !nextItems[itemIndex].done;
+      nextItems[itemIndex] = {
+        ...nextItems[itemIndex],
+        done: nextDone,
+        stage: nextDone ? 'klaar' : 'wachten'
+      };
+    }
+
+    const calculatedNextStatus = getMajorityStatus(nextItems);
+    const statusChanged = targetOrder.status !== calculatedNextStatus;
+    const updatedOrder: Order = {
+      ...targetOrder,
+      items: nextItems,
+      status: statusChanged ? calculatedNextStatus : targetOrder.status,
+      updatedAt: now
+    };
 
     setOrders(prev => {
-      const targetOrder = prev.find(o => o.no === orderNum);
-      if (!targetOrder) return prev;
-      targetOrderBefore = targetOrder;
-
-      nextItems = [...targetOrder.items];
-      if (nextItems[itemIndex]) {
-        const nextDone = !nextItems[itemIndex].done;
-        nextItems[itemIndex] = {
-          ...nextItems[itemIndex],
-          done: nextDone,
-          stage: nextDone ? 'klaar' : 'wachten'
-        };
-      }
-
-      calculatedNextStatus = getMajorityStatus(nextItems);
-      statusChanged = targetOrder.status !== calculatedNextStatus;
-
-      const currentStored = localStorage.getItem('wd_orders');
-      if (currentStored) {
-        try {
-          const parsed: Order[] = JSON.parse(currentStored);
-          const updated = parsed.map(o => o.no === orderNum ? { 
-            ...o, 
-            items: nextItems!, 
-            status: statusChanged ? calculatedNextStatus! : o.status,
-            updatedAt: now 
-          } : o);
-          localStorage.setItem('wd_orders', JSON.stringify(updated));
-        } catch {}
-      }
-
-      return prev.map(o => o.no === orderNum ? { 
-        ...o, 
-        items: nextItems!, 
-        status: statusChanged ? calculatedNextStatus! : o.status,
-        updatedAt: now 
-      } : o);
+      const next = prev.map(o => (o.no === orderNum ? updatedOrder : o));
+      try {
+        localStorage.setItem('wd_orders', JSON.stringify(next));
+      } catch {}
+      return next;
     });
 
-    setTimeout(async () => {
-      if (nextItems) {
-        recordLocalOrderMutation(orderNum, { items: nextItems });
-        broadcastSync('SYNC_ORDER_ITEMS', { orderNo: orderNum, items: nextItems, updatedAt: now });
+    recordLocalOrderMutation(orderNum, { items: nextItems });
+    broadcastSync('SYNC_ORDER_ITEMS', { orderNo: orderNum, items: nextItems, updatedAt: now });
 
-        if (statusChanged && calculatedNextStatus) {
-          recordLocalOrderMutation(orderNum, { status: calculatedNextStatus });
-          broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: calculatedNextStatus, updatedAt: now });
+    if (statusChanged) {
+      recordLocalOrderMutation(orderNum, { status: calculatedNextStatus });
+      broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: calculatedNextStatus, updatedAt: now });
 
-          if (calculatedNextStatus === 'klaar') {
-            const orderToAnnounce = targetOrderBefore;
-            if (orderToAnnounce && orderToAnnounce.orderType !== 'delivery') {
-              AudioFX.speakOrder(orderNum, orderToAnnounce.identifier, orderToAnnounce.orderType);
-            }
-          }
-        }
-
-        if (posClient) {
-          try {
-            const updatePayload: any = { items: nextItems };
-            if (statusChanged && calculatedNextStatus) {
-              updatePayload.status = calculatedNextStatus;
-            }
-            await posClient.from('orders').update(updatePayload).eq('order_no', orderNum);
-          } catch {}
-        }
+      if (calculatedNextStatus === 'klaar' && targetOrder.orderType !== 'delivery') {
+        AudioFX.speakOrder(orderNum, targetOrder.identifier, targetOrder.orderType);
       }
-    }, 10);
+    }
+
+    try {
+      await saveOrderToFirestore(updatedOrder);
+    } catch (err) {
+      console.warn('Firestore toggleOrderItemDone error:', err);
+    }
   };
 
   const toggleOrderPrio = async (orderNum: number) => {
     const now = Date.now();
-    let targetPrio = false;
-    setOrders(prev => prev.map(o => {
-      if (o.no !== orderNum) return o;
-      targetPrio = !o.isPrio;
-      return { ...o, isPrio: targetPrio, updatedAt: now };
-    }));
+    const targetOrder = ordersRef.current.find(o => o.no === orderNum);
+    if (!targetOrder) return;
+
+    const targetPrio = !targetOrder.isPrio;
+    const updatedOrder: Order = { ...targetOrder, isPrio: targetPrio, updatedAt: now };
+
+    setOrders(prev => {
+      const next = prev.map(o => (o.no === orderNum ? updatedOrder : o));
+      try {
+        localStorage.setItem('wd_orders', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+
     recordLocalOrderMutation(orderNum, { isPrio: targetPrio });
     broadcastSync('SYNC_ORDER_PRIO', { orderNo: orderNum, isPrio: targetPrio, updatedAt: now });
+
+    try {
+      await saveOrderToFirestore(updatedOrder);
+    } catch (err) {
+      console.warn('Firestore toggleOrderPrio error:', err);
+    }
   };
 
   const setAllOrderItemsDone = async (orderNum: number, done: boolean) => {
     const now = Date.now();
-    let nextItems: any[] | null = null;
+    const targetOrder = ordersRef.current.find(o => o.no === orderNum);
+    if (!targetOrder) return;
+
     const nextStage: OrderItemStage = done ? 'klaar' : 'wachten';
     const nextStatus: OrderStatus = done ? 'klaar' : 'wachten';
-    let statusChanged = false;
-    let targetOrderBefore: Order | undefined;
+    const statusChanged = targetOrder.status !== nextStatus;
+    const nextItems = targetOrder.items.map(it => ({ ...it, done, stage: nextStage }));
+
+    const updatedOrder: Order = {
+      ...targetOrder,
+      items: nextItems,
+      status: statusChanged ? nextStatus : targetOrder.status,
+      updatedAt: now
+    };
 
     setOrders(prev => {
-      const targetOrder = prev.find(o => o.no === orderNum);
-      if (!targetOrder) return prev;
-      targetOrderBefore = targetOrder;
-      statusChanged = targetOrder.status !== nextStatus;
-
-      nextItems = targetOrder.items.map(it => ({ ...it, done, stage: nextStage }));
-
-      const currentStored = localStorage.getItem('wd_orders');
-      if (currentStored) {
-        try {
-          const parsed: Order[] = JSON.parse(currentStored);
-          const updated = parsed.map(o => o.no === orderNum ? { 
-            ...o, 
-            items: nextItems!, 
-            status: statusChanged ? nextStatus : o.status,
-            updatedAt: now 
-          } : o);
-          localStorage.setItem('wd_orders', JSON.stringify(updated));
-        } catch {}
-      }
-
-      return prev.map(o => o.no === orderNum ? { 
-        ...o, 
-        items: nextItems!, 
-        status: statusChanged ? nextStatus : o.status,
-        updatedAt: now 
-      } : o);
+      const next = prev.map(o => (o.no === orderNum ? updatedOrder : o));
+      try {
+        localStorage.setItem('wd_orders', JSON.stringify(next));
+      } catch {}
+      return next;
     });
 
-    setTimeout(async () => {
-      if (nextItems) {
-        recordLocalOrderMutation(orderNum, { items: nextItems });
-        broadcastSync('SYNC_ORDER_ITEMS', { orderNo: orderNum, items: nextItems, updatedAt: now });
+    recordLocalOrderMutation(orderNum, { items: nextItems });
+    broadcastSync('SYNC_ORDER_ITEMS', { orderNo: orderNum, items: nextItems, updatedAt: now });
 
-        if (statusChanged) {
-          recordLocalOrderMutation(orderNum, { status: nextStatus });
-          broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: nextStatus, updatedAt: now });
+    if (statusChanged) {
+      recordLocalOrderMutation(orderNum, { status: nextStatus });
+      broadcastSync('SYNC_ORDER_STATUS', { orderNo: orderNum, status: nextStatus, updatedAt: now });
 
-          if (nextStatus === 'klaar') {
-            const orderToAnnounce = targetOrderBefore;
-            if (orderToAnnounce && orderToAnnounce.orderType !== 'delivery') {
-              AudioFX.speakOrder(orderNum, orderToAnnounce.identifier, orderToAnnounce.orderType);
-            }
-          }
-        }
-
-        if (posClient) {
-          try {
-            const updatePayload: any = { items: nextItems };
-            if (statusChanged) {
-              updatePayload.status = nextStatus;
-            }
-            await posClient.from('orders').update(updatePayload).eq('order_no', orderNum);
-          } catch {}
-        }
+      if (nextStatus === 'klaar' && targetOrder.orderType !== 'delivery') {
+        AudioFX.speakOrder(orderNum, targetOrder.identifier, targetOrder.orderType);
       }
-    }, 10);
+    }
+
+    try {
+      await saveOrderToFirestore(updatedOrder);
+    } catch (err) {
+      console.warn('Firestore setAllOrderItemsDone error:', err);
+    }
   };
 
   const cancelOrder = async (orderNum: number) => {
@@ -3761,13 +3349,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
     if (shouldBlockTableWrite(`Bestelling #${orderNum} verwijderen`)) return;
     broadcastSync('SYNC_ORDER_DELETE', { orderNo: orderNum });
-    if (posClient) {
-      try {
-        const { error } = await posClient.from('orders').delete().eq('order_no', orderNum);
-        if (error) {
-          console.warn('Supabase delete order error:', error.message);
-        }
-      } catch {}
+    try {
+      await deleteOrderFromFirestore(orderNum);
+    } catch (err) {
+      console.warn('Firestore delete order error:', err);
     }
   };
 
@@ -3903,19 +3488,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const updated = [newReq, ...cashRequests];
     syncCashRequests(updated);
 
-    if (posClient) {
-      posClient.from('cash_requests').insert({
-        req_id: reqId,
-        order_no: orderNo,
-        order_type: orderType,
-        identifier: identifier,
-        amount: total,
-        cashier: identifier,
-        status: 'pending'
-      }).then(({ error }) => {
-        if (error) console.warn('Supabase cash_requests insert error:', error);
-      });
-    }
+    saveCashRequestToFirestore(newReq).catch((err) => {
+      console.warn('Firestore cash_requests insert error:', err);
+    });
 
     return newReq;
   };
@@ -3950,40 +3525,26 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const verifiedChange = Math.max(0, Math.round((received - targetReq.total) * 100) / 100);
     const roundedReceived = Math.round(received * 100) / 100;
 
-    const updated = cashRequests.map(r =>
-      r.id === requestId
-        ? {
-            ...r,
-            status: 'approved' as const,
-            approvedBy: verifiedApprover,
-            approvedByUsername: currentPosUser?.username,
-            approvedAt: Date.now(),
-            received: roundedReceived,
-            change: verifiedChange
-          }
-        : r
-    );
+    const approvedReq: CashPaymentRequest = {
+      ...targetReq,
+      status: 'approved',
+      approvedBy: verifiedApprover,
+      approvedByUsername: currentPosUser?.username,
+      approvedAt: Date.now(),
+      received: roundedReceived,
+      change: verifiedChange
+    };
+
+    const updated = cashRequests.map(r => r.id === requestId ? approvedReq : r);
     syncCashRequests(updated);
     logAuditAction(
       'CONTANT_VERZOEK_GOEDGEKEURD',
       `Contant verzoek #${targetReq.orderNo} (€ ${targetReq.total.toFixed(2)}, ontvangen € ${roundedReceived.toFixed(2)}) goedgekeurd door ${verifiedApprover}.`
     );
 
-    if (posClient) {
-      const isSimpleReqId = /^req_\d+$/.test(requestId);
-      const q = posClient.from('cash_requests').update({
-        status: 'approved',
-        approved_by: verifiedApprover,
-        received: roundedReceived,
-        change: verifiedChange
-      });
-      const reqPromise = isSimpleReqId
-        ? q.or(`req_id.eq.${requestId},id.eq.${requestId.replace('req_', '')}`)
-        : q.eq('req_id', requestId);
-      reqPromise.then(({ error }) => {
-        if (error) console.warn('Supabase cash_requests approve error:', error);
-      });
-    }
+    saveCashRequestToFirestore(approvedReq).catch((err) => {
+      console.warn('Firestore cash_requests approve error:', err);
+    });
 
     return { success: true, message: 'Contant verzoek goedgekeurd.' };
   };
@@ -3991,10 +3552,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   const rejectCashRequest = (requestId: string, reason?: string) => {
     const rejectedReason = reason || 'Geweigerd door medewerker';
     const targetReq = cashRequests.find(r => r.id === requestId);
+    const rejectedReq: CashPaymentRequest | null = targetReq
+      ? { ...targetReq, status: 'rejected', rejectedReason }
+      : null;
+
     const updated = cashRequests.map(r =>
-      r.id === requestId
-        ? { ...r, status: 'rejected' as const, rejectedReason }
-        : r
+      r.id === requestId && rejectedReq ? rejectedReq : r
     );
     syncCashRequests(updated);
 
@@ -4005,17 +3568,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       );
     }
 
-    if (posClient) {
-      const isSimpleReqId = /^req_\d+$/.test(requestId);
-      const q = posClient.from('cash_requests').update({
-        status: 'rejected',
-        rejected_reason: rejectedReason
-      });
-      const reqPromise = isSimpleReqId
-        ? q.or(`req_id.eq.${requestId},id.eq.${requestId.replace('req_', '')}`)
-        : q.eq('req_id', requestId);
-      reqPromise.then(({ error }) => {
-        if (error) console.warn('Supabase cash_requests reject error:', error);
+    if (rejectedReq) {
+      saveCashRequestToFirestore(rejectedReq).catch((err) => {
+        console.warn('Firestore cash_requests reject error:', err);
       });
     }
   };
@@ -4051,16 +3606,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: false, message: 'Niet ingelogd bij WerkPay.' };
     }
     if (!currentBankAccount.is_admin) {
-      return { 
-        success: false, 
-        message: 'Klanten kunnen niet zelf saldo opwaarderen. Opwaarderen kan uitsluitend via de kassa of door een beheerder.' 
+      return {
+        success: false,
+        message: 'Klanten kunnen niet zelf saldo opwaarderen. Opwaarderen kan uitsluitend via de kassa of door een beheerder.'
       };
     }
     if (amount <= 0) {
       return { success: false, message: 'Voer een positief bedrag in.' };
     }
 
-    const newBal = currentBankAccount.balance + amount;
+    const newBal = Math.round((currentBankAccount.balance + amount) * 100) / 100;
     const updated = { ...currentBankAccount, balance: newBal };
     setCurrentBankAccount(updated);
     setBankAccounts(prev => prev.map(a => a.id === updated.id ? updated : a));
@@ -4076,12 +3631,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     };
     setBankTransactions(prev => [tx, ...prev]);
 
-    if (payClient || posClient) {
-      const client = payClient || posClient;
-      try {
-        await client?.from('bank_accounts').update({ balance: newBal }).eq('id', updated.id);
-      } catch {}
-    }
+    try {
+      await saveBankAccountToFirestore(updated);
+      await saveBankTransactionToFirestore(tx);
+    } catch {}
 
     return { success: true, message: `€ ${amount.toFixed(2)} succesvol bijgeschreven!` };
   };
@@ -4126,12 +3679,14 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     };
     setBankTransactions(prev => [tx, ...prev]);
 
-    if (payClient || posClient) {
-      const client = payClient || posClient;
-      try {
-        await client?.from('bank_accounts').update({ balance: newBal }).eq('id', updated.id);
-      } catch {}
-    }
+    try {
+      if (updated.is_admin) {
+        await saveBankAccountToFirestore(updated);
+      } else {
+        await adjustBankBalanceTransaction(updated.username, reward, updated);
+      }
+      await saveBankTransactionToFirestore(tx);
+    } catch {}
 
     return {
       success: true,
@@ -4156,26 +3711,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setBlockedDevices(nextList);
     localStorage.setItem('wd_blocked_devices', JSON.stringify(nextList));
 
-    if (posClient) {
-      try {
-        await posClient.from('pos_settings').upsert({
-          id: 'default',
-          order_stop_active: orderStopActive,
-          pickup_closed: pickupClosed,
-          blocked_devices: nextList,
-          updated_at: new Date().toISOString()
-        });
-
-        // Broadcast realtime event so all devices block IMMEDIATELY without reload
-        const bc = posClient.channel('global_audio_broadcast');
-        bc.send({
-          type: 'broadcast',
-          event: 'wd_device_blocked',
-          payload: { blocked_devices: nextList, newItem }
-        }).catch(() => {});
-      } catch (err) {
-        console.error('Error saving block:', err);
-      }
+    try {
+      await savePosSettingsToFirestore({
+        order_stop_active: orderStopActive,
+        pickup_closed: pickupClosed,
+        blocked_devices: nextList
+      });
+      await emitAudioBroadcastEvent('wd_device_blocked', { blocked_devices: nextList, newItem });
+    } catch (err) {
+      console.error('Error saving block:', err);
     }
 
     return { success: true, message: `${type === 'ip' ? 'IP-adres' : 'Apparaat'} "${cleanVal}" direct live geblokkeerd!` };
@@ -4187,25 +3731,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setBlockedDevices(nextList);
     localStorage.setItem('wd_blocked_devices', JSON.stringify(nextList));
 
-    if (posClient) {
-      try {
-        await posClient.from('pos_settings').upsert({
-          id: 'default',
-          order_stop_active: orderStopActive,
-          pickup_closed: pickupClosed,
-          blocked_devices: nextList,
-          updated_at: new Date().toISOString()
-        });
-
-        const bc = posClient.channel('global_audio_broadcast');
-        bc.send({
-          type: 'broadcast',
-          event: 'wd_device_blocked',
-          payload: { blocked_devices: nextList }
-        }).catch(() => {});
-      } catch (err) {
-        console.error('Error saving unblock:', err);
-      }
+    try {
+      await savePosSettingsToFirestore({
+        order_stop_active: orderStopActive,
+        pickup_closed: pickupClosed,
+        blocked_devices: nextList
+      });
+      await emitAudioBroadcastEvent('wd_device_blocked', { blocked_devices: nextList });
+    } catch (err) {
+      console.error('Error saving unblock:', err);
     }
 
     return { success: true, message: `Blokkade voor "${value}" direct live opgeheven.` };
@@ -4232,25 +3766,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setBlockedDevices(updated);
     localStorage.setItem('wd_blocked_devices', JSON.stringify(updated));
 
-    if (posClient) {
-      try {
-        await posClient.from('pos_settings').upsert({
-          id: 'default',
-          order_stop_active: orderStopActive,
-          pickup_closed: pickupClosed,
-          blocked_devices: updated,
-          updated_at: new Date().toISOString()
-        });
-
-        const bc = posClient.channel('global_audio_broadcast');
-        bc.send({
-          type: 'broadcast',
-          event: 'wd_device_blocked',
-          payload: { blocked_devices: updated }
-        }).catch(() => {});
-      } catch (err) {
-        console.error('Error blocking all other devices:', err);
-      }
+    try {
+      await savePosSettingsToFirestore({
+        order_stop_active: orderStopActive,
+        pickup_closed: pickupClosed,
+        blocked_devices: updated
+      });
+      await emitAudioBroadcastEvent('wd_device_blocked', { blocked_devices: updated });
+    } catch (err) {
+      console.error('Error blocking all other devices:', err);
     }
 
     return { success: true, message: `Alle ${filteredNew.length} overige ingelogde apparaten zijn direct live geblokkeerd!` };
@@ -4265,7 +3789,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     if (amount <= 0) return { success: false, message: 'Ongeldig bedrag.' };
 
     const cleanQuery = to.trim();
-    const recipient = bankAccounts.find(
+    const recipient = bankAccountsRef.current.find(
       a => accountMatchesUid(a, cleanQuery)
     );
 
@@ -4281,16 +3805,40 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: false, message: 'Onvoldoende WerkPay saldo voor deze overboeking.' };
     }
 
-    // Debit sender (unless God mode)
-    const senderBal = currentBankAccount.is_admin 
-      ? currentBankAccount.balance 
+    let senderBal = currentBankAccount.is_admin
+      ? currentBankAccount.balance
       : Math.max(0, Math.round((currentBankAccount.balance - amount) * 100) / 100);
-    const updatedSender = { ...currentBankAccount, balance: senderBal };
-    setCurrentBankAccount(updatedSender);
+    let recipientBal = recipient.is_admin
+      ? recipient.balance
+      : Math.round((recipient.balance + amount) * 100) / 100;
 
-    // Credit recipient
-    const recipientBal = Math.round((recipient.balance + amount) * 100) / 100;
+    // Atomic Firestore transactions for debit & credit
+    if (!currentBankAccount.is_admin) {
+      try {
+        const debitRes = await adjustBankBalanceTransaction(currentBankAccount.username, -amount, currentBankAccount);
+        if (!debitRes.success) {
+          return { success: false, message: debitRes.error || 'Overboeking geweigerd door saldo check.' };
+        }
+        senderBal = debitRes.newBalance;
+      } catch (err) {
+        console.warn('Firestore sender debit error:', err);
+      }
+    }
+
+    if (!recipient.is_admin) {
+      try {
+        const creditRes = await adjustBankBalanceTransaction(recipient.username, amount, recipient);
+        if (creditRes.success) {
+          recipientBal = creditRes.newBalance;
+        }
+      } catch (err) {
+        console.warn('Firestore recipient credit error:', err);
+      }
+    }
+
+    const updatedSender = { ...currentBankAccount, balance: senderBal };
     const updatedRecipient = { ...recipient, balance: recipientBal };
+    setCurrentBankAccount(updatedSender);
 
     setBankAccounts(prev =>
       prev.map(a => {
@@ -4312,15 +3860,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     };
     setBankTransactions(prev => [tx, ...prev]);
 
-    if (payClient || posClient) {
-      const client = payClient || posClient;
-      try {
-        if (!currentBankAccount.is_admin) {
-          await client?.from('bank_accounts').update({ balance: senderBal }).eq('id', updatedSender.id);
-        }
-        await client?.from('bank_accounts').update({ balance: recipientBal }).eq('id', updatedRecipient.id);
-      } catch {}
-    }
+    saveBankTransactionToFirestore(tx).catch(() => {});
 
     return { success: true, message: `€ ${amount.toFixed(2)} overgemaakt naar ${recipient.account_holder}!` };
   };
@@ -4333,12 +3873,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setCurrentBankAccount(updated);
     setBankAccounts(prev => prev.map(a => a.id === updated.id ? updated : a));
 
-    if (payClient || posClient) {
-      const client = payClient || posClient;
-      try {
-        await client?.from('bank_accounts').update({ pin_code: newPin.trim() }).eq('id', updated.id);
-      } catch {}
-    }
+    try {
+      await saveBankAccountToFirestore(updated);
+    } catch {}
 
     return { success: true, message: 'Pincode succesvol gewijzigd!' };
   };
@@ -4347,7 +3884,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     acc: Partial<BankAccount> & { id?: number | string }
   ): Promise<{ success: boolean; message?: string }> => {
     const cleanTargetUsername = acc.username ? acc.username.trim().toLowerCase() : '';
-    const existingAcc = bankAccounts.find(
+    const existingAcc = bankAccountsRef.current.find(
       a => (acc.id !== undefined && a.id === acc.id) || (cleanTargetUsername && a.username.toLowerCase() === cleanTargetUsername)
     );
 
@@ -4359,8 +3896,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         : normalizeCardUid(trimmed);
     };
 
-    const client = payClient || posClient;
-    let nextAccounts: BankAccount[] = [...bankAccounts];
+    let nextAccounts: BankAccount[] = [...bankAccountsRef.current];
     let savedRecord: BankAccount;
 
     if (existingAcc) {
@@ -4383,7 +3919,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       const newLinkedUids = parseLinkedUids(acc.linked_uids || []);
       savedRecord = {
         id: Date.now(),
-        username: acc.username?.trim() || `klant_${Date.now()}`,
+        username: acc.username?.trim().toLowerCase() || `klant_${Date.now()}`,
         password: acc.password || '1234',
         account_holder: acc.account_holder?.trim() || 'Nieuwe Klant',
         card_uid: newCardUid,
@@ -4434,7 +3970,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       nextAccounts = [...nextAccounts, savedRecord];
     }
 
-    // Direct React state + localStorage + cross-tab bijwerken (GEEN async updater bug!)
+    // Direct React state + localStorage + cross-tab bijwerken
     setBankAccounts(nextAccounts);
     if (
       currentBankAccount &&
@@ -4457,105 +3993,26 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: false, message: 'Tabellen zijn vergrendeld (freeze modus).' };
     }
 
-    if (!client) {
-      return { success: true, message: 'Lokaal opgeslagen (offline modus).' };
-    }
-
-    // Helper voor veilige Supabase write (valt terug zonder linked_uids als oude SQL nog draait)
-    const persistAccountToSupabase = async (record: BankAccount, isInsert: boolean) => {
-      const basePayload: Record<string, any> = {
-        username: record.username,
-        account_holder: record.account_holder,
-        card_uid: record.card_uid,
-        pin_code: record.pin_code || '1234',
-        balance: Number(record.balance || 0),
-        is_admin: Boolean(record.is_admin),
-      };
-      if (record.password) basePayload.password = record.password;
-
-      const withLinkedPayload = {
-        ...basePayload,
-        linked_uids: parseLinkedUids(record.linked_uids || []),
-      };
-
-      const runWrite = async (payload: Record<string, any>) => {
-        if (isInsert) {
-          return await client.from('bank_accounts').insert({
-            ...payload,
-            password: record.password || '1234',
-          }).select('*');
-        }
-        if (typeof record.id === 'number' && record.id < 10000000000) {
-          const res = await client.from('bank_accounts').update(payload).eq('id', record.id).select('*');
-          if (!res.error && (!res.data || res.data.length === 0)) {
-            return await client.from('bank_accounts').update(payload).ilike('username', record.username).select('*');
-          }
-          return res;
-        }
-        return await client.from('bank_accounts').update(payload).ilike('username', record.username).select('*');
-      };
-
-      let res = await runWrite(withLinkedPayload);
-      if (
-        res.error &&
-        (String(res.error.code) === 'PGRST204' ||
-          String(res.error.code) === '42703' ||
-          String(res.error.message || '').toLowerCase().includes('linked_uids'))
-      ) {
-        res = await runWrite(basePayload);
-      }
-      return res;
-    };
-
     try {
-      // 1. Eerst oude houders van dezelfde fysieke UID vrijmaken in Supabase om UNIQUE conflicten te voorkomen
+      // 1. Eerst oude houders van dezelfde fysieke UID vrijmaken in Firestore
       for (const oldAcc of displacedAccounts) {
-        await persistAccountToSupabase(oldAcc, false);
+        await saveBankAccountToFirestore(oldAcc);
       }
-
-      // 2. Daarna het doelaccount opslaan (insert of update)
-      const res = await persistAccountToSupabase(savedRecord, !existingAcc);
-      if (res.error) {
-        console.error('Supabase saveBankAccount error:', res.error);
-        showToast(`Fout bij opslaan naar Supabase: ${res.error.message}`, 'error');
-        return { success: false, message: res.error.message };
-      }
-
-      if (res.data && res.data.length > 0) {
-        const dbRow = res.data[0];
-        setBankAccounts((prev) => {
-          const synced = prev.map((a) =>
-            a.username.toLowerCase() === savedRecord.username.toLowerCase()
-              ? {
-                  ...a,
-                  id: dbRow.id,
-                  card_uid: dbRow.card_uid ?? a.card_uid,
-                  linked_uids: dbRow.linked_uids !== undefined ? parseLinkedUids(dbRow.linked_uids) : a.linked_uids,
-                }
-              : a
-          );
-          try {
-            const snap = JSON.stringify(synced);
-            cloudSnapshotsRef.current.bank = snap;
-            localStorage.setItem('wd_bank_accounts', snap);
-          } catch {}
-          return synced;
-        });
-      }
-
-      return { success: true, message: 'Opgeslagen in Supabase & lokaal.' };
+      // 2. Daarna het doelaccount opslaan in Firestore
+      await saveBankAccountToFirestore(savedRecord);
+      return { success: true, message: 'Opgeslagen in Firebase Cloud & lokaal.' };
     } catch (err: any) {
-      console.error('Unexpected saveBankAccount error:', err);
+      console.error('Unexpected saveBankAccount Firestore error:', err);
       showToast(`Kon bankaccount/UID niet opslaan: ${err?.message || 'onbekende fout'}`, 'error');
       return { success: false, message: err?.message || 'Opslaan mislukt' };
     }
   };
 
   const deleteBankAccount = async (id: number | string) => {
-    const accountToDelete = bankAccounts.find(a => a.id === id);
+    const accountToDelete = bankAccountsRef.current.find(a => a.id === id);
     if (!accountToDelete) return;
 
-    const remainingAccounts = bankAccounts.filter(a => a.id !== id);
+    const remainingAccounts = bankAccountsRef.current.filter(a => a.id !== id);
     setBankAccounts(remainingAccounts);
     if (currentBankAccount && currentBankAccount.id === id) {
       setCurrentBankAccount(null);
@@ -4568,29 +4025,28 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (shouldBlockTableWrite(`Bankrekening @${accountToDelete.username} verwijderen`)) return;
 
-    const client = payClient || posClient;
-    if (client) {
-      try {
-        if (typeof id === 'number' && id < 10000000000) {
-          await client.from('bank_accounts').delete().eq('id', id);
-        } else {
-          await client.from('bank_accounts').delete().eq('username', accountToDelete.username);
-        }
-      } catch {}
+    try {
+      await deleteBankAccountFromFirestore(accountToDelete.username);
+    } catch (err) {
+      console.warn('Firestore deleteBankAccount error:', err);
     }
     broadcastSync('SYNC_BANK_ACCOUNTS', remainingAccounts);
   };
 
   const quickMoneyAccount = async (id: number | string, delta: number) => {
-    setBankAccounts(prev =>
-      prev.map(a => {
-        if (a.id === id) {
-          const n = a.is_admin ? a.balance : Math.max(0, a.balance + delta);
-          return { ...a, balance: n };
-        }
-        return a;
-      })
-    );
+    const targetAcc = bankAccountsRef.current.find(a => a.id === id);
+    if (!targetAcc) return;
+    const nextBal = targetAcc.is_admin ? targetAcc.balance : Math.max(0, Math.round((targetAcc.balance + delta) * 100) / 100);
+    const updatedAcc = { ...targetAcc, balance: nextBal };
+
+    setBankAccounts(prev => prev.map(a => (a.id === id ? updatedAcc : a)));
+    if (currentBankAccount && currentBankAccount.id === id) {
+      setCurrentBankAccount(updatedAcc);
+    }
+
+    if (!targetAcc.is_admin && !shouldBlockTableWrite(`Saldo @${targetAcc.username} aanpassen`)) {
+      adjustBankBalanceTransaction(targetAcc.username, delta, targetAcc).catch(() => {});
+    }
   };
 
   // POS Auth
@@ -4659,74 +4115,61 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: true, message: 'Ingelogd op Raspberry Pi Spaarpaal Kiosk (Vergrendeld)!' };
     }
 
-    // 1. Check live in Supabase pos_users table first
-    if (posClient) {
-      try {
-        const { data, error } = await posClient
-          .from('pos_users')
-          .select('*')
-          .ilike('username', cleanU)
-          .single();
-
-        if (data && !error) {
-          const parsedDbUser = parsePosUserFromDb(data);
-          if (parsedDbUser.is_banned || parsedDbUser.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
-            logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
-            return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
-          }
-          if (data.password === cleanPass || data.password === pass) {
-            return await finalizeOrChallengePosLogin(parsedDbUser);
-          }
+    // 1. Check live in Firestore pos_users collection first
+    try {
+      const dbUsers = await fsGetCollection('pos_users');
+      const matchedRow = dbUsers.find((u: any) => String(u.username || '').trim().toLowerCase() === cleanU);
+      if (matchedRow) {
+        const parsedDbUser = parsePosUserFromDb(matchedRow);
+        if (parsedDbUser.is_banned || parsedDbUser.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
+          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
+          return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
         }
-      } catch (err) {
-        console.warn('Supabase pos_users login error:', err);
+        if (matchedRow.password === cleanPass || matchedRow.password === pass) {
+          return await finalizeOrChallengePosLogin(parsedDbUser);
+        }
       }
+    } catch (err) {
+      console.warn('Firestore pos_users login error:', err);
     }
 
-    // 2. Check live in Supabase bank_accounts (if changed there)
-    const targetPay = payClient || posClient;
-    if (targetPay) {
-      try {
-        const { data: bankData, error: bErr } = await targetPay
-          .from('bank_accounts')
-          .select('*')
-          .ilike('username', cleanU)
-          .single();
-
-        if (bankData && !bErr) {
-          const matchingPosRecord = posUsers.find(u => u.username.toLowerCase() === cleanU);
-          if (
-            bankData.is_banned ||
-            bankData.is_suspended ||
-            matchingPosRecord?.is_banned ||
-            matchingPosRecord?.is_suspended ||
-            blockedDevices.some(b => b.value.toLowerCase() === cleanU)
-          ) {
-            logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
-            return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
-          }
-          if (bankData.password === cleanPass || bankData.pin_code === cleanPass || bankData.password === pass) {
-            const bankUser: PosUser = {
-              id: typeof bankData.id === 'number' ? bankData.id : Date.now(),
-              name: bankData.account_holder,
-              username: bankData.username,
-              password: bankData.password,
-              perms: matchingPosRecord?.perms || (bankData.is_admin 
-                ? ['pos', 'kitchen', 'pickup', 'voorraad', 'manager', 'medewerkers', 'producten', 'coupons_giftcards', 'cash_pay']
-                : ['pos', 'pickup']),
-              is_admin: bankData.is_admin,
-              is_shadowbanned: Boolean(bankData.is_shadowbanned || matchingPosRecord?.is_shadowbanned),
-              is_2fa_enabled: Boolean(bankData.is_2fa_enabled || matchingPosRecord?.is_2fa_enabled),
-              totp_secret: bankData.totp_secret || matchingPosRecord?.totp_secret,
-              backup_codes: bankData.backup_codes || matchingPosRecord?.backup_codes,
-              theme: matchingPosRecord?.theme
-            };
-            return await finalizeOrChallengePosLogin(bankUser);
-          }
+    // 2. Check live in Firestore bank_accounts
+    try {
+      const dbBanks = await getAllBankAccountsFromFirestore();
+      const bankData = dbBanks.find(a => a.username.trim().toLowerCase() === cleanU);
+      if (bankData) {
+        const matchingPosRecord = posUsers.find(u => u.username.toLowerCase() === cleanU);
+        if (
+          bankData.is_banned ||
+          bankData.is_suspended ||
+          matchingPosRecord?.is_banned ||
+          matchingPosRecord?.is_suspended ||
+          blockedDevices.some(b => b.value.toLowerCase() === cleanU)
+        ) {
+          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
+          return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
         }
-      } catch (err) {
-        console.warn('Supabase bank_accounts login error:', err);
+        if (bankData.password === cleanPass || bankData.pin_code === cleanPass || bankData.password === pass) {
+          const bankUser: PosUser = {
+            id: typeof bankData.id === 'number' ? bankData.id : Date.now(),
+            name: bankData.account_holder,
+            username: bankData.username,
+            password: bankData.password,
+            perms: matchingPosRecord?.perms || (bankData.is_admin
+              ? ['pos', 'kitchen', 'pickup', 'voorraad', 'manager', 'medewerkers', 'producten', 'coupons_giftcards', 'cash_pay']
+              : ['pos', 'pickup']),
+            is_admin: bankData.is_admin,
+            is_shadowbanned: Boolean(bankData.is_shadowbanned || matchingPosRecord?.is_shadowbanned),
+            is_2fa_enabled: Boolean(bankData.is_2fa_enabled || matchingPosRecord?.is_2fa_enabled),
+            totp_secret: bankData.totp_secret || matchingPosRecord?.totp_secret,
+            backup_codes: bankData.backup_codes || matchingPosRecord?.backup_codes,
+            theme: matchingPosRecord?.theme
+          };
+          return await finalizeOrChallengePosLogin(bankUser);
+        }
       }
+    } catch (err) {
+      console.warn('Firestore bank_accounts login error:', err);
     }
 
     // 3. Try local cached users (fallback if offline)
@@ -4816,8 +4259,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
 
     const existing = posUsers.find(x => x.id === u.id);
-    const resolvedPassword = u.password && u.password.trim().length > 0 
-      ? u.password.trim() 
+    const resolvedPassword = u.password && u.password.trim().length > 0
+      ? u.password.trim()
       : (existing?.password || '1234');
 
     const finalUser: PosUser = {
@@ -4838,19 +4281,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: true, message: `Gebruiker ${finalUser.name} succesvol opgeslagen!` };
     }
 
-    if (posClient) {
-      try {
-        const dbPerms = buildDbPermsForUser(finalUser);
-        await posClient.from('pos_users').upsert({
-          id: finalUser.id,
-          name: finalUser.name,
-          username: finalUser.username,
-          password: finalUser.password,
-          perms: dbPerms,
-          is_admin: finalUser.is_admin
-        });
-      } catch {}
-    }
+    try {
+      await savePosUserToFirestore(finalUser, buildDbPermsForUser(finalUser));
+    } catch {}
 
     return { success: true, message: `Gebruiker ${finalUser.name} succesvol opgeslagen!` };
   };
@@ -4866,18 +4299,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: true, message: `Nieuwe medewerker ${u.name} aangemaakt!` };
     }
 
-    if (posClient) {
-      try {
-        await posClient.from('pos_users').insert({
-          id: newId,
-          name: u.name,
-          username: u.username,
-          password: u.password,
-          perms: buildDbPermsForUser(newUser),
-          is_admin: u.is_admin
-        });
-      } catch {}
-    }
+    try {
+      await savePosUserToFirestore(newUser, buildDbPermsForUser(newUser));
+    } catch {}
 
     return { success: true, message: `Nieuwe medewerker ${u.name} aangemaakt!` };
   };
@@ -4901,56 +4325,32 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: true, message: `Gebruiker ${target.name} verwijderd.` };
     }
 
-    if (posClient) {
-      try {
-        await posClient.from('pos_users').delete().eq('id', userId);
-      } catch {}
-    }
+    try {
+      await deletePosUserFromFirestore(userId);
+    } catch {}
 
     return { success: true, message: `Gebruiker ${target.name} verwijderd.` };
   };
 
-  // Products
+  // Products (synced inclusief keuzemenu's / options, brand en recepten!)
   const createProduct = async (p: Omit<Product, 'id'>) => {
     const newP: Product = { ...p, id: Date.now() };
     setProducts(prev => [...prev, newP]);
     if (shouldBlockTableWrite(`Product "${p.name}" aanmaken`)) return;
-    if (posClient) {
-      try {
-        await posClient.from('products').insert({
-          id: newP.id,
-          name: newP.name,
-          price: newP.price,
-          sale_price: newP.salePrice,
-          on_sale: newP.onSale,
-          cat: newP.cat,
-          emoji: newP.emoji,
-          in_stock: newP.inStock
-        });
-      } catch (err) {
-        console.error("DEBUG: createProduct error:", err);
-      }
+    try {
+      await saveProductToFirestore(newP);
+    } catch (err) {
+      console.error('Firestore createProduct error:', err);
     }
   };
 
   const updateProduct = async (p: Product) => {
     setProducts(prev => prev.map(x => x.id === p.id ? p : x));
     if (shouldBlockTableWrite(`Product "${p.name}" wijzigen naar €${p.price}`)) return;
-    if (posClient) {
-      try {
-        await posClient.from('products').upsert({
-          id: p.id,
-          name: p.name,
-          price: p.price,
-          sale_price: p.salePrice,
-          on_sale: p.onSale,
-          cat: p.cat,
-          emoji: p.emoji,
-          in_stock: p.inStock
-        });
-      } catch (err) {
-        console.error("DEBUG: updateProduct error:", err);
-      }
+    try {
+      await saveProductToFirestore(p);
+    } catch (err) {
+      console.error('Firestore updateProduct error:', err);
     }
   };
 
@@ -4962,28 +4362,27 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
     saveDisasterRecoverySnapshot();
     setProducts(prev => prev.filter(x => x.id !== id));
-    if (posClient) {
-      try {
-        await posClient.from('products').delete().eq('id', id);
-      } catch {}
+    try {
+      await deleteProductFromFirestore(id);
+    } catch (err) {
+      console.error('Firestore deleteProduct error:', err);
     }
   };
 
   const toggleProductSale = async (id: number) => {
     const prod = products.find(p => p.id === id);
     if (!prod) return;
-    const newState = !prod.onSale;
-    setProducts(prev => prev.map(p => p.id === id ? { ...p, onSale: newState } : p));
-    if (posClient) {
-      try {
-        await posClient.from('products').update({ on_sale: newState }).eq('id', id);
-      } catch (err) {
-        console.error("DEBUG: toggleProductSale error:", err);
-      }
+    const updatedProd: Product = { ...prod, onSale: !prod.onSale };
+    setProducts(prev => prev.map(p => p.id === id ? updatedProd : p));
+    if (shouldBlockTableWrite(`Product "${prod.name}" actie wijzigen`)) return;
+    try {
+      await saveProductToFirestore(updatedProd);
+    } catch (err) {
+      console.error('Firestore toggleProductSale error:', err);
     }
   };
 
-  const resetProductsToDefault = () => {
+  const resetProductsToDefault = async () => {
     if (shouldBlockTableWrite('Menulijst resetten')) {
       setProducts(ALL_DEFAULT_PRODUCTS);
       return;
@@ -4992,62 +4391,27 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     localStorage.setItem('wd_products', JSON.stringify(ALL_DEFAULT_PRODUCTS));
     localStorage.setItem('wd_products_version', 'v8_koekploeg_and_werkpay');
     setProducts(ALL_DEFAULT_PRODUCTS);
-    if (posClient) {
-      const rows = ALL_DEFAULT_PRODUCTS.map(p => ({
-        id: p.id,
-        name: p.name,
-        price: p.price,
-        sale_price: p.salePrice || 0,
-        on_sale: p.onSale || false,
-        cat: p.cat,
-        emoji: p.emoji,
-        in_stock: p.inStock
-      }));
-      posClient.from('products').upsert(rows).then(({ error }) => {
-        if (error) console.error('Supabase sync error on reset:', error);
-      });
+    try {
+      await saveProductsBatchToFirestore(ALL_DEFAULT_PRODUCTS);
+    } catch (err) {
+      console.error('Firestore sync error on reset:', err);
     }
   };
 
   const syncProducts = async () => {
-    if (!posClient) {
-      showToast('Niet verbonden met Supabase.', 'error');
-      return;
-    }
     setSyncStatus('syncing');
     try {
-      const { data, error } = await posClient.from('products').select('*').order('id', { ascending: true });
-      if (error) throw error;
+      const data = await fsGetCollection('products');
       if (data && data.length > 0) {
-        let localList: Product[] = [];
-        try {
-          const rawLocal = localStorage.getItem('wd_products');
-          if (rawLocal) localList = JSON.parse(rawLocal);
-        } catch {}
-        const parsed = data.map(p => {
-          const defP = ALL_DEFAULT_PRODUCTS.find(d => d.id === p.id);
-          const locP = localList.find(l => l.id === p.id);
-          return {
-            id: p.id,
-            name: p.name,
-            price: Number(p.price),
-            salePrice: Number(p.sale_price || 0),
-            onSale: Boolean(p.on_sale),
-            cat: p.cat,
-            emoji: p.emoji,
-            inStock: Boolean(p.in_stock),
-            options: p.options || locP?.options || defP?.options,
-            brand: p.brand || locP?.brand || defP?.brand,
-            recipe: p.recipe || locP?.recipe || defP?.recipe,
-            recipeDescription: p.recipe_description || locP?.recipeDescription || defP?.recipeDescription
-          };
-        });
+        const parsed = data.map(fromFirestoreProduct).sort((a, b) => a.id - b.id);
         setProducts(parsed);
         localStorage.setItem('wd_products', JSON.stringify(parsed));
-        showToast(`📦 ${data.length} producten succesvol gesynchroniseerd met online database!`, 'success');
+        showToast(`📦 ${parsed.length} producten (incl. keuzemenu's) gesynchroniseerd met Firebase Cloud!`, 'success');
       } else {
-        showToast('Geen producten gevonden in online database.', 'warning');
+        await saveProductsBatchToFirestore(products.length > 0 ? products : ALL_DEFAULT_PRODUCTS);
+        showToast('📦 Menulijst & keuzemenu’s geüpload naar Firebase Cloud!', 'success');
       }
+      setIsOnline(true);
     } catch (err: any) {
       console.error('Sync products error:', err);
       showToast('Fout bij laden producten: ' + (err.message || 'Onbekende fout'), 'error');
@@ -5061,21 +4425,29 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const item = inventory.find(x => x.id === id);
     if (!item) return;
     const cost = amount * item.cost_price;
-    setInventory(prev => prev.map(x => x.id === id ? { ...x, stock_qty: x.stock_qty + amount } : x));
+    const updatedItem: InventoryItem = { ...item, stock_qty: item.stock_qty + amount };
+    setInventory(prev => prev.map(x => x.id === id ? updatedItem : x));
     setTotalExpenses(prev => prev + cost);
+    if (!shouldBlockTableWrite(`Voorraad "${item.item_name}" inkopen`)) {
+      saveInventoryItemToFirestore(updatedItem).catch(() => {});
+    }
   };
 
   const addInventoryItem = (item: Omit<InventoryItem, 'id'>) => {
-    setInventory(prev => [...prev, { ...item, id: Date.now() }]);
+    const newItem: InventoryItem = { ...item, id: Date.now() };
+    setInventory(prev => [...prev, newItem]);
+    if (!shouldBlockTableWrite(`Voorraadartikel "${item.item_name}" toevoegen`)) {
+      saveInventoryItemToFirestore(newItem).catch(() => {});
+    }
   };
 
   // Coupons & Gift Cards
   const createGiftCard = async (
-    code: string, 
-    amount: number, 
-    sender_name?: string, 
-    recipient_name?: string, 
-    recipient_phone?: string, 
+    code: string,
+    amount: number,
+    sender_name?: string,
+    recipient_name?: string,
+    recipient_phone?: string,
     notes?: string
   ) => {
     const cleanCode = code.toUpperCase();
@@ -5099,22 +4471,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (shouldBlockTableWrite(`Cadeaubon ${cleanCode} aanmaken`)) return;
 
-    if (posClient) {
-      try {
-        await posClient.from('gift_cards').insert({
-          id: newGc.id,
-          code: newGc.code,
-          initial_balance: newGc.initial_balance,
-          current_balance: newGc.current_balance,
-          is_active: newGc.is_active,
-          sender_name: newGc.sender_name || null,
-          recipient_name: newGc.recipient_name || null,
-          recipient_phone: newGc.recipient_phone || null,
-          notes: newGc.notes || null
-        });
-      } catch (err) {
-        console.error('Error creating gift card in DB:', err);
-      }
+    try {
+      await saveGiftCardToFirestore(newGc);
+    } catch (err) {
+      console.error('Error creating gift card in Firestore:', err);
     }
 
     // Link card to existing WerkLoyalty account if phone is provided
@@ -5134,28 +4494,25 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   };
 
   const topUpGiftCard = async (id: number, amount: number) => {
-    setGiftCards(prev => prev.map(g => g.id === id ? { ...g, current_balance: g.current_balance + amount } : g));
+    const card = giftCards.find(g => g.id === id);
+    if (!card) return;
+    const updatedCard: GiftCard = { ...card, current_balance: card.current_balance + amount };
+    setGiftCards(prev => prev.map(g => g.id === id ? updatedCard : g));
     if (shouldBlockTableWrite(`Cadeaubon #${id} opwaarderen`)) return;
-    if (posClient) {
-      try {
-        const { data } = await posClient.from('gift_cards').select('current_balance').eq('id', id).single();
-        const currentBalance = data ? Number(data.current_balance) : 0;
-        await posClient.from('gift_cards').update({ current_balance: currentBalance + amount }).eq('id', id);
-      } catch (err) {
-        console.error('Error topping up gift card in DB:', err);
-      }
+    try {
+      await saveGiftCardToFirestore(updatedCard);
+    } catch (err) {
+      console.error('Error topping up gift card in Firestore:', err);
     }
   };
 
   const deleteGiftCard = async (id: number) => {
     setGiftCards(prev => prev.filter(g => g.id !== id));
     if (shouldBlockTableWrite(`Cadeaubon #${id} verwijderen`)) return;
-    if (posClient) {
-      try {
-        await posClient.from('gift_cards').delete().eq('id', id);
-      } catch (err) {
-        console.error('Error deleting gift card from DB:', err);
-      }
+    try {
+      await deleteGiftCardFromFirestore(id);
+    } catch (err) {
+      console.error('Error deleting gift card from Firestore:', err);
     }
   };
 
@@ -5163,39 +4520,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const newC: Coupon = { ...coupon, id: Date.now() };
     setCoupons(prev => [...prev, newC]);
     if (shouldBlockTableWrite(`Coupon ${newC.code} aanmaken`)) return;
-    if (posClient) {
-      try {
-        await posClient.from('coupons').insert({
-          id: newC.id,
-          code: newC.code.toUpperCase(),
-          discount_type: newC.discount_type,
-          discount_val: newC.discount_val,
-          min_subtotal: newC.min_subtotal || 0,
-          target_product_name: newC.target_product_name || '',
-          is_active: newC.is_active
-        });
-      } catch (err) {
-        console.error('Error creating coupon in DB:', err);
-      }
+    try {
+      await saveCouponToFirestore(newC);
+    } catch (err) {
+      console.error('Error creating coupon in Firestore:', err);
     }
   };
 
   const toggleCouponActive = async (id: number) => {
-    let nextActiveState = true;
-    setCoupons(prev => prev.map(c => {
-      if (c.id === id) {
-        nextActiveState = !c.is_active;
-        return { ...c, is_active: nextActiveState };
-      }
-      return c;
-    }));
+    const target = coupons.find(c => c.id === id);
+    if (!target) return;
+    const updatedCoupon: Coupon = { ...target, is_active: !target.is_active };
+    setCoupons(prev => prev.map(c => c.id === id ? updatedCoupon : c));
     if (shouldBlockTableWrite(`Coupon #${id} status wijzigen`)) return;
-    if (posClient) {
-      try {
-        await posClient.from('coupons').update({ is_active: nextActiveState }).eq('id', id);
-      } catch (err) {
-        console.error('Error toggling coupon active state in DB:', err);
-      }
+    try {
+      await saveCouponToFirestore(updatedCoupon);
+    } catch (err) {
+      console.error('Error toggling coupon active state in Firestore:', err);
     }
   };
 
@@ -5248,11 +4589,11 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     return orders.filter(isUserOrder);
   }, [orders, isUserOrder]);
 
-  const activeUserOrders = orders.filter(o => 
-    isUserOrder(o) && 
-    o.status !== 'afgehaald' && 
-    o.status !== 'archived' && 
-    o.status !== 'cancelled' && 
+  const activeUserOrders = orders.filter(o =>
+    isUserOrder(o) &&
+    o.status !== 'afgehaald' &&
+    o.status !== 'archived' &&
+    o.status !== 'cancelled' &&
     o.status !== 'geannuleerd'
   );
 
@@ -5269,15 +4610,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         setActiveBrand,
         brandConfig,
         brandProducts,
-        supabaseConfig,
-        setSupabaseConfig,
-        posClient,
-        payClient,
         isOnline,
-        isSupabaseConfigured: Boolean(
-          (supabaseConfig.unifiedUrl || supabaseConfig.supabaseUrl) &&
-          (supabaseConfig.unifiedKey || supabaseConfig.supabaseAnonKey)
-        ),
         connectionText,
         syncStatus,
         isRealtimeActive,

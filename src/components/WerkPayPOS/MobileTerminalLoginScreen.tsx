@@ -59,7 +59,7 @@ export const MobileTerminalLoginScreen: React.FC<MobileTerminalLoginScreenProps>
           <div className="min-w-0">
             <h1 className="text-base font-black text-white truncate">{brandName}</h1>
             <p className="text-xs text-cyan-400 font-semibold truncate">
-              SumUp Pocket Terminal · Alleen voor personeel
+              WerkPin Pocket Terminal · Alleen voor personeel
             </p>
           </div>
         </div>
@@ -141,7 +141,7 @@ export const MobileTerminalLoginScreen: React.FC<MobileTerminalLoginScreenProps>
               className="w-full min-h-[48px] py-3 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 active:scale-[0.98] text-slate-950 font-black text-sm flex items-center justify-center gap-2 transition shadow-lg shadow-cyan-500/20"
             >
               <LogIn className="w-4 h-4" />
-              <span>{isSubmitting ? 'Controleren...' : 'Open SumUp Terminal'}</span>
+              <span>{isSubmitting ? 'Controleren...' : 'Open WerkPin Terminal'}</span>
             </button>
           </form>
         </div>

@@ -1,11 +1,26 @@
 import React, { useEffect, useState } from 'react';
-import { RefreshCw, Sparkles, AlertCircle } from 'lucide-react';
+import { RefreshCw, Sparkles } from 'lucide-react';
+
+const reloadFresh = async () => {
+  try {
+    if ('caches' in window) {
+      const names = await caches.keys();
+      await Promise.all(names.map((name) => caches.delete(name)));
+    }
+  } catch {}
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('_r', String(Date.now()));
+    window.location.replace(url.toString());
+  } catch {
+    window.location.reload();
+  }
+};
 
 export const AutoUpdateBanner: React.FC = () => {
   const [initialBuildTime, setInitialBuildTime] = useState<number | null>(null);
   const [newVersionDetected, setNewVersionDetected] = useState<boolean>(false);
   const [countdown, setCountdown] = useState<number>(4);
-  const [isManuallyChecking, setIsManuallyChecking] = useState<boolean>(false);
 
   const getVersionUrl = () => {
     return `./version.json?t=${Date.now()}`;
@@ -23,7 +38,7 @@ export const AutoUpdateBanner: React.FC = () => {
             setInitialBuildTime(data.buildTime);
           }
         }
-      } catch (err) {
+      } catch {
         // Silently ignore 404 / network error for dev environment
       }
     };
@@ -32,7 +47,7 @@ export const AutoUpdateBanner: React.FC = () => {
     return () => { isMounted = false; };
   }, []);
 
-  // Poll version every 20 seconds
+  // Poll version every 20 seconds and immediately on tab focus / visibility restore
   useEffect(() => {
     if (!initialBuildTime) return;
 
@@ -45,13 +60,25 @@ export const AutoUpdateBanner: React.FC = () => {
             setNewVersionDetected(true);
           }
         }
-      } catch (err) {
+      } catch {
         // Ignore periodic network errors
       }
     };
 
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void checkVersion();
+      }
+    };
+
     const interval = setInterval(checkVersion, 20000);
-    return () => clearInterval(interval);
+    window.addEventListener('focus', checkVersion);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', checkVersion);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [initialBuildTime]);
 
   // Handle countdown and auto-reload when new version is detected
@@ -59,7 +86,7 @@ export const AutoUpdateBanner: React.FC = () => {
     if (!newVersionDetected) return;
 
     if (countdown <= 0) {
-      window.location.reload();
+      void reloadFresh();
       return;
     }
 
@@ -69,28 +96,6 @@ export const AutoUpdateBanner: React.FC = () => {
 
     return () => clearTimeout(timer);
   }, [newVersionDetected, countdown]);
-
-  const handleManualCheck = async () => {
-    setIsManuallyChecking(true);
-    try {
-      const res = await fetch(getVersionUrl(), { cache: 'no-store' });
-      if (res.ok) {
-        const data = await res.json();
-        if (initialBuildTime && data.buildTime && data.buildTime > initialBuildTime + 2000) {
-          setNewVersionDetected(true);
-        } else {
-          // Hard reload if user explicitly asked
-          window.location.reload();
-        }
-      } else {
-        window.location.reload();
-      }
-    } catch {
-      window.location.reload();
-    } finally {
-      setIsManuallyChecking(false);
-    }
-  };
 
   if (!newVersionDetected) {
     return null;
@@ -106,7 +111,7 @@ export const AutoUpdateBanner: React.FC = () => {
       <div className="flex items-center gap-2">
         <button
           type="button"
-          onClick={() => window.location.reload()}
+          onClick={() => { void reloadFresh(); }}
           className="px-3 py-1 bg-slate-950 hover:bg-slate-900 text-white font-black text-xs rounded-lg transition shadow-md flex items-center gap-1 active:scale-95"
         >
           <RefreshCw className="w-3.5 h-3.5 text-emerald-400 animate-spin" />

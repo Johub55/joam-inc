@@ -70,10 +70,10 @@ export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess
           <div className="md:hidden p-3 rounded-2xl bg-cyan-950/40 border border-cyan-500/40 text-xs text-cyan-200 space-y-0.5">
             <div className="font-black flex items-center gap-1.5">
               <span>📱</span>
-              <span>Speciale Klein-Scherm SumUp Modus</span>
+              <span>Speciale Klein-Scherm WerkPin Modus</span>
             </div>
             <p className="text-[11px] text-slate-300 leading-snug">
-              Na het inloggen opent direct de speciale mobiele SumUp betaalterminal.
+              Na het inloggen opent direct de speciale mobiele WerkPin betaalterminal.
             </p>
           </div>
 
@@ -134,7 +134,7 @@ export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess
           </form>
 
           <p className="text-[11px] text-slate-500 text-center leading-relaxed">
-            Medewerker accounts worden veilig beheerd in Supabase. Wachtwoorden worden nooit publiekelijk op het scherm getoond.
+            Medewerker accounts worden veilig beheerd in Firebase Cloud. Wachtwoorden worden nooit publiekelijk op het scherm getoond.
           </p>
 
         </div>

@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro, formatCardUid } from '../../services/store';
 import { AudioFX } from '../../services/audio';
+import { fsSetDoc, fsSubscribeCollection, sanitizeDocId } from '../../services/firebase';
+import { adjustBankBalanceTransaction, saveBankTransactionToFirestore } from '../../services/firestoreSync';
 import { 
   Phone, 
   PhoneCall, 
@@ -85,9 +87,7 @@ export const DigitalPhone: React.FC = () => {
     orders,
     posUsers,
     createCashRequest,
-    saveBankAccount,
-    payClient,
-    posClient
+    saveBankAccount
   } = useApp();
 
   const [isOpen, setIsOpen] = useState<boolean>(false);
@@ -550,24 +550,45 @@ export const DigitalPhone: React.FC = () => {
     };
   }, [analyser, isMuted]);
 
-  // Helper to broadcast phone signals (calls and SMS) across local tabs and Supabase network
+  const phoneMountTsRef = useRef<number>(Date.now());
+  const seenPhoneSignalsRef = useRef<Set<string>>(new Set());
+
+  // Helper to broadcast phone signals (calls and SMS) across local tabs and Firebase Firestore
   const sendPhoneSignal = (payload: any) => {
+    const signalWithTs = {
+      ...payload,
+      ts: typeof payload?.ts === 'number' ? payload.ts : Date.now()
+    };
+
     try {
       const localChan = new BroadcastChannel('wd_phone_channel');
-      localChan.postMessage(payload);
+      localChan.postMessage(signalWithTs);
       localChan.close();
     } catch {}
 
-    const sbClient = payClient || posClient;
-    if (sbClient) {
-      try {
-        sbClient.channel('wd_phone_signals').send({
-          type: 'broadcast',
-          event: 'phone_signal',
-          payload
-        }).catch(() => {});
-      } catch {}
+    const allowedKeys = [
+      'type', 'fromId', 'toId', 'senderId', 'senderName', 'targetId',
+      'text', 'avatar', 'role', 'fromName', 'fromPhone', 'fromRole',
+      'sdp', 'candidate', 'ts'
+    ];
+    const cleanPayload: Record<string, any> = {};
+    for (const k of allowedKeys) {
+      if (signalWithTs[k] !== undefined && signalWithTs[k] !== null) {
+        if (k === 'sdp' || k === 'candidate') {
+          try {
+            cleanPayload[k] = JSON.parse(JSON.stringify(signalWithTs[k]));
+          } catch {}
+        } else {
+          cleanPayload[k] = signalWithTs[k];
+        }
+      }
     }
+    if (!cleanPayload.type) return;
+    if (typeof cleanPayload.ts !== 'number') cleanPayload.ts = Date.now();
+
+    const sigId = sanitizeDocId(`sig_${cleanPayload.ts}_${Math.random().toString(36).slice(2, 7)}`);
+    seenPhoneSignalsRef.current.add(sigId);
+    fsSetDoc('phone_signals', sigId, cleanPayload).catch(() => {});
   };
 
   // Ringtone sound effect loop during active dialing or incoming calls
@@ -689,33 +710,6 @@ export const DigitalPhone: React.FC = () => {
   const [smsInput, setSmsInput] = useState<string>('');
   const [showNewChatList, setShowNewChatList] = useState<boolean>(false);
   const [contacts, setContacts] = useState<SMSContact[]>([]);
-  const phoneChannel = useRef<any>(null);
-
-  useEffect(() => {
-    if (posClient) {
-      phoneChannel.current = posClient.channel('phone_messages');
-      phoneChannel.current
-        .on('broadcast', { event: 'new_message' }, ({ payload }) => {
-          // Handle incoming message
-          setContacts(prev => prev.map(c => {
-            if (c.phone === payload.contactPhone) {
-              return {
-                ...c,
-                messages: [...c.messages, payload.message],
-                unread: true
-              };
-            }
-            return c;
-          }));
-        })
-        .subscribe();
-    }
-    return () => {
-      if (phoneChannel.current) {
-        posClient?.removeChannel(phoneChannel.current);
-      }
-    };
-  }, [posClient]);
   const [showGtaModal, setShowGtaModal] = useState<boolean>(false);
 
   // Initialize Contacts list, loading purely from localStorage but excluding any leftover mock profiles
@@ -933,140 +927,103 @@ export const DigitalPhone: React.FC = () => {
       localChan.onmessage = (event) => processSignal(event.data);
     } catch {}
 
-    // Listen via Supabase Realtime Broadcast channel
-    const sbClient = payClient || posClient;
-    let sbSignalChan: any = null;
-    if (sbClient) {
-      try {
-        sbSignalChan = sbClient.channel('wd_phone_signals')
-          .on('broadcast', { event: 'phone_signal' }, ({ payload }: any) => {
-            processSignal(payload);
-          })
-          .subscribe();
-      } catch {}
-    }
+    // Listen via Firebase Firestore phone_signals collection
+    const unsubSignals = fsSubscribeCollection<any>(
+      'phone_signals',
+      (rows) => {
+        const sorted = [...rows].sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+        for (const row of sorted) {
+          const sigKey = String(row._docId || `${row.type}_${row.ts}`);
+          if (seenPhoneSignalsRef.current.has(sigKey)) continue;
+          seenPhoneSignalsRef.current.add(sigKey);
+          if (Number(row.ts || 0) < phoneMountTsRef.current - 5000) continue;
+          processSignal(row);
+        }
+      },
+      () => {}
+    );
 
     return () => {
       if (localChan) localChan.close();
-      if (sbSignalChan && sbClient) sbClient.removeChannel(sbSignalChan);
+      unsubSignals();
     };
-  }, [payClient, posClient, isOpen, activeApp, activeContactId, myId, callPartnerId]);
+  }, [isOpen, activeApp, activeContactId, myId, callPartnerId]);
 
-  // Supabase phone_messages Database Sync & Realtime Subscription
+  // Firebase Firestore phone_messages Real-Time Subscription
   useEffect(() => {
-    const sbClient = payClient || posClient;
-    if (!sbClient) return;
+    const unsubMessages = fsSubscribeCollection<any>(
+      'phone_messages',
+      (rows) => {
+        const myIncoming = rows
+          .filter((r) => r.target_id === myId)
+          .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
 
-    let channel: any = null;
+        if (myIncoming.length === 0) return;
 
-    // Fetch initial messages sent to me from Supabase database
-    const fetchSupabaseMessages = async () => {
-      try {
-        const { data, error } = await sbClient
-          .from('phone_messages')
-          .select('*')
-          .eq('target_id', myId)
-          .order('created_at', { ascending: true })
-          .limit(100);
+        let hadNewUnread = false;
+        let lastNewSender = '';
+        let lastNewText = '';
 
-        if (data && data.length > 0) {
-          setContacts(prev => {
-            let next = [...prev];
-            data.forEach((row: any) => {
-              const senderId = row.sender_id;
-              const existing = next.find(c => c.id === senderId);
-              const msgTime = new Date(row.created_at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-              const msgId = 'sb_' + row.id;
+        setContacts((prev) => {
+          let next = [...prev];
+          for (const row of myIncoming) {
+            const senderId = String(row.sender_id || '');
+            if (!senderId) continue;
+            const msgId = 'fb_' + String(row.id || row._docId || '');
+            const alreadyKnown = next.some((c) => c.id === senderId && c.messages.some((m) => m.id === msgId));
+            if (alreadyKnown) continue;
 
-              const msgObj: SMSMessage = {
-                id: msgId,
-                sender: 'them',
-                text: row.text,
-                timestamp: msgTime,
-                read: true
-              };
-
-              if (existing) {
-                if (!existing.messages.some(m => m.id === msgId)) {
-                  next = next.map(c => c.id === senderId ? { ...c, messages: [...c.messages, msgObj] } : c);
-                }
-              } else {
-                next.push({
-                  id: senderId,
-                  name: row.sender_name || senderId,
-                  avatar: row.avatar || '📱',
-                  role: row.role || 'Gebruiker',
-                  phone: '06-' + senderId,
-                  unread: false,
-                  messages: [msgObj],
-                  isCustom: true
-                });
-              }
-            });
-            saveSmsToStorage(next);
-            return next;
-          });
-        }
-      } catch {}
-    };
-
-    fetchSupabaseMessages();
-
-    // Subscribe to real-time inserts on phone_messages table
-    try {
-      channel = sbClient
-        .channel('public:phone_messages')
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'phone_messages', filter: `target_id=eq.${myId}` }, (payload: any) => {
-          const row = payload.new;
-          if (!row) return;
-
-          const senderId = row.sender_id;
-          const msgTime = new Date(row.created_at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          const msgId = 'sb_' + row.id;
-
-          setContacts(prev => {
-            const existing = prev.find(c => c.id === senderId);
+            const msgTime = row.timestamp || new Date(row.created_at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             const msgObj: SMSMessage = {
               id: msgId,
               sender: 'them',
-              text: row.text,
-              timestamp: msgTime,
-              read: false
+              text: String(row.text || ''),
+              timestamp: String(msgTime),
+              read: activeContactId === senderId
             };
 
-            let next: SMSContact[] = [];
+            hadNewUnread = true;
+            lastNewSender = String(row.sender_name || senderId);
+            lastNewText = String(row.text || '');
+
+            const existing = next.find((c) => c.id === senderId);
             if (existing) {
-              if (existing.messages.some(m => m.id === msgId)) return prev;
-              next = prev.map(c => c.id === senderId ? { ...c, messages: [...c.messages, msgObj], unread: activeContactId !== senderId } : c);
+              next = next.map((c) =>
+                c.id === senderId
+                  ? { ...c, messages: [...c.messages, msgObj], unread: activeContactId !== senderId }
+                  : c
+              );
             } else {
-              next = [...prev, {
+              next.push({
                 id: senderId,
-                name: row.sender_name || senderId,
-                avatar: row.avatar || '📱',
-                role: row.role || 'Gebruiker',
+                name: String(row.sender_name || senderId),
+                avatar: String(row.avatar || '📱'),
+                role: String(row.role || 'Gebruiker'),
                 phone: '06-' + senderId,
                 unread: activeContactId !== senderId,
                 messages: [msgObj],
                 isCustom: true
-              }];
+              });
             }
-
-            saveSmsToStorage(next);
-            return next;
-          });
-
-          if (!isOpen || activeApp !== 'messages' || activeContactId !== senderId) {
-            setNotification({ title: row.sender_name || 'Nieuw bericht', body: row.text });
-            try { AudioFX.beep(); } catch {} // Replaced bell with quiet beep
           }
-        })
-        .subscribe();
-    } catch {}
+          if (hadNewUnread) {
+            saveSmsToStorage(next);
+          }
+          return hadNewUnread ? next : prev;
+        });
+
+        if (hadNewUnread && (!isOpen || activeApp !== 'messages')) {
+          setNotification({ title: lastNewSender || 'Nieuw bericht', body: lastNewText });
+          try { AudioFX.beep(); } catch {}
+        }
+      },
+      () => {}
+    );
 
     return () => {
-      if (channel && sbClient) sbClient.removeChannel(channel);
+      unsubMessages();
     };
-  }, [payClient, posClient, myId, activeContactId, isOpen, activeApp]);
+  }, [myId, activeContactId, isOpen, activeApp]);
 
   const sendSms = (contactId: string, overrideText?: string, priority: 'normal' | 'urgent' | 'emergency' = 'normal', action?: { label: string; event: string }) => {
     const text = overrideText || smsInput.trim();
@@ -1106,14 +1063,6 @@ export const DigitalPhone: React.FC = () => {
       return c;
     }));
 
-    if (phoneChannel.current) {
-      phoneChannel.current.send({
-        type: 'broadcast',
-        event: 'new_message',
-        payload: { contactPhone: contact.phone, message: myMsg }
-      });
-    }
-
     let updated = contacts.map(c => {
       if (c.id === contactId) {
         return {
@@ -1127,20 +1076,21 @@ export const DigitalPhone: React.FC = () => {
     setContacts(updated);
     saveSmsToStorage(updated);
 
-    // 1. Save message to Supabase database if connected
-    const sbClient = payClient || posClient;
-    if (sbClient) {
-      sbClient.from('phone_messages').insert({
-        sender_id: myId,
-        sender_name: myName,
-        target_id: contactId,
-        text,
-        avatar: myAvatar,
-        role: myRole
-      }).then(() => {}).catch(() => {});
-    }
+    // 1. Save message to Firebase Firestore
+    const msgDocId = sanitizeDocId(`msg_${Date.now()}_${Math.floor(Math.random() * 10000)}`);
+    fsSetDoc('phone_messages', msgDocId, {
+      id: msgDocId,
+      sender_id: String(myId).slice(0, 128),
+      sender_name: String(myName).slice(0, 120),
+      target_id: String(contactId).slice(0, 128),
+      text: String(text).slice(0, 2000),
+      avatar: String(myAvatar).slice(0, 32),
+      role: String(myRole).slice(0, 80),
+      timestamp: timeStr,
+      created_at: new Date().toISOString()
+    }).catch(() => {});
 
-    // 2. Broadcast SMS to other tabs / devices via dual-channel (BroadcastChannel + Supabase)
+    // 2. Broadcast SMS to other tabs / devices via dual-channel (BroadcastChannel + Firestore)
     sendPhoneSignal({
       type: 'SMS_RECEIVED',
       senderId: myId,
@@ -2480,7 +2430,33 @@ export const DigitalPhone: React.FC = () => {
                                               setActiveApp('werkpay');
                                               return;
                                             }
-                                            const success = await payClient(contact.id, numAmt, `Tikkie: ${tikNote}`);
+                                            let success = false;
+                                            if (wpAccount.is_admin || Number(wpAccount.balance) >= numAmt) {
+                                              const nextSenderBal = wpAccount.is_admin ? Number(wpAccount.balance) : Math.max(0, Math.round((Number(wpAccount.balance) - numAmt) * 100) / 100);
+                                              const updatedSender = { ...wpAccount, balance: nextSenderBal };
+                                              setWpAccount(updatedSender);
+                                              saveBankAccount(updatedSender);
+                                              await adjustBankBalanceTransaction(wpAccount.username, -numAmt, wpAccount).catch(() => {});
+
+                                              const targetAcc = bankAccounts.find(
+                                                a => a.username.toLowerCase() === contact.id.toLowerCase() ||
+                                                     a.account_holder.toLowerCase() === contact.name.toLowerCase()
+                                              );
+                                              if (targetAcc) {
+                                                await adjustBankBalanceTransaction(targetAcc.username, numAmt, targetAcc).catch(() => {});
+                                              }
+                                              await saveBankTransactionToFirestore({
+                                                id: Date.now(),
+                                                from_account: wpAccount.username,
+                                                to_account: targetAcc ? targetAcc.username : contact.name,
+                                                amount: numAmt,
+                                                label: `WerkPay Tikkie: ${tikNote}`,
+                                                note: `Betaald via WerkOS Telefoon aan ${contact.name}`,
+                                                when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
+                                                timestamp: Date.now()
+                                              }).catch(() => {});
+                                              success = true;
+                                            }
                                             if (success) {
                                               try { AudioFX.bell(); } catch {}
                                               setNotification({
@@ -2754,7 +2730,7 @@ export const DigitalPhone: React.FC = () => {
                     </div>
                     <div className="flex justify-between py-1 border-b border-slate-850 text-[11px]">
                       <span className="text-slate-400">Verbinding:</span>
-                      <span className="text-cyan-400 font-bold">Supabase Realtime</span>
+                      <span className="text-cyan-400 font-bold">Firebase Realtime</span>
                     </div>
                     <div className="flex justify-between py-1 text-[11px]">
                       <span className="text-slate-400">Actieve Identiteit:</span>

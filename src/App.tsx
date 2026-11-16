@@ -1,6 +1,6 @@
-import React, { useState, Suspense, lazy } from 'react';
+import React, { useState } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
-import { ShieldAlert, Loader2 } from 'lucide-react';
+import { ShieldAlert } from 'lucide-react';
 import { Header } from './components/Header';
 import { PosScreen } from './components/WerkPayPOS/PosScreen';
 import { ReceiptModal } from './components/WerkPayPOS/ReceiptModal';
@@ -12,30 +12,20 @@ import { AppToast } from './components/AppToast';
 import { TwoFactorChallengeModal } from './components/TwoFactorChallengeModal';
 import { TwoFactorSetupModal } from './components/TwoFactorSetupModal';
 import { SystemLockScreen } from './components/WerkPayPOS/SystemLockScreen';
-
-const KitchenScreen = lazy(() => import('./components/WerkPayPOS/KitchenScreen').then(m => ({ default: m.KitchenScreen })));
-const PickupScreen = lazy(() => import('./components/WerkPayPOS/PickupScreen').then(m => ({ default: m.PickupScreen })));
-const PickupControlScreen = lazy(() => import('./components/WerkPayPOS/PickupControlScreen').then(m => ({ default: m.PickupControlScreen })));
-const InventoryScreen = lazy(() => import('./components/WerkPayPOS/InventoryScreen').then(m => ({ default: m.InventoryScreen })));
-const ManagerScreen = lazy(() => import('./components/WerkPayPOS/ManagerScreen').then(m => ({ default: m.ManagerScreen })));
-const OrderTrackingScreen = lazy(() => import('./components/WerkPayPOS/OrderTrackingScreen').then(m => ({ default: m.OrderTrackingScreen })));
-const LoyaltyTerminalScreen = lazy(() => import('./components/WerkPayPOS/LoyaltyTerminalScreen').then(m => ({ default: m.LoyaltyTerminalScreen })));
-const SumUpTerminalScreen = lazy(() => import('./components/WerkPayPOS/SumUpTerminalScreen').then(m => ({ default: m.SumUpTerminalScreen })));
-const MobileTerminalLoginScreen = lazy(() => import('./components/WerkPayPOS/MobileTerminalLoginScreen').then(m => ({ default: m.MobileTerminalLoginScreen })));
-const WalletScreen = lazy(() => import('./components/WerkPayBank/WalletScreen').then(m => ({ default: m.WalletScreen })));
-const ManagerAccountsScreen = lazy(() => import('./components/WerkPayBank/ManagerAccountsScreen').then(m => ({ default: m.ManagerAccountsScreen })));
-const SupabaseModal = lazy(() => import('./components/SupabaseModal').then(m => ({ default: m.SupabaseModal })));
-const GitHubExportModal = lazy(() => import('./components/GitHubExportModal').then(m => ({ default: m.GitHubExportModal })));
-const DigitalPhone = lazy(() => import('./components/DigitalPhone/DigitalPhone').then(m => ({ default: m.DigitalPhone })));
-
-const ScreenLoader: React.FC = () => (
-  <div className="flex-1 flex items-center justify-center p-12 text-slate-400">
-    <div className="flex items-center gap-3 bg-slate-900/80 border border-slate-800 px-5 py-3 rounded-2xl shadow-xl">
-      <Loader2 className="w-5 h-5 animate-spin text-blue-400" />
-      <span className="text-sm font-bold">Scherm laden...</span>
-    </div>
-  </div>
-);
+import { KitchenScreen } from './components/WerkPayPOS/KitchenScreen';
+import { PickupScreen } from './components/WerkPayPOS/PickupScreen';
+import { PickupControlScreen } from './components/WerkPayPOS/PickupControlScreen';
+import { InventoryScreen } from './components/WerkPayPOS/InventoryScreen';
+import { ManagerScreen } from './components/WerkPayPOS/ManagerScreen';
+import { OrderTrackingScreen } from './components/WerkPayPOS/OrderTrackingScreen';
+import { LoyaltyTerminalScreen } from './components/WerkPayPOS/LoyaltyTerminalScreen';
+import { SumUpTerminalScreen } from './components/WerkPayPOS/SumUpTerminalScreen';
+import { MobileTerminalLoginScreen } from './components/WerkPayPOS/MobileTerminalLoginScreen';
+import { WalletScreen } from './components/WerkPayBank/WalletScreen';
+import { ManagerAccountsScreen } from './components/WerkPayBank/ManagerAccountsScreen';
+import { CloudSyncModal } from './components/CloudSyncModal';
+import { GitHubExportModal } from './components/GitHubExportModal';
+import { DigitalPhone } from './components/DigitalPhone/DigitalPhone';
 
 const MainLayout: React.FC = () => {
   const { 
@@ -88,7 +78,7 @@ const MainLayout: React.FC = () => {
     };
   }, []);
 
-  // Auth-gate & automatic small-screen SumUp mode activation for logged-in staff
+  // Auth-gate & automatic small-screen WerkPin mode activation for logged-in staff
   React.useEffect(() => {
     if (!isLoggedInStaff) {
       setPreferFullPosOnMobile(false);
@@ -213,12 +203,11 @@ const MainLayout: React.FC = () => {
       {/* GitHub Deployment Auto-Update Listener & Banner */}
       <AutoUpdateBanner />
 
-      {/* Universal Top Header (verborgen op klein scherm in SumUp Terminal / Mobiele Login stand) */}
+      {/* Universal Top Header (verborgen op klein scherm in WerkPin Terminal / Mobiele Login stand) */}
       <Header onOpenGithub={() => setShowGithubModal(true)} hideHeader={hideMainHeader} />
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col overflow-hidden">
-        <Suspense fallback={<ScreenLoader />}>
           {/* Werkdonalds POS screens */}
           {appMode === 'pos' && (
             showMobilePreLoginShell ? (
@@ -304,7 +293,6 @@ const MainLayout: React.FC = () => {
               </div>
             </div>
           )}
-        </Suspense>
       </main>
 
       {/* Global Modals & Notifications */}
@@ -316,18 +304,12 @@ const MainLayout: React.FC = () => {
         <PaymentModal onClose={() => setShowPaymentModal(false)} />
       )}
       {appMode === 'setup' && (
-        <Suspense fallback={null}>
-          <SupabaseModal onClose={() => setAppMode('pos')} />
-        </Suspense>
+        <CloudSyncModal onClose={() => setAppMode('pos')} />
       )}
       {showGithubModal && (
-        <Suspense fallback={null}>
-          <GitHubExportModal isOpen={showGithubModal} onClose={() => setShowGithubModal(false)} />
-        </Suspense>
+        <GitHubExportModal isOpen={showGithubModal} onClose={() => setShowGithubModal(false)} />
       )}
-      <Suspense fallback={null}>
-        <DigitalPhone />
-      </Suspense>
+      <DigitalPhone />
       {showSetup2FA && currentPosUser && (
         <TwoFactorSetupModal
           username={currentPosUser.username}

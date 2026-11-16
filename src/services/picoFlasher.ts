@@ -19,6 +19,13 @@ export interface PicoWifiConfig {
   lcdAddress?: '0x27' | '0x3F' | 'auto';
 }
 
+export interface SavedWifiProfile {
+  ssid: string;
+  password: string;
+  lcdAddress: 'auto' | '0x27' | '0x3F';
+  savedAt: string;
+}
+
 export interface CppFirmwareMetadata {
   ok: boolean;
   filename: string;
@@ -34,6 +41,82 @@ const UF2_BLOCK_SIZE = 512;
 const SSID_MARKER = '__WP_SSID_MARKER_0001__';
 const PASS_MARKER = '__WP_PASS_MARKER_0001__';
 const LCD_MARKER = '__WP_LCD_AUTO__';
+const WIFI_PROFILES_STORAGE_KEY = 'wp_pico_wifi_profiles_v1';
+
+export function isLocalDevOrigin(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname;
+  return host === 'localhost' || host === '127.0.0.1';
+}
+
+export function resolveFirmwareAssetUrl(): string {
+  const base = (typeof import.meta !== 'undefined' && (import.meta as any).env?.BASE_URL) || './';
+  const normalizedBase = base.endsWith('/') ? base : `${base}/`;
+  return `${normalizedBase}firmware/werkpay_picow_i2c_pn532.uf2`;
+}
+
+export function getSavedWifiProfiles(): SavedWifiProfile[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(WIFI_PROFILES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveWifiProfile(profile: Omit<SavedWifiProfile, 'savedAt'>): SavedWifiProfile[] {
+  const cleanSsid = profile.ssid.trim();
+  if (!cleanSsid) return getSavedWifiProfiles();
+  const existing = getSavedWifiProfiles().filter(
+    (p) => p.ssid.toLowerCase() !== cleanSsid.toLowerCase()
+  );
+  const next: SavedWifiProfile[] = [
+    {
+      ssid: cleanSsid,
+      password: profile.password,
+      lcdAddress: profile.lcdAddress || 'auto',
+      savedAt: new Date().toISOString()
+    },
+    ...existing
+  ].slice(0, 8);
+  try {
+    localStorage.setItem(WIFI_PROFILES_STORAGE_KEY, JSON.stringify(next));
+  } catch {}
+  return next;
+}
+
+export function removeWifiProfile(ssid: string): SavedWifiProfile[] {
+  const next = getSavedWifiProfiles().filter(
+    (p) => p.ssid.toLowerCase() !== ssid.trim().toLowerCase()
+  );
+  try {
+    localStorage.setItem(WIFI_PROFILES_STORAGE_KEY, JSON.stringify(next));
+  } catch {}
+  return next;
+}
+
+export function validateWifiCredentials(cfg: PicoWifiConfig): void {
+  const encoder = new TextEncoder();
+  const cleanSsid = (cfg.ssid || '').trim();
+  if (!cleanSsid) {
+    throw new Error('Vul eerst je WiFi-naam (SSID) in voordat je de C++ .UF2 flasht.');
+  }
+  const ssidBytes = encoder.encode(cleanSsid).length;
+  if (ssidBytes > 63) {
+    throw new Error(
+      `WiFi-naam (SSID) is te lang (${ssidBytes} bytes, maximaal 63 UTF-8 bytes toegestaan in de .UF2 firmware).`
+    );
+  }
+  const passBytes = encoder.encode(cfg.password || '').length;
+  if (passBytes > 63) {
+    throw new Error(
+      `WiFi-wachtwoord is te lang (${passBytes} bytes, maximaal 63 UTF-8 bytes toegestaan in de .UF2 firmware).`
+    );
+  }
+}
 
 export function detectFlasherCapabilities(): FlasherCapabilities {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') {
@@ -117,6 +200,8 @@ function writeFixedCString(target: Uint8Array, offset: number, slotBytes: number
  * wachtwoord en I2C LCD adres (veilig over 256-byte UF2 payload blokgrenzen heen).
  */
 export function patchCppUf2Firmware(uf2Buffer: ArrayBuffer, cfg: PicoWifiConfig): ArrayBuffer {
+  validateWifiCredentials(cfg);
+
   if (uf2Buffer.byteLength === 0 || uf2Buffer.byteLength % UF2_BLOCK_SIZE !== 0) {
     throw new Error('Ongeldig .UF2 firmware-bestand (blokgrootte klopt niet).');
   }
@@ -163,10 +248,6 @@ export function patchCppUf2Firmware(uf2Buffer: ArrayBuffer, cfg: PicoWifiConfig)
   }
 
   const cleanSsid = (cfg.ssid || '').trim();
-  if (!cleanSsid) {
-    throw new Error('Vul eerst je WiFi-naam (SSID) in voordat je de C++ .UF2 flasht.');
-  }
-
   writeFixedCString(flatPayload, ssidIdx, 64, cleanSsid);
   writeFixedCString(flatPayload, passIdx, 64, cfg.password || '');
 
@@ -180,7 +261,6 @@ export function patchCppUf2Firmware(uf2Buffer: ArrayBuffer, cfg: PicoWifiConfig)
     writeFixedCString(flatPayload, lcdIdx, 16, lcdVal);
   }
 
-  // Schrijf de gepatchte payload terug in de exacte 512-byte UF2 blokken
   for (const s of slices) {
     outBytes.set(flatPayload.subarray(s.flatStart, s.flatStart + s.payloadSize), s.blockOffset + 32);
   }
@@ -189,23 +269,45 @@ export function patchCppUf2Firmware(uf2Buffer: ArrayBuffer, cfg: PicoWifiConfig)
 }
 
 /**
- * Haalt de gecompileerde C++ Pico W .UF2 firmware op en injecteert direct jouw WiFi-gegevens
+ * Haalt de gecompileerde C++ Pico W .UF2 firmware op (GitHub Pages subpath-safe)
+ * en injecteert direct jouw WiFi-gegevens.
  */
 export async function buildConfiguredCppUf2Blob(
   cfg: PicoWifiConfig,
   onLog: (msg: string) => void
 ): Promise<{ blob: Blob; filename: string }> {
+  validateWifiCredentials(cfg);
   onLog('⚙️ Gecompileerde C++ firmware ophalen (Adafruit PN532 + LCD + WiFi Cloud)...');
 
-  let res = await fetch('/firmware/werkpay_picow_i2c_pn532.uf2');
-  if (!res.ok) {
-    res = await fetch('/api/pico/cpp-uf2');
-  }
-  if (!res.ok) {
-    throw new Error(`C++ .UF2 firmware kon niet worden geladen (HTTP ${res.status}).`);
+  const candidates = [
+    resolveFirmwareAssetUrl(),
+    './firmware/werkpay_picow_i2c_pn532.uf2',
+    ...(isLocalDevOrigin() ? ['/api/pico/cpp-uf2'] : [])
+  ];
+
+  let rawBuf: ArrayBuffer | null = null;
+  let lastStatus = 0;
+
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url);
+      lastStatus = res.status;
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength >= 512 && buf.byteLength % UF2_BLOCK_SIZE === 0) {
+          rawBuf = buf;
+          break;
+        }
+      }
+    } catch {
+      // try next URL
+    }
   }
 
-  const rawBuf = await res.arrayBuffer();
+  if (!rawBuf) {
+    throw new Error(`C++ .UF2 firmware kon niet worden geladen (HTTP ${lastStatus || 404}).`);
+  }
+
   onLog(`📦 Base C++ .UF2 geladen (${(rawBuf.byteLength / 1024).toFixed(0)} KB). WiFi invullen...`);
 
   const patchedBuf = patchCppUf2Firmware(rawBuf, cfg);
@@ -286,4 +388,64 @@ export async function exportCppUf2ForMobileOrDownload(
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 10000);
   onLog(`✅ ${filename} gedownload! Kopieer dit bestand naar de "RPI-RP2" schijf van je Pico W.`);
+}
+
+/**
+ * WebSerial Live Monitor voor de Raspberry Pi Pico W (115200 baud, normale USB-modus ná BOOTSEL).
+ * Toont live WiFi-, LCD-, PN532- en Firestore-statusberichten uit Serial.println().
+ */
+export async function connectPicoSerialMonitor(
+  onLine: (line: string) => void,
+  onDisconnect: () => void
+): Promise<{ disconnect: () => Promise<void> }> {
+  const serial = (navigator as any).serial;
+  if (!serial) {
+    throw new Error('WebSerial wordt alleen ondersteund op desktop in Chrome of Edge.');
+  }
+
+  const port = await serial.requestPort();
+  await port.open({ baudRate: 115200 });
+
+  let cancelled = false;
+  const decoder = new TextDecoderStream();
+  const readableStreamClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
+  const reader = decoder.readable.getReader();
+
+  (async () => {
+    let buffer = '';
+    try {
+      while (!cancelled) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          buffer += value;
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() ?? '';
+          for (const l of lines) {
+            if (l.trim()) onLine(l);
+          }
+        }
+      }
+    } catch {
+      // closed
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {}
+      onDisconnect();
+    }
+  })();
+
+  return {
+    disconnect: async () => {
+      cancelled = true;
+      try {
+        await reader.cancel();
+      } catch {}
+      await readableStreamClosed;
+      try {
+        await port.close();
+      } catch {}
+    }
+  };
 }

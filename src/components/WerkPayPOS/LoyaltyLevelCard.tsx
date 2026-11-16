@@ -29,7 +29,6 @@ interface LoyaltyLevelCardProps {
 }
 
 export const LoyaltyLevelCard: React.FC<LoyaltyLevelCardProps> = ({ customer, onCustomerUpdated }) => {
-  const { posClient } = useApp();
   const currentTier = getTierInfo(customer.tier || customer.totalSpent, customer.vipSubscriptionActive);
   const currentLevel = currentTier.level;
   const [subscribing, setSubscribing] = useState<boolean>(false);
@@ -55,7 +54,7 @@ export const LoyaltyLevelCard: React.FC<LoyaltyLevelCardProps> = ({ customer, on
 
   const handleSubscribeVip = (plan: 'vip_monthly_499' | 'vip_monthly_999') => {
     setSubscribing(true);
-    const updated = subscribeVipClub(customer.phone, plan, posClient);
+    const updated = subscribeVipClub(customer.phone, plan);
     if (updated) {
       AudioFX.chime();
       showToast(`🌟 Welkom bij de VIP Club! Je 2.0x dubbele WerkCoins boost en gratis snack-voucher zijn geactiveerd.`, 'success');

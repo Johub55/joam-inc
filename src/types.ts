@@ -133,6 +133,7 @@ export interface BankAccount {
   account_holder: string;
   card_uid: string;
   linked_uids?: LinkedNfcTag[];
+  card_uids?: string[];
   pin_code?: string;
   balance: number;
   is_admin: boolean;
@@ -260,16 +261,6 @@ export interface CustomBrandingConfig {
   };
   tvLayout: 'split_50' | 'menu_focus' | 'pickup_focus';
   nosCategory: 'general' | 'sport' | 'tech' | 'binnenland';
-}
-
-export interface SupabaseConfig {
-  unifiedUrl: string;
-  unifiedKey: string;
-  useSeparatePay: boolean;
-  payUrl?: string;
-  payKey?: string;
-  supabaseUrl?: string;
-  supabaseAnonKey?: string;
 }
 
 export interface CashPaymentRequest {

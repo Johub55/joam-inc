@@ -9,7 +9,7 @@ service cloud.firestore {
     }
 
     // ===============================================================
-    // Helper Functions
+    // Shared Validation Helpers
     // ===============================================================
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
@@ -19,6 +19,17 @@ service cloud.firestore {
       return request.resource.data;
     }
 
+    function isStrLen(val, maxLen) {
+      return val is string && val.size() <= maxLen;
+    }
+
+    function isNumRange(val, minVal, maxVal) {
+      return val is number && val >= minVal && val <= maxVal;
+    }
+
+    // ===============================================================
+    // Entity Validators
+    // ===============================================================
     function isValidHardwareTerminal(data) {
       return data.keys().hasAll(['status', 'updatedAt'])
         && data.keys().hasOnly([
@@ -31,30 +42,355 @@ service cloud.firestore {
           'reason',
           'updatedAt'
         ])
-        && data.status is string
-        && data.status.size() <= 32
+        && isStrLen(data.status, 32)
         && data.status in ['IDLE', 'LINK', 'CARD_SCANNED', 'LINKED', 'PAY', 'SUBMITTED', 'APPROVED', 'DECLINED']
-        && data.updatedAt is string
-        && data.updatedAt.size() <= 64
-        && (!('username' in data) || (data.username is string && data.username.size() <= 100))
-        && (!('amount' in data) || (data.amount is number && data.amount >= 0 && data.amount <= 100000))
-        && (!('orderNo' in data) || ((data.orderNo is number && data.orderNo >= 0) || (data.orderNo is string && data.orderNo.size() <= 64)))
-        && (!('scannedUid' in data) || (data.scannedUid is string && data.scannedUid.size() <= 64))
-        && (!('enteredPin' in data) || (data.enteredPin is string && data.enteredPin.size() <= 16))
-        && (!('reason' in data) || (data.reason is string && data.reason.size() <= 128));
+        && isStrLen(data.updatedAt, 64)
+        && (!('username' in data) || isStrLen(data.username, 100))
+        && (!('amount' in data) || isNumRange(data.amount, 0, 100000))
+        && (!('orderNo' in data) || (isNumRange(data.orderNo, 0, 99999999) || isStrLen(data.orderNo, 64)))
+        && (!('scannedUid' in data) || isStrLen(data.scannedUid, 64))
+        && (!('enteredPin' in data) || isStrLen(data.enteredPin, 16))
+        && (!('reason' in data) || isStrLen(data.reason, 128));
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasAll(['id', 'name', 'price', 'cat', 'inStock'])
+        && data.keys().hasOnly([
+          'id', 'name', 'price', 'salePrice', 'onSale', 'cat', 'emoji',
+          'inStock', 'options', 'brand', 'recipe', 'recipeDescription', 'updatedAt'
+        ])
+        && isNumRange(data.id, 0, 9999999999999)
+        && isStrLen(data.name, 160)
+        && isNumRange(data.price, 0, 100000)
+        && isStrLen(data.cat, 80)
+        && data.inStock is bool
+        && (!('salePrice' in data) || isNumRange(data.salePrice, 0, 100000))
+        && (!('onSale' in data) || data.onSale is bool)
+        && (!('emoji' in data) || isStrLen(data.emoji, 32))
+        && (!('options' in data) || (data.options is list && data.options.size() <= 30 && (data.options.size() == 0 || data.options[0] is map)))
+        && (!('brand' in data) || (isStrLen(data.brand, 32) && data.brand in ['werkpay', 'koekploeg', 'both']))
+        && (!('recipe' in data) || (data.recipe is list && data.recipe.size() <= 50 && (data.recipe.size() == 0 || data.recipe[0] is map)))
+        && (!('recipeDescription' in data) || isStrLen(data.recipeDescription, 1000))
+        && (!('updatedAt' in data) || data.updatedAt is number);
+    }
+
+    function isValidOrder(data) {
+      return data.keys().hasAll(['no', 'total', 'status', 'orderType', 'identifier'])
+        && data.keys().hasOnly([
+          'id', 'no', 'items', 'total', 'discount', 'orderType', 'identifier',
+          'notes', 'paymentMethod', 'paymentMeta', 'cashier', 'status', 'isPrio',
+          'time', 'timestamp', 'updatedAt'
+        ])
+        && isNumRange(data.no, 0, 999999999)
+        && isNumRange(data.total, 0, 100000)
+        && isStrLen(data.status, 32)
+        && data.status in ['wachten', 'bereiden', 'oven_grill', 'frituren', 'inpakken', 'klaar', 'afgehaald', 'geannuleerd', 'new', 'done', 'archived', 'cancelled']
+        && isStrLen(data.orderType, 32)
+        && data.orderType in ['dine_in', 'takeaway', 'delivery']
+        && isStrLen(data.identifier, 160)
+        && (!('id' in data) || data.id is number || isStrLen(data.id, 128))
+        && (!('items' in data) || (data.items is list && data.items.size() <= 150 && (data.items.size() == 0 || data.items[0] is map)))
+        && (!('discount' in data) || isNumRange(data.discount, 0, 100000))
+        && (!('notes' in data) || isStrLen(data.notes, 500))
+        && (!('paymentMethod' in data) || (isStrLen(data.paymentMethod, 32) && data.paymentMethod in ['workpay', 'cash', 'giftcard']))
+        && (!('paymentMeta' in data) || data.paymentMeta is map)
+        && (!('cashier' in data) || isStrLen(data.cashier, 100))
+        && (!('isPrio' in data) || data.isPrio is bool)
+        && (!('time' in data) || isStrLen(data.time, 32))
+        && (!('timestamp' in data) || data.timestamp is number)
+        && (!('updatedAt' in data) || data.updatedAt is number);
+    }
+
+    function isValidBankAccount(data) {
+      return data.keys().hasAll(['id', 'username', 'balance'])
+        && data.keys().hasOnly([
+          'id', 'username', 'password', 'account_holder', 'card_uid',
+          'linked_uids', 'card_uids', 'pin_code', 'balance', 'is_admin',
+          'is_banned', 'is_suspended', 'is_shadowbanned', 'is_2fa_enabled',
+          'totp_secret', 'backup_codes', 'created_at', 'updated_at'
+        ])
+        && (data.id is number || isStrLen(data.id, 128))
+        && isStrLen(data.username, 64)
+        && isNumRange(data.balance, 0, 100000000)
+        && (!('password' in data) || isStrLen(data.password, 128))
+        && (!('account_holder' in data) || isStrLen(data.account_holder, 120))
+        && (!('card_uid' in data) || isStrLen(data.card_uid, 64))
+        && (!('linked_uids' in data) || (data.linked_uids is list && data.linked_uids.size() <= 50 && (data.linked_uids.size() == 0 || data.linked_uids[0] is map)))
+        && (!('card_uids' in data) || (data.card_uids is list && data.card_uids.size() <= 50 && (data.card_uids.size() == 0 || data.card_uids[0] is string)))
+        && (!('pin_code' in data) || isStrLen(data.pin_code, 32))
+        && (!('is_admin' in data) || data.is_admin is bool)
+        && (!('is_banned' in data) || data.is_banned is bool)
+        && (!('is_suspended' in data) || data.is_suspended is bool)
+        && (!('is_shadowbanned' in data) || data.is_shadowbanned is bool)
+        && (!('is_2fa_enabled' in data) || data.is_2fa_enabled is bool)
+        && (!('totp_secret' in data) || isStrLen(data.totp_secret, 128))
+        && (!('backup_codes' in data) || (data.backup_codes is list && data.backup_codes.size() <= 20 && (data.backup_codes.size() == 0 || data.backup_codes[0] is string)))
+        && (!('created_at' in data) || isStrLen(data.created_at, 64))
+        && (!('updated_at' in data) || isStrLen(data.updated_at, 64));
+    }
+
+    function isValidBankTransaction(data) {
+      return data.keys().hasAll(['id', 'from_account', 'to_account', 'amount', 'label', 'when', 'timestamp'])
+        && data.keys().hasOnly([
+          'id', 'from_account', 'to_account', 'amount', 'label', 'note', 'order_no', 'when', 'timestamp'
+        ])
+        && (data.id is number || isStrLen(data.id, 128))
+        && isStrLen(data.from_account, 100)
+        && isStrLen(data.to_account, 100)
+        && isNumRange(data.amount, 0, 100000000)
+        && isStrLen(data.label, 160)
+        && isStrLen(data.when, 64)
+        && data.timestamp is number
+        && (!('note' in data) || isStrLen(data.note, 500))
+        && (!('order_no' in data) || data.order_no is number);
+    }
+
+    function isValidPosUser(data) {
+      return data.keys().hasAll(['id', 'username', 'name'])
+        && data.keys().hasOnly([
+          'id', 'username', 'name', 'password', 'perms', 'is_admin',
+          'is_banned', 'is_suspended', 'is_shadowbanned', 'is_2fa_enabled',
+          'totp_secret', 'backup_codes', 'is_terminal_locked', 'assigned_screen',
+          'session_token', 'theme', 'updated_at'
+        ])
+        && (data.id is number || isStrLen(data.id, 128))
+        && isStrLen(data.username, 64)
+        && isStrLen(data.name, 120)
+        && (!('password' in data) || isStrLen(data.password, 128))
+        && (!('perms' in data) || (data.perms is list && data.perms.size() <= 50 && (data.perms.size() == 0 || data.perms[0] is string)))
+        && (!('is_admin' in data) || data.is_admin is bool)
+        && (!('is_banned' in data) || data.is_banned is bool)
+        && (!('is_suspended' in data) || data.is_suspended is bool)
+        && (!('is_shadowbanned' in data) || data.is_shadowbanned is bool)
+        && (!('is_2fa_enabled' in data) || data.is_2fa_enabled is bool)
+        && (!('totp_secret' in data) || isStrLen(data.totp_secret, 128))
+        && (!('backup_codes' in data) || (data.backup_codes is list && data.backup_codes.size() <= 20 && (data.backup_codes.size() == 0 || data.backup_codes[0] is string)))
+        && (!('is_terminal_locked' in data) || data.is_terminal_locked is bool)
+        && (!('assigned_screen' in data) || isStrLen(data.assigned_screen, 64))
+        && (!('session_token' in data) || isStrLen(data.session_token, 128))
+        && (!('theme' in data) || isStrLen(data.theme, 64))
+        && (!('updated_at' in data) || isStrLen(data.updated_at, 64));
+    }
+
+    function isValidInventoryItem(data) {
+      return data.keys().hasAll(['id', 'item_name', 'stock_qty', 'min_qty', 'unit', 'cost_price', 'supplier_name'])
+        && data.keys().hasOnly([
+          'id', 'item_name', 'stock_qty', 'min_qty', 'unit', 'cost_price', 'supplier_name', 'updated_at'
+        ])
+        && isNumRange(data.id, 0, 9999999999999)
+        && isStrLen(data.item_name, 160)
+        && isNumRange(data.stock_qty, 0, 1000000)
+        && isNumRange(data.min_qty, 0, 1000000)
+        && isStrLen(data.unit, 32)
+        && isNumRange(data.cost_price, 0, 100000)
+        && isStrLen(data.supplier_name, 120)
+        && (!('updated_at' in data) || isStrLen(data.updated_at, 64));
+    }
+
+    function isValidCoupon(data) {
+      return data.keys().hasAll(['id', 'code', 'discount_type', 'discount_val', 'is_active'])
+        && data.keys().hasOnly([
+          'id', 'code', 'discount_type', 'discount_val', 'min_subtotal',
+          'target_product_name', 'target_category', 'description', 'is_active', 'updated_at'
+        ])
+        && isNumRange(data.id, 0, 9999999999999)
+        && isStrLen(data.code, 64)
+        && isStrLen(data.discount_type, 32)
+        && data.discount_type in ['percent', 'fixed', 'product', 'threshold', 'free_item']
+        && isNumRange(data.discount_val, 0, 100000)
+        && data.is_active is bool
+        && (!('min_subtotal' in data) || isNumRange(data.min_subtotal, 0, 100000))
+        && (!('target_product_name' in data) || isStrLen(data.target_product_name, 160))
+        && (!('target_category' in data) || isStrLen(data.target_category, 80))
+        && (!('description' in data) || isStrLen(data.description, 300))
+        && (!('updated_at' in data) || isStrLen(data.updated_at, 64));
+    }
+
+    function isValidGiftCard(data) {
+      return data.keys().hasAll(['id', 'code', 'initial_balance', 'current_balance', 'is_active'])
+        && data.keys().hasOnly([
+          'id', 'code', 'initial_balance', 'current_balance', 'sender_name',
+          'recipient_name', 'recipient_phone', 'message', 'is_active',
+          'is_private', 'notes', 'created_at', 'updated_at'
+        ])
+        && isNumRange(data.id, 0, 9999999999999)
+        && isStrLen(data.code, 64)
+        && isNumRange(data.initial_balance, 0, 100000)
+        && isNumRange(data.current_balance, 0, 100000)
+        && data.is_active is bool
+        && (!('sender_name' in data) || isStrLen(data.sender_name, 120))
+        && (!('recipient_name' in data) || isStrLen(data.recipient_name, 120))
+        && (!('recipient_phone' in data) || isStrLen(data.recipient_phone, 32))
+        && (!('message' in data) || isStrLen(data.message, 500))
+        && (!('is_private' in data) || data.is_private is bool)
+        && (!('notes' in data) || isStrLen(data.notes, 500))
+        && (!('created_at' in data) || isStrLen(data.created_at, 64))
+        && (!('updated_at' in data) || isStrLen(data.updated_at, 64));
+    }
+
+    function isValidCashRequest(data) {
+      return data.keys().hasAll(['id', 'orderNo', 'orderType', 'identifier', 'total', 'status', 'requestedAt'])
+        && data.keys().hasOnly([
+          'id', 'orderNo', 'orderType', 'identifier', 'total', 'status', 'requestedAt',
+          'cashier', 'approvedBy', 'approvedByUsername', 'approvedAt', 'consumedAt',
+          'received', 'change', 'rejectedReason'
+        ])
+        && isStrLen(data.id, 128)
+        && isNumRange(data.orderNo, 0, 999999999)
+        && isStrLen(data.orderType, 32)
+        && data.orderType in ['dine_in', 'takeaway', 'delivery']
+        && isStrLen(data.identifier, 160)
+        && isNumRange(data.total, 0, 100000)
+        && isStrLen(data.status, 32)
+        && data.status in ['pending', 'approved', 'rejected', 'consumed']
+        && data.requestedAt is number
+        && (!('cashier' in data) || isStrLen(data.cashier, 100))
+        && (!('approvedBy' in data) || isStrLen(data.approvedBy, 120))
+        && (!('approvedByUsername' in data) || isStrLen(data.approvedByUsername, 64))
+        && (!('approvedAt' in data) || data.approvedAt is number)
+        && (!('consumedAt' in data) || data.consumedAt is number)
+        && (!('received' in data) || isNumRange(data.received, 0, 1000000))
+        && (!('change' in data) || isNumRange(data.change, 0, 1000000))
+        && (!('rejectedReason' in data) || isStrLen(data.rejectedReason, 300));
+    }
+
+    function isValidLoyaltyCustomer(data) {
+      return data.keys().hasAll(['id', 'name', 'phone', 'coins', 'totalSpent', 'ordersCount', 'tier', 'joinedDate'])
+        && data.keys().hasOnly([
+          'id', 'name', 'phone', 'coins', 'totalSpent', 'ordersCount', 'tier',
+          'level', 'currentMonthSpent', 'lastMonthSpent', 'currentMonthKey',
+          'monthsBelowTarget', 'tierGraceUntil', 'lastSpinDate', 'totalSpins',
+          'lastOrderDate', 'ordersTodayCount', 'vouchers',
+          'vipSubscriptionActive', 'vipSubscriptionExpires', 'vipPlan',
+          'joinedDate', 'updatedAt'
+        ])
+        && isStrLen(data.id, 128)
+        && isStrLen(data.name, 120)
+        && isStrLen(data.phone, 32)
+        && isNumRange(data.coins, 0, 100000000)
+        && isNumRange(data.totalSpent, 0, 100000000)
+        && isNumRange(data.ordersCount, 0, 1000000)
+        && isStrLen(data.tier, 32)
+        && isStrLen(data.joinedDate, 32)
+        && (!('level' in data) || isNumRange(data.level, 1, 10))
+        && (!('currentMonthSpent' in data) || isNumRange(data.currentMonthSpent, 0, 100000000))
+        && (!('lastMonthSpent' in data) || isNumRange(data.lastMonthSpent, 0, 100000000))
+        && (!('currentMonthKey' in data) || isStrLen(data.currentMonthKey, 16))
+        && (!('monthsBelowTarget' in data) || isNumRange(data.monthsBelowTarget, 0, 100))
+        && (!('tierGraceUntil' in data) || isStrLen(data.tierGraceUntil, 32))
+        && (!('lastSpinDate' in data) || isStrLen(data.lastSpinDate, 32))
+        && (!('totalSpins' in data) || isNumRange(data.totalSpins, 0, 1000000))
+        && (!('lastOrderDate' in data) || isStrLen(data.lastOrderDate, 32))
+        && (!('ordersTodayCount' in data) || isNumRange(data.ordersTodayCount, 0, 10000))
+        && (!('vouchers' in data) || (data.vouchers is list && data.vouchers.size() <= 100 && (data.vouchers.size() == 0 || data.vouchers[0] is map)))
+        && (!('vipSubscriptionActive' in data) || data.vipSubscriptionActive is bool)
+        && (!('vipSubscriptionExpires' in data) || isStrLen(data.vipSubscriptionExpires, 32))
+        && (!('vipPlan' in data) || isStrLen(data.vipPlan, 32))
+        && (!('updatedAt' in data) || isStrLen(data.updatedAt, 64));
     }
 
     function isValidPosSetting(data) {
       return data.keys().hasAll(['updated_at'])
-        && data.keys().hasOnly(['news_config', 'custom_news_items', 'updated_at'])
-        && data.updated_at is string
-        && data.updated_at.size() <= 64
+        && data.keys().hasOnly([
+          'news_config', 'custom_news_items', 'order_stop_active', 'order_stop_text',
+          'pickup_closed', 'order_stop_config', 'branding_config', 'custom_branding',
+          'active_brand', 'master_security_pin', 'master_pin', 'tables_frozen',
+          'blocked_devices', 'pos_disaster_backup', 'updated_at'
+        ])
+        && isStrLen(data.updated_at, 64)
         && (!('news_config' in data) || data.news_config is map)
-        && (!('custom_news_items' in data) || (data.custom_news_items is list && data.custom_news_items.size() <= 100));
+        && (!('custom_news_items' in data) || (data.custom_news_items is list && data.custom_news_items.size() <= 100 && (data.custom_news_items.size() == 0 || data.custom_news_items[0] is map)))
+        && (!('order_stop_active' in data) || data.order_stop_active is bool)
+        && (!('order_stop_text' in data) || isStrLen(data.order_stop_text, 2000))
+        && (!('pickup_closed' in data) || data.pickup_closed is bool)
+        && (!('order_stop_config' in data) || data.order_stop_config is map)
+        && (!('branding_config' in data) || data.branding_config is map)
+        && (!('custom_branding' in data) || data.custom_branding is map)
+        && (!('active_brand' in data) || (isStrLen(data.active_brand, 32) && data.active_brand in ['werkpay', 'koekploeg']))
+        && (!('master_security_pin' in data) || isStrLen(data.master_security_pin, 32))
+        && (!('master_pin' in data) || isStrLen(data.master_pin, 32))
+        && (!('tables_frozen' in data) || data.tables_frozen is bool)
+        && (!('blocked_devices' in data) || (data.blocked_devices is list && data.blocked_devices.size() <= 200 && (data.blocked_devices.size() == 0 || data.blocked_devices[0] is map)))
+        && (!('pos_disaster_backup' in data) || (isStrLen(data.pos_disaster_backup, 900000) || data.pos_disaster_backup is map));
+    }
+
+    function isValidPosSession(data) {
+      return data.keys().hasAll(['device_id', 'user_name', 'last_seen'])
+        && data.keys().hasOnly(['device_id', 'ip_address', 'user_name', 'user_agent', 'app_mode', 'pos_screen', 'last_seen'])
+        && isStrLen(data.device_id, 128)
+        && isStrLen(data.user_name, 120)
+        && isStrLen(data.last_seen, 64)
+        && (!('ip_address' in data) || isStrLen(data.ip_address, 64))
+        && (!('user_agent' in data) || isStrLen(data.user_agent, 256))
+        && (!('app_mode' in data) || isStrLen(data.app_mode, 32))
+        && (!('pos_screen' in data) || isStrLen(data.pos_screen, 64));
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['action', 'user_name', 'details', 'timestamp'])
+        && data.keys().hasOnly(['id', 'action', 'user_name', 'details', 'timestamp'])
+        && isStrLen(data.action, 80)
+        && isStrLen(data.user_name, 120)
+        && isStrLen(data.details, 500)
+        && isStrLen(data.timestamp, 64)
+        && (!('id' in data) || data.id is number || isStrLen(data.id, 128));
+    }
+
+    function isValidTvPreset(data) {
+      return data.keys().hasAll(['id', 'name', 'clock_style', 'view_mode', 'auto_rotate', 'widgets'])
+        && data.keys().hasOnly(['id', 'name', 'clock_style', 'view_mode', 'auto_rotate', 'layout_ratio', 'widgets', 'updated_at'])
+        && isStrLen(data.id, 128)
+        && isStrLen(data.name, 120)
+        && isStrLen(data.clock_style, 32)
+        && isStrLen(data.view_mode, 32)
+        && data.auto_rotate is bool
+        && data.widgets is map
+        && (!('layout_ratio' in data) || isStrLen(data.layout_ratio, 32))
+        && (!('updated_at' in data) || isStrLen(data.updated_at, 64));
+    }
+
+    function isValidPhoneMessage(data) {
+      return data.keys().hasAll(['sender_id', 'target_id', 'text', 'created_at'])
+        && data.keys().hasOnly(['id', 'sender_id', 'sender_name', 'target_id', 'text', 'avatar', 'role', 'timestamp', 'created_at'])
+        && isStrLen(data.sender_id, 128)
+        && isStrLen(data.target_id, 128)
+        && isStrLen(data.text, 2000)
+        && isStrLen(data.created_at, 64)
+        && (!('id' in data) || isStrLen(data.id, 128))
+        && (!('sender_name' in data) || isStrLen(data.sender_name, 120))
+        && (!('avatar' in data) || isStrLen(data.avatar, 32))
+        && (!('role' in data) || isStrLen(data.role, 80))
+        && (!('timestamp' in data) || isStrLen(data.timestamp, 32));
+    }
+
+    function isValidPhoneSignal(data) {
+      return data.keys().hasAll(['type', 'ts'])
+        && data.keys().hasOnly(['type', 'fromId', 'toId', 'senderId', 'senderName', 'targetId', 'text', 'avatar', 'role', 'fromName', 'fromPhone', 'fromRole', 'sdp', 'candidate', 'ts'])
+        && isStrLen(data.type, 48)
+        && data.ts is number
+        && (!('fromId' in data) || isStrLen(data.fromId, 128))
+        && (!('toId' in data) || isStrLen(data.toId, 128))
+        && (!('senderId' in data) || isStrLen(data.senderId, 128))
+        && (!('senderName' in data) || isStrLen(data.senderName, 120))
+        && (!('targetId' in data) || isStrLen(data.targetId, 128))
+        && (!('text' in data) || isStrLen(data.text, 2000))
+        && (!('avatar' in data) || isStrLen(data.avatar, 32))
+        && (!('role' in data) || isStrLen(data.role, 80))
+        && (!('fromName' in data) || isStrLen(data.fromName, 120))
+        && (!('fromPhone' in data) || isStrLen(data.fromPhone, 64))
+        && (!('fromRole' in data) || isStrLen(data.fromRole, 80));
+    }
+
+    function isValidAudioEvent(data) {
+      return data.keys().hasAll(['event', 'ts'])
+        && data.keys().hasOnly(['event', 'payload', 'ts'])
+        && isStrLen(data.event, 64)
+        && data.ts is number
+        && (!('payload' in data) || data.payload is map);
     }
 
     // ===============================================================
-    // Hardware Terminal Relay (POS <-> Raspberry Pi Pico W REST API)
+    // Collections
     // ===============================================================
     match /hardware_terminals/{terminalId} {
       allow get: if isValidId(terminalId);
@@ -63,21 +399,81 @@ service cloud.firestore {
       allow update: if isValidId(terminalId)
         && isValidHardwareTerminal(incoming())
         && incoming().diff(resource.data).affectedKeys().hasOnly([
-          'status',
-          'username',
-          'amount',
-          'orderNo',
-          'scannedUid',
-          'enteredPin',
-          'reason',
-          'updatedAt'
+          'status', 'username', 'amount', 'orderNo', 'scannedUid', 'enteredPin', 'reason', 'updatedAt'
         ]);
       allow delete: if false;
     }
 
-    // ===============================================================
-    // POS News & Ticker Settings Relay
-    // ===============================================================
+    match /products/{productId} {
+      allow get, list: if true;
+      allow create: if isValidId(productId) && isValidProduct(incoming());
+      allow update: if isValidId(productId) && isValidProduct(incoming());
+      allow delete: if isValidId(productId);
+    }
+
+    match /orders/{orderId} {
+      allow get, list: if true;
+      allow create: if isValidId(orderId) && isValidOrder(incoming());
+      allow update: if isValidId(orderId) && isValidOrder(incoming());
+      allow delete: if isValidId(orderId);
+    }
+
+    match /bank_accounts/{accountId} {
+      allow get, list: if true;
+      allow create: if isValidId(accountId) && isValidBankAccount(incoming());
+      allow update: if isValidId(accountId) && isValidBankAccount(incoming());
+      allow delete: if isValidId(accountId);
+    }
+
+    match /bank_transactions/{transactionId} {
+      allow get, list: if true;
+      allow create: if isValidId(transactionId) && isValidBankTransaction(incoming());
+      allow update: if isValidId(transactionId) && isValidBankTransaction(incoming());
+      allow delete: if false;
+    }
+
+    match /pos_users/{userId} {
+      allow get, list: if true;
+      allow create: if isValidId(userId) && isValidPosUser(incoming());
+      allow update: if isValidId(userId) && isValidPosUser(incoming());
+      allow delete: if isValidId(userId);
+    }
+
+    match /inventory/{itemId} {
+      allow get, list: if true;
+      allow create: if isValidId(itemId) && isValidInventoryItem(incoming());
+      allow update: if isValidId(itemId) && isValidInventoryItem(incoming());
+      allow delete: if isValidId(itemId);
+    }
+
+    match /coupons/{couponId} {
+      allow get, list: if true;
+      allow create: if isValidId(couponId) && isValidCoupon(incoming());
+      allow update: if isValidId(couponId) && isValidCoupon(incoming());
+      allow delete: if isValidId(couponId);
+    }
+
+    match /gift_cards/{cardId} {
+      allow get, list: if true;
+      allow create: if isValidId(cardId) && isValidGiftCard(incoming());
+      allow update: if isValidId(cardId) && isValidGiftCard(incoming());
+      allow delete: if isValidId(cardId);
+    }
+
+    match /cash_requests/{requestId} {
+      allow get, list: if true;
+      allow create: if isValidId(requestId) && isValidCashRequest(incoming());
+      allow update: if isValidId(requestId) && isValidCashRequest(incoming());
+      allow delete: if isValidId(requestId);
+    }
+
+    match /loyalty_customers/{customerId} {
+      allow get, list: if true;
+      allow create: if isValidId(customerId) && isValidLoyaltyCustomer(incoming());
+      allow update: if isValidId(customerId) && isValidLoyaltyCustomer(incoming());
+      allow delete: if isValidId(customerId);
+    }
+
     match /pos_settings/{settingId} {
       allow get: if isValidId(settingId);
       allow list: if false;
@@ -85,32 +481,55 @@ service cloud.firestore {
       allow update: if isValidId(settingId)
         && isValidPosSetting(incoming())
         && incoming().diff(resource.data).affectedKeys().hasOnly([
-          'news_config',
-          'custom_news_items',
-          'updated_at'
+          'news_config', 'custom_news_items', 'order_stop_active', 'order_stop_text',
+          'pickup_closed', 'order_stop_config', 'branding_config', 'custom_branding',
+          'active_brand', 'master_security_pin', 'master_pin', 'tables_frozen',
+          'blocked_devices', 'pos_disaster_backup', 'updated_at'
         ]);
       allow delete: if false;
     }
 
-    // ===============================================================
-    // Supabase-backed Collections (Locked on Firestore Client SDK)
-    // ===============================================================
-    match /products/{productId} { allow read, write: if false; }
-    match /orders/{orderId} { allow read, write: if false; }
-    match /bank_accounts/{accountId} { allow read, write: if false; }
-    match /pos_users/{userId} { allow read, write: if false; }
-    match /bank_transactions/{transactionId} { allow read, write: if false; }
-    match /cash_requests/{requestId} { allow read, write: if false; }
-    match /chat_groups/{groupId} { allow read, write: if false; }
-    match /coupons/{couponId} { allow read, write: if false; }
-    match /gift_cards/{cardId} { allow read, write: if false; }
-    match /group_members/{memberId} { allow read, write: if false; }
-    match /group_messages/{messageId} { allow read, write: if false; }
-    match /inventory/{itemId} { allow read, write: if false; }
-    match /loyalty_customers/{customerId} { allow read, write: if false; }
-    match /phone_messages/{messageId} { allow read, write: if false; }
-    match /pos_audit_logs/{logId} { allow read, write: if false; }
-    match /pos_sessions/{sessionId} { allow read, write: if false; }
-    match /tv_presets/{presetId} { allow read, write: if false; }
+    match /pos_sessions/{sessionId} {
+      allow get, list: if true;
+      allow create: if isValidId(sessionId) && isValidPosSession(incoming());
+      allow update: if isValidId(sessionId) && isValidPosSession(incoming());
+      allow delete: if isValidId(sessionId);
+    }
+
+    match /pos_audit_logs/{logId} {
+      allow get, list: if true;
+      allow create: if isValidId(logId) && isValidAuditLog(incoming());
+      allow update, delete: if false;
+    }
+
+    match /tv_presets/{presetId} {
+      allow get, list: if true;
+      allow create: if isValidId(presetId) && isValidTvPreset(incoming());
+      allow update: if isValidId(presetId) && isValidTvPreset(incoming());
+      allow delete: if isValidId(presetId);
+    }
+
+    match /phone_messages/{messageId} {
+      allow get, list: if true;
+      allow create: if isValidId(messageId) && isValidPhoneMessage(incoming());
+      allow update: if false;
+      allow delete: if isValidId(messageId);
+    }
+
+    match /phone_signals/{signalId} {
+      allow get: if isValidId(signalId);
+      allow list: if true;
+      allow create: if isValidId(signalId) && isValidPhoneSignal(incoming());
+      allow update: if isValidId(signalId) && isValidPhoneSignal(incoming());
+      allow delete: if isValidId(signalId);
+    }
+
+    match /audio_events/{eventId} {
+      allow get: if isValidId(eventId);
+      allow list: if false;
+      allow create: if isValidId(eventId) && isValidAudioEvent(incoming());
+      allow update: if isValidId(eventId) && isValidAudioEvent(incoming());
+      allow delete: if false;
+    }
   }
 }

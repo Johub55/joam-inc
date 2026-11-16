@@ -1,6 +1,7 @@
 import { broadcastSync } from './syncHelpers';
-import { getSupabaseClient } from './store';
+import { db, fsGetCollection, sanitizeDocId, sanitizeForFirestore } from './firebase';
 import { LoyaltyVoucher } from '../types';
+import { doc, writeBatch } from 'firebase/firestore';
 export type { LoyaltyVoucher };
 
 export interface LoyaltyCustomer {
@@ -523,61 +524,71 @@ const DEFAULT_LOYALTY_CUSTOMERS: LoyaltyCustomer[] = [
 
 const STORAGE_KEY = 'wd_loyalty_customers_db';
 
-export async function fetchLoyaltyFromSupabase(customClient?: any): Promise<LoyaltyCustomer[] | null> {
+export function parseLoyaltyRow(c: any): LoyaltyCustomer {
+  const phone = String(c.phone || '');
+  const activeVipRec = isVipSubscriberPhone(phone);
+  const isVip = Boolean(c.vipSubscriptionActive ?? c.vip_subscription_active ?? activeVipRec);
+
+  return {
+    id: String(c.id),
+    name: String(c.name || 'Vaste Klant'),
+    phone,
+    coins: Number(c.coins || 0),
+    totalSpent: Number(c.totalSpent ?? c.total_spent ?? 0),
+    ordersCount: Number(c.ordersCount ?? c.orders_count ?? 0),
+    tier: isVip ? 'VIP Diamant' : ((c.tier as any) || 'Brons'),
+    level: isVip ? 4 : (typeof c.level === 'number' ? c.level : undefined),
+    currentMonthSpent: Number(c.currentMonthSpent ?? c.current_month_spent ?? 0),
+    lastMonthSpent: Number(c.lastMonthSpent ?? c.last_month_spent ?? 0),
+    currentMonthKey: c.currentMonthKey || c.current_month_key || '',
+    monthsBelowTarget: Number(c.monthsBelowTarget ?? c.months_below_target ?? 0),
+    vipSubscriptionActive: isVip,
+    vipSubscriptionExpires: activeVipRec?.expiresAt || c.vipSubscriptionExpires || c.vip_subscription_expires || undefined,
+    vipPlan: activeVipRec?.plan || c.vipPlan || c.vip_plan || undefined,
+    vouchers: Array.isArray(c.vouchers)
+      ? c.vouchers
+      : typeof c.vouchers === 'string'
+      ? (() => { try { return JSON.parse(c.vouchers); } catch { return []; } })()
+      : [],
+    lastSpinDate: c.lastSpinDate || c.last_spin_date || undefined,
+    ordersTodayCount: Number(c.ordersTodayCount ?? c.orders_today_count ?? 0),
+    joinedDate: c.joinedDate || c.joined_date || new Date().toISOString().split('T')[0]
+  };
+}
+
+export async function fetchLoyaltyFromFirestore(): Promise<LoyaltyCustomer[] | null> {
   try {
-    const sb = customClient || getSupabaseClient();
-    if (!sb) return null;
-    const { data, error } = await sb
-      .from('loyalty_customers')
-      .select('*')
-      .order('created_at', { ascending: false });
+    const rows = await fsGetCollection('loyalty_customers');
+    if (!rows || rows.length === 0) return null;
 
-    if (error) {
-      console.warn('⚠️ Supabase fetch loyalty_customers error:', error.message || error);
-      return null;
+    const parsed: LoyaltyCustomer[] = rows.map(parseLoyaltyRow);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+      localStorage.setItem('wd_loyalty_ts', Date.now().toString());
+      window.dispatchEvent(new Event('wd_loyalty_updated'));
     }
-
-    if (data && Array.isArray(data)) {
-      const parsed: LoyaltyCustomer[] = data.map((c: any) => {
-        const phone = String(c.phone || '');
-        const activeVipRec = isVipSubscriberPhone(phone);
-        const isVip = Boolean(c.vip_subscription_active || activeVipRec);
-
-        return {
-          id: String(c.id),
-          name: String(c.name || 'Vaste Klant'),
-          phone,
-          coins: Number(c.coins || 0),
-          totalSpent: Number(c.total_spent || 0),
-          ordersCount: Number(c.orders_count || 0),
-          tier: isVip ? 'VIP Diamant' : ((c.tier as any) || 'Brons'),
-          level: isVip ? 4 : undefined,
-          currentMonthSpent: Number(c.current_month_spent || 0),
-          lastMonthSpent: Number(c.last_month_spent || 0),
-          currentMonthKey: c.current_month_key || '',
-          monthsBelowTarget: Number(c.months_below_target || 0),
-          vipSubscriptionActive: isVip,
-          vipSubscriptionExpires: activeVipRec?.expiresAt || c.vip_subscription_expires || undefined,
-          vipPlan: activeVipRec?.plan || c.vip_plan || undefined,
-          vouchers: Array.isArray(c.vouchers) ? c.vouchers : (typeof c.vouchers === 'string' ? JSON.parse(c.vouchers) : []),
-          lastSpinDate: c.last_spin_date || undefined,
-          ordersTodayCount: Number(c.orders_today_count || 0),
-          joinedDate: c.joined_date || new Date().toISOString().split('T')[0]
-        };
-      });
-
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
-        localStorage.setItem('wd_loyalty_ts', Date.now().toString());
-        window.dispatchEvent(new Event('wd_loyalty_updated'));
-      }
-      return parsed;
-    }
-    return null;
+    return parsed;
   } catch (err) {
-    console.warn('⚠️ Supabase fetch exception:', err);
+    console.warn('⚠️ Firestore loyalty_customers fetch error:', err);
     return null;
   }
+}
+
+export async function findLoyaltyCustomerInFirestore(query: string): Promise<LoyaltyCustomer | null> {
+  const clean = query.trim().toLowerCase();
+  const cleanPhone = normalizePhone(query);
+  if (!clean && !cleanPhone) return null;
+  const list = await fetchLoyaltyFromFirestore();
+  if (!list) return null;
+  return (
+    list.find((c) => {
+      const cPhoneClean = normalizePhone(c.phone);
+      if (cleanPhone && cPhoneClean.includes(cleanPhone)) return true;
+      if (c.phone.toLowerCase().includes(clean)) return true;
+      if (c.name.toLowerCase().includes(clean)) return true;
+      return false;
+    }) || null
+  );
 }
 
 export function getLoyaltyCustomers(): LoyaltyCustomer[] {
@@ -596,14 +607,14 @@ export function getLoyaltyCustomers(): LoyaltyCustomer[] {
   }
 }
 
-export function saveLoyaltyCustomers(list: LoyaltyCustomer[], customClient?: any) {
+export function saveLoyaltyCustomers(list: LoyaltyCustomer[], _unused?: any) {
   if (typeof window === 'undefined') return;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
     localStorage.setItem('wd_loyalty_ts', Date.now().toString());
     window.dispatchEvent(new Event('wd_loyalty_updated'));
     broadcastSync('SYNC_LOYALTY_CUSTOMERS', { customers: list });
-    syncLoyaltyToSupabase(list, customClient);
+    void syncLoyaltyToFirestore(list);
   } catch (e) {
     console.error('Failed to save loyalty customers:', e);
   }
@@ -872,38 +883,46 @@ export function getMonthlyTierStatus(customer: LoyaltyCustomer): MonthlyTierStat
   };
 }
 
-export async function syncLoyaltyToSupabase(list: LoyaltyCustomer[], customClient?: any) {
+export async function syncLoyaltyToFirestore(list: LoyaltyCustomer[]) {
   try {
-    const sb = customClient || getSupabaseClient();
-    if (!sb) return;
-    const rows = list.map(c => ({
-      id: String(c.id),
-      name: String(c.name || '').trim(),
-      phone: String(c.phone || '').trim(),
-      coins: Number(c.coins || 0),
-      total_spent: Number(c.totalSpent || 0),
-      orders_count: Number(c.ordersCount || 0),
-      tier: String(c.tier || 'Brons'),
-      current_month_spent: Number(c.currentMonthSpent || 0),
-      last_month_spent: Number(c.lastMonthSpent || 0),
-      current_month_key: String(c.currentMonthKey || getCurrentMonthKey()),
-      months_below_target: Number(c.monthsBelowTarget || 0),
-      vip_subscription_active: Boolean(c.vipSubscriptionActive),
-      vip_subscription_expires: c.vipSubscriptionExpires ? String(c.vipSubscriptionExpires) : null,
-      vouchers: Array.isArray(c.vouchers) ? c.vouchers : [],
-      last_spin_date: c.lastSpinDate ? String(c.lastSpinDate) : null,
-      orders_today_count: Number(c.ordersTodayCount || 0),
-      joined_date: String(c.joinedDate || new Date().toISOString().split('T')[0]),
-      updated_at: new Date().toISOString()
-    }));
-    const { error } = await sb.from('loyalty_customers').upsert(rows, { onConflict: 'id' });
-    if (error) {
-      console.warn('⚠️ Supabase loyalty_customers upsert error:', error.message || error);
-    } else {
-      console.log('✅ Loyalty customers synced to Supabase successfully:', rows.length);
+    if (!list || list.length === 0) return;
+    const chunkSize = 400;
+    for (let i = 0; i < list.length; i += chunkSize) {
+      const batch = writeBatch(db);
+      const chunk = list.slice(i, i + chunkSize);
+      for (const c of chunk) {
+        const docId = sanitizeDocId(String(c.id || `c_${normalizePhone(c.phone)}`));
+        const docData: Record<string, any> = {
+          id: String(c.id).slice(0, 128),
+          name: String(c.name || 'Vaste Klant').trim().slice(0, 120),
+          phone: String(c.phone || '').trim().slice(0, 32),
+          coins: Math.max(0, Number(c.coins || 0)),
+          totalSpent: Math.max(0, Number(c.totalSpent || 0)),
+          ordersCount: Math.max(0, Number(c.ordersCount || 0)),
+          tier: String(c.tier || 'Brons').slice(0, 32),
+          currentMonthSpent: Math.max(0, Number(c.currentMonthSpent || 0)),
+          lastMonthSpent: Math.max(0, Number(c.lastMonthSpent || 0)),
+          currentMonthKey: String(c.currentMonthKey || getCurrentMonthKey()).slice(0, 16),
+          monthsBelowTarget: Math.max(0, Number(c.monthsBelowTarget || 0)),
+          vipSubscriptionActive: Boolean(c.vipSubscriptionActive),
+          vouchers: Array.isArray(c.vouchers) ? c.vouchers.slice(0, 100) : [],
+          ordersTodayCount: Math.max(0, Number(c.ordersTodayCount || 0)),
+          joinedDate: String(c.joinedDate || new Date().toISOString().split('T')[0]).slice(0, 32),
+          updatedAt: new Date().toISOString()
+        };
+        if (typeof c.level === 'number') docData.level = c.level;
+        if (c.vipSubscriptionExpires) docData.vipSubscriptionExpires = String(c.vipSubscriptionExpires).slice(0, 32);
+        if (c.vipPlan) docData.vipPlan = String(c.vipPlan).slice(0, 32);
+        if (c.lastSpinDate) docData.lastSpinDate = String(c.lastSpinDate).slice(0, 32);
+        if (c.lastOrderDate) docData.lastOrderDate = String(c.lastOrderDate).slice(0, 32);
+        if (typeof c.totalSpins === 'number') docData.totalSpins = c.totalSpins;
+
+        batch.set(doc(db, 'loyalty_customers', docId), sanitizeForFirestore(docData));
+      }
+      await batch.commit();
     }
   } catch (err) {
-    console.warn('⚠️ Supabase loyalty sync exception:', err);
+    console.warn('⚠️ Firestore loyalty sync error:', err);
   }
 }
 

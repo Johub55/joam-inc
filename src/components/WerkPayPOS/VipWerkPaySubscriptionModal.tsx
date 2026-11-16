@@ -7,6 +7,11 @@ import {
   normalizePhone 
 } from '../../services/loyalty';
 import { euro, accountMatchesUid, normalizeCardUid } from '../../services/store';
+import {
+  getAllBankAccountsFromFirestore,
+  adjustBankBalanceTransaction,
+  saveBankTransactionToFirestore
+} from '../../services/firestoreSync';
 import { showToast } from '../../services/appToast';
 import { AudioFX } from '../../services/audio';
 import { 
@@ -40,7 +45,6 @@ export const VipWerkPaySubscriptionModal: React.FC<VipWerkPaySubscriptionModalPr
     bankAccounts, 
     setBankAccounts, 
     setBankTransactions, 
-    posClient, 
     currentBankAccount,
     currentPosUser
   } = useApp();
@@ -110,24 +114,12 @@ export const VipWerkPaySubscriptionModal: React.FC<VipWerkPaySubscriptionModalPr
           a => a.username.toLowerCase() === u && (a.password === p || a.pin_code === p)
         );
 
-        if (!targetAccount && posClient) {
+        if (!targetAccount) {
           try {
-            const { data } = await posClient
-              .from('bank_accounts')
-              .select('*')
-              .ilike('username', u)
-              .or(`password.eq.${p},pin_code.eq.${p}`)
-              .single();
-            if (data) {
-              targetAccount = {
-                id: data.id,
-                username: data.username,
-                account_holder: data.account_holder,
-                card_uid: data.card_uid,
-                pin_code: data.pin_code,
-                balance: Number(data.balance)
-              };
-            }
+            const remoteAccounts = await getAllBankAccountsFromFirestore();
+            targetAccount = remoteAccounts.find(
+              a => a.username.toLowerCase() === u && (a.password === p || a.pin_code === p)
+            );
           } catch {}
         }
 
@@ -180,17 +172,16 @@ export const VipWerkPaySubscriptionModal: React.FC<VipWerkPaySubscriptionModalPr
       };
       setBankTransactions(prev => [tx, ...prev]);
 
-      // Sync Bank Account to Supabase if client exists
-      if (posClient) {
-        try {
-          await posClient.from('bank_accounts').update({ balance: newBal }).eq('id', targetAccount.id);
-        } catch (err) {
-          console.warn('Error updating bank account balance in DB:', err);
-        }
+      // Sync Bank Account balance & transaction to Firebase Firestore
+      try {
+        await adjustBankBalanceTransaction(targetAccount.username, -planAmount, targetAccount);
+        await saveBankTransactionToFirestore(tx);
+      } catch (err) {
+        console.warn('Error updating bank account balance in Firestore:', err);
       }
 
       // Activate VIP status & save subscriber record
-      const activated = subscribeVipClub(phone.trim(), selectedPlan, posClient);
+      subscribeVipClub(phone.trim(), selectedPlan);
 
       saveVipSubscriberRecord({
         phone: normalizePhone(phone) || phone,

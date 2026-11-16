@@ -32,7 +32,8 @@ import {
 } from 'lucide-react';
 import { 
   getLoyaltyCustomers, 
-  fetchLoyaltyFromSupabase,
+  fetchLoyaltyFromFirestore,
+  findLoyaltyCustomerInFirestore,
   normalizePhone,
   findLoyaltyCustomerByPhoneOrName, 
   registerLoyaltyCustomer, 
@@ -64,19 +65,17 @@ export const PAAL_OPTIONS = [
 ];
 
 export const LoyaltyTerminalScreen: React.FC = () => {
-  const { currentPosUser, logoutPos, forceSyncNow, isOnline, syncStatus, isRealtimeActive, posClient } = useApp();
+  const { currentPosUser, logoutPos, forceSyncNow, isOnline, syncStatus, isRealtimeActive } = useApp();
   const [customers, setCustomers] = useState<LoyaltyCustomer[]>(getLoyaltyCustomers());
   const [activeCustomer, setActiveCustomer] = useState<LoyaltyCustomer | null>(null);
   
-  // Prefer Supabase cloud sync over local storage whenever network & posClient exist
+  // Prefer Firebase Cloud Firestore sync over local storage
   useEffect(() => {
     let isMounted = true;
     const loadCloudLoyalty = async () => {
-      if (posClient) {
-        const cloudData = await fetchLoyaltyFromSupabase(posClient);
-        if (isMounted && cloudData) {
-          setCustomers(cloudData);
-        }
+      const cloudData = await fetchLoyaltyFromFirestore();
+      if (isMounted && cloudData) {
+        setCustomers(cloudData);
       } else if (forceSyncNow) {
         forceSyncNow().then(() => {
           if (isMounted) setCustomers(getLoyaltyCustomers());
@@ -85,7 +84,7 @@ export const LoyaltyTerminalScreen: React.FC = () => {
     };
     loadCloudLoyalty();
     return () => { isMounted = false; };
-  }, [posClient, forceSyncNow]);
+  }, [forceSyncNow]);
   
   // Paal Koppeling State
   const [selectedPaalId, setSelectedPaalId] = useState<string>(() => {
@@ -237,53 +236,23 @@ export const LoyaltyTerminalScreen: React.FC = () => {
     const cleanQuery = query.trim();
     if (!cleanQuery) return;
 
-    // 1. PRIMARY SOURCE OF TRUTH: Supabase Cloud Database Query
-    if (posClient) {
-      try {
-        const cleanPhone = normalizePhone(cleanQuery);
-        const { data, error } = await posClient
-          .from('loyalty_customers')
-          .select('*')
-          .or(`phone.eq.${cleanPhone},phone.ilike.%${cleanQuery}%,name.ilike.%${cleanQuery}%`)
-          .limit(1);
-
-        if (!error && data && data.length > 0) {
-          const row = data[0];
-          const remoteCust: LoyaltyCustomer = {
-            id: String(row.id),
-            name: String(row.name || 'Vaste Klant'),
-            phone: String(row.phone || ''),
-            coins: Number(row.coins || 0),
-            totalSpent: Number(row.total_spent || 0),
-            ordersCount: Number(row.orders_count || 0),
-            tier: (row.tier as any) || 'Brons',
-            currentMonthSpent: Number(row.current_month_spent || 0),
-            lastMonthSpent: Number(row.last_month_spent || 0),
-            currentMonthKey: row.current_month_key || '',
-            monthsBelowTarget: Number(row.months_below_target || 0),
-            vipSubscriptionActive: Boolean(row.vip_subscription_active),
-            vipSubscriptionExpires: row.vip_subscription_expires || undefined,
-            vouchers: Array.isArray(row.vouchers) ? row.vouchers : (typeof row.vouchers === 'string' ? JSON.parse(row.vouchers) : []),
-            lastSpinDate: row.last_spin_date || undefined,
-            ordersTodayCount: Number(row.orders_today_count || 0),
-            joinedDate: row.joined_date || new Date().toISOString().split('T')[0]
-          };
-
-          // Cache in local storage and update state
-          const localList = getLoyaltyCustomers();
-          const updatedList = [remoteCust, ...localList.filter(c => c.id !== remoteCust.id)];
-          saveLoyaltyCustomers(updatedList, posClient);
-          setActiveCustomer(remoteCust);
-          AudioFX.success();
-          setSearchError('');
-          return;
-        }
-      } catch (err) {
-        console.warn('⚠️ Primary Supabase search exception:', err);
+    // 1. PRIMARY SOURCE OF TRUTH: Firebase Cloud Firestore Query
+    try {
+      const remoteCust = await findLoyaltyCustomerInFirestore(cleanQuery);
+      if (remoteCust) {
+        const localList = getLoyaltyCustomers();
+        const updatedList = [remoteCust, ...localList.filter(c => c.id !== remoteCust.id)];
+        saveLoyaltyCustomers(updatedList);
+        setActiveCustomer(remoteCust);
+        AudioFX.success();
+        setSearchError('');
+        return;
       }
+    } catch (err) {
+      console.warn('⚠️ Primary Firestore search exception:', err);
     }
 
-    // 2. SECONDARY FALLBACK: Local Storage Cache (Only used if offline or Supabase unreachable)
+    // 2. SECONDARY FALLBACK: Local Storage Cache (Only used if offline)
     const localFound = findLoyaltyCustomerByPhoneOrName(cleanQuery);
     if (localFound) {
       setActiveCustomer(localFound);
@@ -342,7 +311,7 @@ export const LoyaltyTerminalScreen: React.FC = () => {
       return;
     }
     const nameToUse = newCustName.trim() || 'Vaste Klant';
-    const newCust = registerLoyaltyCustomer(nameToUse, finalPhone, posClient);
+    const newCust = registerLoyaltyCustomer(nameToUse, finalPhone);
     setActiveCustomer(newCust);
     setCustomers(getLoyaltyCustomers());
     setShowRegisterModal(false);
@@ -359,7 +328,7 @@ export const LoyaltyTerminalScreen: React.FC = () => {
     if (!activeCustomer) return;
     resetIdleTimer();
 
-    const result = redeemRewardForCustomer(activeCustomer.phone, reward, posClient);
+    const result = redeemRewardForCustomer(activeCustomer.phone, reward);
     if (result.error || !result.customer) {
       showToast(result.error || 'Kon beloning niet inwisselen', 'warning');
       return;
@@ -421,25 +390,24 @@ export const LoyaltyTerminalScreen: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Live Online Supabase Indicator */}
+          {/* Live Online Firebase Cloud Indicator */}
           <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold border bg-slate-950/80 border-slate-800">
-            <span className={`w-2 h-2 rounded-full ${posClient && isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+            <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
             <span className="text-slate-300">
-              {posClient && isOnline ? '⚡ Supabase Cloud Actief' : '💾 Offline Cache Mode'}
+              {isRealtimeActive || isOnline ? '⚡ Firebase Cloud Actief' : '💾 Offline Cache Mode'}
             </span>
             <button
               onClick={async () => {
-                if (posClient) {
-                  const cloudData = await fetchLoyaltyFromSupabase(posClient);
-                  if (cloudData) setCustomers(cloudData);
-                } else if (forceSyncNow) {
+                const cloudData = await fetchLoyaltyFromFirestore();
+                if (cloudData) setCustomers(cloudData);
+                else if (forceSyncNow) {
                   await forceSyncNow();
                   setCustomers(getLoyaltyCustomers());
                 }
-                showToast('⚡ Live cloud data ververst vanuit Supabase!', 'success');
+                showToast('⚡ Live cloud data ververst vanuit Firebase Cloud!', 'success');
               }}
               className="p-1 hover:text-white text-slate-400 transition ml-0.5"
-              title="Nu handmatig met Supabase synchroniseren"
+              title="Nu handmatig met Firebase Cloud synchroniseren"
             >
               <RotateCw className={`w-3 h-3 ${syncStatus === 'syncing' ? 'animate-spin text-cyan-400' : ''}`} />
             </button>

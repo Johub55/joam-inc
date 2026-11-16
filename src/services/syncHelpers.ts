@@ -35,7 +35,7 @@ export function clearLocalOrderMutation(orderNo: number) {
 }
 
 /**
- * Format an order raw record from Supabase into our strongly-typed Order object.
+ * Format an order raw record from Firestore or storage into our strongly-typed Order object.
  */
 export const formatDbOrder = (o: any): Order => {
   let parsedItems = [];
@@ -50,36 +50,48 @@ export const formatDbOrder = (o: any): Order => {
   }
 
   let parsedMeta: any = {};
-  if (typeof o.payment_meta === 'string') {
+  const rawMeta = o.paymentMeta ?? o.payment_meta;
+  if (typeof rawMeta === 'string') {
     try {
-      parsedMeta = JSON.parse(o.payment_meta);
+      parsedMeta = JSON.parse(rawMeta);
     } catch {
       parsedMeta = {};
     }
-  } else if (typeof o.payment_meta === 'object' && o.payment_meta !== null) {
-    parsedMeta = o.payment_meta;
+  } else if (typeof rawMeta === 'object' && rawMeta !== null) {
+    parsedMeta = rawMeta;
   }
 
-  const createdDate = o.created_at ? new Date(o.created_at) : new Date();
-  const updatedDate = o.updated_at ? new Date(o.updated_at) : createdDate;
+  const createdTs =
+    typeof o.timestamp === 'number'
+      ? o.timestamp
+      : o.created_at
+      ? new Date(o.created_at).getTime()
+      : Date.now();
+  const updatedTs =
+    typeof o.updatedAt === 'number'
+      ? o.updatedAt
+      : o.updated_at
+      ? new Date(o.updated_at).getTime()
+      : createdTs;
+  const createdDate = new Date(createdTs);
 
   return {
-    id: o.id || Date.now(),
-    no: Number(o.order_no),
+    id: o.id || createdTs,
+    no: Number(o.no ?? o.order_no ?? 0),
     items: parsedItems,
     total: Number(o.total || 0),
     discount: Number(o.discount || 0),
-    orderType: (o.order_type as any) || 'dine_in',
+    orderType: (o.orderType || o.order_type || 'dine_in') as any,
     identifier: o.identifier || '',
     notes: o.notes || '',
-    paymentMethod: (o.payment_method as any) || 'workpay',
+    paymentMethod: (o.paymentMethod || o.payment_method || 'workpay') as any,
     paymentMeta: parsedMeta,
     cashier: o.cashier || 'Kassa',
-    status: (o.status as OrderStatus) || 'new',
-    isPrio: Boolean(o.is_prio ?? parsedMeta?.isPrio ?? false),
-    time: createdDate.toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
-    timestamp: createdDate.getTime(),
-    updatedAt: updatedDate.getTime()
+    status: (o.status as OrderStatus) || 'wachten',
+    isPrio: Boolean(o.isPrio ?? o.is_prio ?? parsedMeta?.isPrio ?? false),
+    time: o.time || createdDate.toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
+    timestamp: createdTs,
+    updatedAt: updatedTs
   };
 };
 
@@ -161,7 +173,7 @@ export const mergeOrders = (
     }
   }
 
-  // Keep any optimistic local orders that have not yet arrived from Supabase
+  // Keep any optimistic local orders that have not yet arrived from Firestore
   for (const exist of current) {
     if (!processedNos.has(exist.no)) {
       const deletedTime = recentlyDeletedOrders.get(exist.no);
@@ -170,8 +182,8 @@ export const mergeOrders = (
       }
       
       // If the order was created very recently (e.g. less than 15 seconds ago),
-      // it might be optimistic local-only and hasn't finished uploading to Supabase yet.
-      // Otherwise, if it is older, and we are connected/polling Supabase, and it's not in incoming,
+      // it might be optimistic local-only and hasn't finished uploading to Firebase yet.
+      // Otherwise, if it is older, and we are connected to Firestore, and it's not in incoming,
       // it has been deleted on another terminal/tab! So we should NOT keep it.
       const isOptimistic = now - exist.timestamp < 15000;
       if (isOptimistic) {

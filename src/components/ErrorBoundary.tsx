@@ -9,6 +9,33 @@ interface State {
   error: Error | null;
 }
 
+const isChunkLoadError = (error: Error | null): boolean => {
+  if (!error) return false;
+  const msg = String(error.message || error.name || '').toLowerCase();
+  return (
+    msg.includes('failed to fetch dynamically imported module') ||
+    msg.includes('importing a module script failed') ||
+    msg.includes('loading chunk') ||
+    msg.includes('chunkloaderror')
+  );
+};
+
+const forceCacheBustedReload = async () => {
+  try {
+    if ('caches' in window) {
+      const names = await caches.keys();
+      await Promise.all(names.map((name) => caches.delete(name)));
+    }
+  } catch {}
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('_r', String(Date.now()));
+    window.location.replace(url.toString());
+  } catch {
+    window.location.reload();
+  }
+};
+
 export class ErrorBoundary extends Component<Props, State> {
   public state: State = {
     hasError: false,
@@ -21,22 +48,37 @@ export class ErrorBoundary extends Component<Props, State> {
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('Uncaught error:', error, errorInfo);
+
+    // Eenmalig automatisch herstellen als GitHub Pages een nieuwere versie heeft gedeployed
+    if (isChunkLoadError(error)) {
+      try {
+        const key = 'wd_chunk_reload_at';
+        const last = Number(sessionStorage.getItem(key) || '0');
+        const now = Date.now();
+        if (now - last > 15000) {
+          sessionStorage.setItem(key, String(now));
+          void forceCacheBustedReload();
+        }
+      } catch {}
+    }
   }
 
-  private handleReset = () => {
+  private handleReset = async () => {
     try {
       localStorage.clear();
+      sessionStorage.clear();
     } catch {}
-    window.location.reload();
+    await forceCacheBustedReload();
   };
 
-  private handleReload = () => {
-    window.location.reload();
+  private handleReload = async () => {
+    await forceCacheBustedReload();
   };
 
   public render(): ReactNode {
     const instance = this as any;
     if (instance.state?.hasError) {
+      const chunkErr = isChunkLoadError(instance.state?.error || null);
       return (
         <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-6 text-center select-none font-sans">
           <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4">
@@ -44,9 +86,13 @@ export class ErrorBoundary extends Component<Props, State> {
               ⚠️
             </div>
             <div>
-              <h2 className="text-xl font-black text-white">Oeps! Er is iets misgegaan</h2>
+              <h2 className="text-xl font-black text-white">
+                {chunkErr ? 'Nieuwe versie beschikbaar' : 'Oeps! Er is iets misgegaan'}
+              </h2>
               <p className="text-xs text-slate-400 mt-1">
-                De applicatie heeft een onverwachte fout opgevangen om een wit scherm te voorkomen.
+                {chunkErr
+                  ? 'Er is waarschijnlijk een nieuwe update op GitHub Pages geplaatst. Herlaad de pagina om de nieuwste versie op te halen.'
+                  : 'De applicatie heeft een onverwachte fout opgevangen om een wit scherm te voorkomen.'}
               </p>
             </div>
 

@@ -11,7 +11,6 @@ import { TwoFactorSetupModal } from '../TwoFactorSetupModal';
 import { TwoFactorChallengeModal } from '../TwoFactorChallengeModal';
 import { generateTotpCode, verifyTotpCode } from '../../services/totp';
 import { showToast } from '../../services/appToast';
-import { ZERO_CHANGES_FREEZE_SQL, ZERO_CHANGES_UNFREEZE_SQL, SHADOWBAN_SECURITY_PATCH_SQL } from '../../services/sqlScripts';
 import { 
   getLoyaltyCustomers, 
   saveLoyaltyCustomers, 
@@ -1211,7 +1210,7 @@ export const ManagerScreen: React.FC = () => {
                   Master Security PIN beveiligt alle gevoelige acties (gebruikers verwijderen, menu wissen, back-up herstellen).
                 </p>
                 <div className="flex items-center justify-between pt-1">
-                  <span className="text-[11px] text-slate-400 font-mono">Opslag: <strong className="text-emerald-400">Beveiligd in pos_settings (Supabase)</strong></span>
+                  <span className="text-[11px] text-slate-400 font-mono">Opslag: <strong className="text-emerald-400">Beveiligd in Firebase Cloud (pos_settings)</strong></span>
                   <button
                     type="button"
                     onClick={() => {
@@ -1236,7 +1235,7 @@ export const ManagerScreen: React.FC = () => {
                   1-Klik 0-Veranderingen Tabel-Slot &amp; Automatische Nep-Rechten
                 </strong>
                 <p className="text-slate-400 text-[11px]">
-                  <strong>Nep-Rechten (👻 Shadowban)</strong> en <strong>Blokkades</strong> werken nu 100% automatisch online via de al bestaande <code className="text-purple-300 font-mono">perms</code> kolom (<strong>je hoeft zelf 0 SQL aan te passen!</strong>). Met de knop hieronder bevries je direct alle tabellen zodat er 0 wijzigingen plaatsvinden:
+                  <strong>Nep-Rechten (👻 Shadowban)</strong> en <strong>Blokkades</strong> werken 100% automatisch live via Firebase Cloud Firestore. Met de knop hieronder bevries je direct alle product- en voorraadwijzigingen:
                 </p>
                 <div className="flex flex-wrap items-center gap-2 pt-1">
                   <button
@@ -1257,26 +1256,6 @@ export const ManagerScreen: React.FC = () => {
                     }`}
                   >
                     {tablesFrozen ? '🔓 Ontgrendel Tabellen Nu' : '🔒 Bevries Tabellen Nu (0 Veranderingen)'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      navigator.clipboard?.writeText(ZERO_CHANGES_FREEZE_SQL);
-                      showToast('🔒 1-Regel Server Lock SQL gekopieerd! Plak in Supabase om op server-niveau élke wijziging te blokkeren.', 'success');
-                    }}
-                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-rose-300 border border-rose-500/30 text-[10px] font-bold"
-                  >
-                    📋 Kopieer 1-Regel SQL Slot
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      navigator.clipboard?.writeText(ZERO_CHANGES_UNFREEZE_SQL);
-                      showToast('🔓 SQL Ontgrendeling gekopieerd!', 'success');
-                    }}
-                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold"
-                  >
-                    📋 Kopieer SQL Unlock
                   </button>
                 </div>
               </div>
@@ -1621,67 +1600,15 @@ export const ManagerScreen: React.FC = () => {
               <span>Systeemacties, Database &amp; Menureset</span>
             </h3>
 
-            {/* SQL Export & Schema Downloads */}
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3 text-xs">
-              <div>
-                <div className="font-bold text-slate-200 flex items-center gap-1.5">
-                  <Database className="w-4 h-4 text-emerald-400" />
-                  <span>Supabase PostgreSQL Database Scripts (3 Opties)</span>
-                </div>
-                <p className="text-slate-400 text-[11px] mt-0.5">
-                  Kies een van de SQL scripts voor de Supabase SQL Editor. Gebruik de <strong>Schema Only</strong> versie als je jouw aangepaste producten en prijzen wilt BEWAREN.
-                </p>
+            {/* Firebase Cloud Firestore Info */}
+            <div className="p-4 rounded-xl bg-slate-950 border border-emerald-500/30 space-y-2 text-xs">
+              <div className="font-bold text-emerald-300 flex items-center gap-1.5">
+                <Database className="w-4 h-4 text-emerald-400" />
+                <span>Firebase Cloud Firestore Live Synchronisatie Actief</span>
               </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
-                <a
-                  href="./database-schema-only.sql"
-                  download="database-schema-only.sql"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="p-3 rounded-xl bg-slate-900 border border-emerald-500/40 hover:border-emerald-400 hover:bg-slate-850 transition flex items-center justify-between group shadow-sm"
-                >
-                  <div>
-                    <div className="font-bold text-emerald-400 flex items-center gap-1">
-                      <span>🛡️ Schema Only</span>
-                    </div>
-                    <div className="text-[10px] text-slate-300 font-medium">Behoudt jouw eigen producten &amp; prijzen (Geen reset)</div>
-                  </div>
-                  <Download className="w-4 h-4 text-slate-400 group-hover:text-emerald-400 transition" />
-                </a>
-
-                <a
-                  href="./database-basis.sql"
-                  download="database-basis.sql"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="p-3 rounded-xl bg-slate-900 border border-slate-800 hover:border-cyan-500/50 hover:bg-slate-850 transition flex items-center justify-between group"
-                >
-                  <div>
-                    <div className="font-bold text-cyan-400 flex items-center gap-1">
-                      <span>📄 Basis Tabellen</span>
-                    </div>
-                    <div className="text-[10px] text-slate-400">⚡ Alleen 5 kern-tabellen</div>
-                  </div>
-                  <Download className="w-4 h-4 text-slate-400 group-hover:text-cyan-400 transition" />
-                </a>
-
-                <a
-                  href="./database.sql"
-                  download="database.sql"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="p-3 rounded-xl bg-slate-900 border border-slate-800 hover:border-indigo-500/50 hover:bg-slate-850 transition flex items-center justify-between group"
-                >
-                  <div>
-                    <div className="font-bold text-indigo-400 flex items-center gap-1">
-                      <span>📦 Volledig + Seed</span>
-                    </div>
-                    <div className="text-[10px] text-slate-400">🔥 Alle tabellen + Standaard data</div>
-                  </div>
-                  <Download className="w-4 h-4 text-slate-400 group-hover:text-indigo-400 transition" />
-                </a>
-              </div>
+              <p className="text-slate-400 text-[11px]">
+                Alle producten, keuzemenu&apos;s, bestellingen, keukenupdates, voorraad, spaarpunten en WerkPay bankrekeningen worden direct en automatisch live gesynchroniseerd via Firebase Firestore. Handmatige SQL scripts zijn niet meer nodig.
+              </p>
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs">
@@ -2697,7 +2624,7 @@ export const ManagerScreen: React.FC = () => {
 
           <div className="flex items-center gap-2">
             <span className="px-3 py-1 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 text-xs font-bold font-mono">
-              ⚡ Live Supabase Sync
+              ⚡ Live Firebase Sync
             </span>
           </div>
         </div>

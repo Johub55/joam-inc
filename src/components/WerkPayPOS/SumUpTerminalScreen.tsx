@@ -241,7 +241,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
       const res = await processSumUpPayment({
         amount: baseAmount,
         tipAmount,
-        description: description.trim() || 'SumUp Betaling',
+        description: description.trim() || 'WerkPin Betaling',
         method,
         paymentMeta: meta,
         sendToKitchen,
@@ -465,7 +465,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
       {
         received: Math.round(rec * 100) / 100,
         change,
-        cashier: currentPosUser?.name || 'SumUp',
+        cashier: currentPosUser?.name || 'WerkPin',
         approvalPin: !hasCashAuth ? cashApprovalPin.trim() : undefined
       },
       false
@@ -524,10 +524,10 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
 
   const qrDataPayload = useMemo(() => {
     return JSON.stringify({
-      type: 'WERKPAY_SUMUP',
+      type: 'WERKPAY_PIN',
       merchant: customBranding?.useCustomBranding ? customBranding.storeName : brandConfig.name,
       amount: finalTotal,
-      ref: description.trim() || 'SumUp Betaling',
+      ref: description.trim() || 'WerkPin Betaling',
       orderNo
     });
   }, [finalTotal, description, orderNo, customBranding, brandConfig.name]);
@@ -660,7 +660,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
       showToast('Voer eerst een bedrag in om te delen.', 'error');
       return;
     }
-    const text = `Betaalverzoek ${displayBrandName}: ${euro(finalTotal)} — ${description.trim() || 'SumUp Betaling'} (Bon #${orderNo})`;
+    const text = `Betaalverzoek ${displayBrandName}: ${euro(finalTotal)} — ${description.trim() || 'WerkPin Betaling'} (Bon #${orderNo})`;
     if (typeof navigator.share === 'function') {
       try {
         await navigator.share({ title: `${displayBrandName} Betaalverzoek`, text });
@@ -677,7 +677,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
 
   return (
     <div className="flex-1 flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
-      {/* Compact SumUp Mobile App Header (only shown when auto-opened in small screen shell without full POS headers) */}
+      {/* Compact WerkPin Mobile App Header (only shown when auto-opened in small screen shell without full POS headers) */}
       {isCompactMobileShell && (
         <div className="px-4 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -686,7 +686,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
-                <span className="font-black text-sm text-white truncate">WerkPay SumUp</span>
+                <span className="font-black text-sm text-white truncate">WerkPay WerkPin</span>
                 <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400' : 'bg-amber-400'}`} />
               </div>
               <p className="text-[11px] text-slate-400 truncate">
@@ -719,7 +719,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         </div>
       )}
 
-      {/* Sub-navigation Bar (4 SumUp App Tabs) */}
+      {/* Sub-navigation Bar (4 WerkPin App Tabs) */}
       <div className="px-2.5 sm:px-6 py-2 bg-slate-900/80 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
         <div className="grid grid-cols-4 gap-1 sm:gap-1.5 w-full max-w-2xl mx-auto">
           <button
@@ -786,7 +786,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         <div className="max-w-2xl mx-auto space-y-4">
 
           {/* ============================================================== */}
-          {/* TAB 1: SUMUP AFREKENEN (NUMPAD) */}
+          {/* TAB 1: WERKPIN AFREKENEN (NUMPAD) */}
           {/* ============================================================== */}
           {activeTab === 'charge' && (
             <div className="space-y-3.5">
@@ -832,7 +832,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
                   <span className="font-bold uppercase tracking-wider flex items-center gap-1.5">
                     <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-                    <span>SumUp Betaalverzoek</span>
+                    <span>WerkPin Betaalverzoek</span>
                   </span>
                   <div className="flex items-center gap-1.5">
                     {entryCount > 0 && (
@@ -1083,7 +1083,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 </div>
               </div>
 
-              {/* SumUp Tactile Numpad */}
+              {/* WerkPin Tactile Numpad */}
               <div className="grid grid-cols-4 gap-2 sm:gap-2.5">
                 {['1', '2', '3'].map(d => (
                   <button
@@ -1179,12 +1179,12 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
                   <div className="text-[10px] font-bold uppercase text-slate-400">Omzet Vandaag</div>
                   <div className="text-lg font-black text-emerald-400 mt-0.5">{euro(todayStats.totalRev)}</div>
-                  <div className="text-[10px] text-slate-500">Waarvan SumUp: {euro(todayStats.sumupRev)}</div>
+                  <div className="text-[10px] text-slate-500">Waarvan WerkPin: {euro(todayStats.sumupRev)}</div>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
                   <div className="text-[10px] font-bold uppercase text-slate-400">Transacties</div>
                   <div className="text-lg font-black text-white mt-0.5">{todayStats.count}</div>
-                  <div className="text-[10px] text-slate-500">{todayStats.sumupCount}x via SumUp app</div>
+                  <div className="text-[10px] text-slate-500">{todayStats.sumupCount}x via WerkPin app</div>
                 </div>
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
                   <div className="text-[10px] font-bold uppercase text-slate-400">Gemiddeld</div>
@@ -1194,14 +1194,14 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3.5">
                   <div className="text-[10px] font-bold uppercase text-slate-400">Fooi Vandaag</div>
                   <div className="text-lg font-black text-amber-400 mt-0.5">{euro(todayStats.tips)}</div>
-                  <div className="text-[10px] text-slate-500">SumUp fooien</div>
+                  <div className="text-[10px] text-slate-500">WerkPin fooien</div>
                 </div>
               </div>
 
               {/* Filter Bar */}
               <div className="flex items-center gap-1.5 overflow-x-auto">
                 {([
-                  { id: 'sumup', label: '💳 Alleen SumUp' },
+                  { id: 'sumup', label: '💳 Alleen WerkPin' },
                   { id: 'all', label: 'Alles (incl. Kassa)' },
                   { id: 'workpay', label: 'WerkPay' },
                   { id: 'cash', label: 'Contant' }
@@ -1243,7 +1243,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                             <span className="text-sm font-bold text-white truncate">{o.identifier}</span>
                             {o.paymentMeta?.isSumUp && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-bold">
-                                SumUp
+                                WerkPin
                               </span>
                             )}
                             {isRefunded && (
@@ -1976,7 +1976,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
             <div className="p-4 sm:p-5 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
               <div>
                 <div className="text-[11px] font-bold uppercase tracking-wider text-cyan-400">
-                  SumUp Afrekenen · {description.trim() || 'SumUp Betaling'}
+                  WerkPin Afrekenen · {description.trim() || 'WerkPin Betaling'}
                 </div>
                 <div className="text-2xl font-black text-white font-mono">{euro(finalTotal)}</div>
               </div>
@@ -2116,7 +2116,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
               {payMethod === 'login' && (
                 <div className="space-y-4">
                   <div className="bg-white rounded-2xl p-3 flex flex-col items-center gap-1.5">
-                    <img src={qrImgUrl} alt="WerkPay SumUp QR" className="w-36 h-36 rounded-lg" />
+                    <img src={qrImgUrl} alt="WerkPay WerkPin QR" className="w-36 h-36 rounded-lg" />
                     <span className="text-[11px] font-black text-slate-900 font-mono">
                       WerkPay QR · {euro(finalTotal)}
                     </span>
