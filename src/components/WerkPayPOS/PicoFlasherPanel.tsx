@@ -3,10 +3,19 @@ import {
   detectFlasherCapabilities,
   exportCppUf2ForMobileOrDownload,
   flashCppUf2ViaDirectoryPicker,
-  generateConfiguredPicoIno
+  generateConfiguredPicoIno,
+  getSavedWifiProfiles,
+  removeWifiProfile,
+  SavedWifiProfile,
+  saveWifiProfile,
+  sendTerminalIdOverWebSerial,
+  sendWifiOverWebSerial
 } from '../../services/picoFlasher';
+import { getActiveHardwareTerminalId, HARDWARE_TERMINAL_EVENT } from '../../services/firebase';
+import { TerminalSelector } from './TerminalSelector';
 import { showToast } from '../../services/appToast';
 import {
+  Bookmark,
   Cpu,
   Download,
   Eye,
@@ -18,7 +27,9 @@ import {
   Share2,
   Smartphone,
   Terminal,
-  Wifi
+  Usb,
+  Wifi,
+  X
 } from 'lucide-react';
 
 interface PicoFlasherPanelProps {
@@ -44,6 +55,11 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
   });
   const [showPass, setShowPass] = useState<boolean>(false);
   const [lcdAddr, setLcdAddr] = useState<'auto' | '0x27' | '0x3F'>('auto');
+  const [terminalId, setTerminalId] = useState<string>(() => getActiveHardwareTerminalId());
+  const [skipWifiPatch, setSkipWifiPatch] = useState<boolean>(false);
+  const [savedProfiles, setSavedProfiles] = useState<SavedWifiProfile[]>(() =>
+    getSavedWifiProfiles()
+  );
   const [firmwareInfo, setFirmwareInfo] = useState<{ filename: string; sizeKb: number } | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -54,6 +70,14 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
       localStorage.setItem('wp_pico_wifi_pass', wifiPass);
     } catch {}
   }, [wifiSsid, wifiPass]);
+
+  useEffect(() => {
+    const syncTerm = () => {
+      setTerminalId(getActiveHardwareTerminalId());
+    };
+    window.addEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+    return () => window.removeEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+  }, []);
 
   useEffect(() => {
     fetch('/api/pico/firmware-info')
@@ -82,17 +106,20 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
     () => ({
       ssid: wifiSsid,
       password: wifiPass,
+      terminalId,
       nfcBus: 'i2c' as const,
-      lcdAddress: lcdAddr
+      lcdAddress: lcdAddr,
+      skipWifiPatch
     }),
-    [wifiSsid, wifiPass, lcdAddr]
+    [wifiSsid, wifiPass, terminalId, lcdAddr, skipWifiPatch]
   );
 
-  const runFlashAction = async (id: string, fn: () => Promise<void>) => {
+  const runFlashAction = async (id: string, fn: () => Promise<void>, okMessage?: string) => {
     setBusyAction(id);
     try {
       await fn();
-      showToast('C++ firmware klaar om te draaien op de Pico W!', 'success');
+      setSavedProfiles(getSavedWifiProfiles());
+      showToast(okMessage || 'C++ firmware klaar om te draaien op de Pico W!', 'success');
     } catch (err: any) {
       const msg = err?.message || 'Onbekende fout tijdens flashen.';
       appendLog(`❌ ${msg}`);
@@ -102,18 +129,45 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
     }
   };
 
+  const handleSaveCurrentProfile = () => {
+    const clean = wifiSsid.trim();
+    if (!clean) {
+      showToast('Vul eerst een WiFi-naam in om op te slaan.', 'error');
+      return;
+    }
+    const updated = saveWifiProfile({
+      ssid: clean,
+      password: wifiPass,
+      lcdAddress: lcdAddr
+    });
+    setSavedProfiles(updated);
+    appendLog(`🔖 WiFi profiel "${clean}" opgeslagen voor 1-klik flashen.`);
+    showToast(`WiFi "${clean}" opgeslagen!`, 'success');
+  };
+
   const handleDownloadConfiguredIno = () => {
-    const { code, filename } = generateConfiguredPicoIno(wifiConfig);
-    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    appendLog(`📥 ${filename} (C++ broncode met ingevulde WiFi) gedownload.`);
+    if (!terminalId.trim()) {
+      showToast('Stel eerst zelf een Pinapparaat Terminal-ID in via Doel Pinapparaat.', 'error');
+      return;
+    }
+    try {
+      const { code, filename } = generateConfiguredPicoIno(wifiConfig);
+      setSavedProfiles(getSavedWifiProfiles());
+      const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      appendLog(`📥 ${filename} (C++ broncode met WiFi + AP-Portaal + USB WiFi) gedownload.`);
+    } catch (err: any) {
+      const msg = err?.message || 'Kon .INO broncode niet genereren.';
+      appendLog(`❌ ${msg}`);
+      showToast(msg, 'error');
+    }
   };
 
   const platformLabel =
@@ -144,75 +198,214 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
         </div>
 
         <p className="text-[11px] text-slate-300 leading-relaxed">
-          Geen MicroPython en geen Arduino IDE meer nodig: je flasht in <strong>1 stap</strong> de vooraf gecompileerde{' '}
-          <strong>C++ firmware</strong> (PN532 I2C NFC, 16x2 I2C LCD, ghost-vrij keypad &amp; Cloud Keep-Alive) met jouw WiFi direct in het <code>.UF2</code> bestand gebakken.
+          Geen MicroPython nodig: flash in <strong>1 stap</strong> de echte{' '}
+          <strong>C++ firmware</strong> (PN532 I2C NFC, 16x2 LCD, keypad &amp; Cloud). Omdat een browser om veiligheidsredenen geen WiFi-wachtwoord uit je telefoon of laptop mag uitlezen, kun je hier je netwerk opslaan of zonder WiFi flashen.
         </p>
 
         <div className="text-[11px] text-cyan-300/90 font-semibold">
           {caps.hasDirectoryPicker
-            ? 'Direct 1-klik flashen naar RPI-RP2 beschikbaar · of handmatige .UF2 download'
+            ? 'Direct flashen naar RPI-RP2 (met automatische download fallback) beschikbaar'
             : caps.platform === 'ios'
-            ? 'iPad/iPhone: Gebruik USB-C adapter -> kopieer WerkPay_PicoW_Cpp.uf2 in Bestanden naar schijf RPI-RP2'
-            : 'Telefoon/Tablet: Gebruik USB-OTG kabel -> kopieer WerkPay_PicoW_Cpp.uf2 naar schijf RPI-RP2'}
+            ? 'iPad/iPhone: Gebruik USB-C adapter -> kopieer WerkPay_PicoW_Cpp.uf2 in Bestanden naar RPI-RP2'
+            : 'Telefoon/Tablet: Gebruik USB-OTG kabel -> kopieer WerkPay_PicoW_Cpp.uf2 naar RPI-RP2'}
         </div>
       </div>
 
-      {/* WiFi & LCD Settings */}
-      <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
-        <div className="text-xs font-black text-white flex items-center gap-2">
-          <Wifi className="w-4 h-4 text-cyan-400" />
-          <span>1. WiFi &amp; Scherm Instellingen (worden in C++ .UF2 gebakken)</span>
-        </div>
-        <div className={`grid gap-2.5 ${compact ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-3'}`}>
-          <div>
-            <label className="text-[11px] font-bold text-slate-400 block mb-1">WiFi Naam (SSID)</label>
-            <input
-              type="text"
-              value={wifiSsid}
-              onChange={(e) => setWifiSsid(e.target.value)}
-              placeholder="Bijv. MijnWiFi"
-              className="w-full min-h-[42px] bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
-            />
+      {/* WiFi, Terminal-ID & LCD Settings */}
+      <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-3">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="text-xs font-black text-white flex items-center gap-2">
+            <Wifi className="w-4 h-4 text-cyan-400" />
+            <span>1. WiFi, Terminal-ID &amp; Scherm Instellingen</span>
           </div>
-          <div>
-            <label className="text-[11px] font-bold text-slate-400 block mb-1">WiFi Wachtwoord</label>
-            <div className="relative">
-              <input
-                type={showPass ? 'text' : 'password'}
-                value={wifiPass}
-                onChange={(e) => setWifiPass(e.target.value)}
-                placeholder="Wachtwoord..."
-                className="w-full min-h-[42px] bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 pr-9 text-xs text-white focus:outline-none focus:border-cyan-500"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPass((p) => !p)}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
-              >
-                {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
+
+          <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={skipWifiPatch}
+              onChange={(e) => setSkipWifiPatch(e.target.checked)}
+              className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
+            />
+            <span>Basis .UF2 (zonder WiFi)</span>
+          </label>
+        </div>
+
+        {/* Multi-Terminal Selector */}
+        <div className="p-2.5 rounded-xl bg-slate-900/70 border border-slate-800 flex flex-wrap items-center justify-between gap-2">
+          <TerminalSelector
+            compact
+            value={terminalId}
+            onChange={(next) => setTerminalId(next)}
+            disabled={busyAction !== null}
+            label="Doel Pinapparaat"
+          />
+          {caps.hasWebSerial && (
+            <button
+              type="button"
+              disabled={busyAction !== null || !terminalId}
+              onClick={() =>
+                runFlashAction(
+                  'webserial_term',
+                  () => sendTerminalIdOverWebSerial(terminalId, appendLog),
+                  `Terminal-ID "${terminalId}" verstuurd via USB!`
+                )
+              }
+              className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-cyan-300 text-[11px] font-bold flex items-center gap-1.5 disabled:opacity-50"
+              title={!terminalId ? 'Voeg eerst zelf een Terminal-ID toe' : 'Alleen het Terminal-ID naar de Pico W sturen via USB'}
+            >
+              {busyAction === 'webserial_term' ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Usb className="w-3 h-3" />
+              )}
+              <span>Stuur Terminal-ID via USB</span>
+            </button>
+          )}
+        </div>
+
+        {/* Saved WiFi Profile Chips */}
+        {!skipWifiPatch && savedProfiles.length > 0 && (
+          <div className="space-y-1">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Opgeslagen WiFi netwerken (1-klik invullen):
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {savedProfiles.map((prof) => {
+                const isSelected =
+                  prof.ssid.toLowerCase() === wifiSsid.trim().toLowerCase() &&
+                  prof.password === wifiPass;
+                return (
+                  <div
+                    key={prof.ssid}
+                    className={`inline-flex items-center rounded-lg border text-[11px] font-bold overflow-hidden ${
+                      isSelected
+                        ? 'bg-cyan-500/20 border-cyan-500/60 text-cyan-200'
+                        : 'bg-slate-900 border-slate-700 text-slate-300'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWifiSsid(prof.ssid);
+                        setWifiPass(prof.password);
+                        setLcdAddr(prof.lcdAddress || 'auto');
+                      }}
+                      className="px-2.5 py-1 hover:bg-white/5 flex items-center gap-1"
+                    >
+                      <Wifi className="w-3 h-3 text-cyan-400" />
+                      <span>{prof.ssid}</span>
+                    </button>
+                    <button
+                      type="button"
+                      title="Verwijder opgeslagen profiel"
+                      onClick={() => setSavedProfiles(removeWifiProfile(prof.ssid))}
+                      className="px-1.5 py-1 text-slate-500 hover:text-rose-400 border-l border-slate-800"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </div>
-          <div>
-            <label className="text-[11px] font-bold text-slate-400 block mb-1">I2C LCD Adres</label>
-            <select
-              value={lcdAddr}
-              onChange={(e) => setLcdAddr(e.target.value as any)}
-              className="w-full min-h-[42px] bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
-            >
-              <option value="auto">Automatisch (0x27 / 0x3F)</option>
-              <option value="0x27">Vast: 0x27</option>
-              <option value="0x3F">Vast: 0x3F</option>
-            </select>
+        )}
+
+        {skipWifiPatch ? (
+          <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-[11px] text-amber-200 leading-relaxed">
+            Je flasht nu de schone basis <strong>.UF2 firmware</strong> zonder WiFi-gegevens in te typen.
+            Tip: gebruik je de <strong>.INO broncode</strong>, dan start de Pico W vanzelf een hotspot{' '}
+            <code className="text-white font-bold">WerkPay-Setup</code> (open <code className="text-white">192.168.4.1</code> op je telefoon) of kun je WiFi via USB instellen.
           </div>
-        </div>
+        ) : (
+          <>
+            <div className={`grid gap-2.5 ${compact ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-3'}`}>
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 block mb-1">WiFi Naam (SSID)</label>
+                <input
+                  type="text"
+                  value={wifiSsid}
+                  onChange={(e) => setWifiSsid(e.target.value)}
+                  placeholder="Bijv. MijnWiFi of Hotspot"
+                  className="w-full min-h-[42px] bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 block mb-1">
+                  WiFi Wachtwoord <span className="text-slate-500 font-normal">(leeg = open)</span>
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPass ? 'text' : 'password'}
+                    value={wifiPass}
+                    onChange={(e) => setWifiPass(e.target.value)}
+                    placeholder="Wachtwoord (of leeg laten)..."
+                    className="w-full min-h-[42px] bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 pr-9 text-xs text-white focus:outline-none focus:border-cyan-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPass((p) => !p)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                  >
+                    {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 block mb-1">I2C LCD Adres</label>
+                <select
+                  value={lcdAddr}
+                  onChange={(e) => setLcdAddr(e.target.value as any)}
+                  className="w-full min-h-[42px] bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
+                >
+                  <option value="auto">Automatisch (0x27 / 0x3F)</option>
+                  <option value="0x27">Vast: 0x27</option>
+                  <option value="0x3F">Vast: 0x3F</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <button
+                type="button"
+                onClick={handleSaveCurrentProfile}
+                className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 text-[11px] font-bold flex items-center gap-1.5"
+              >
+                <Bookmark className="w-3.5 h-3.5 text-cyan-400" />
+                <span>WiFi onthouden voor volgende keer</span>
+              </button>
+
+              {caps.hasWebSerial && (
+                <button
+                  type="button"
+                  disabled={busyAction !== null}
+                  onClick={() =>
+                    runFlashAction(
+                      'webserial_wifi',
+                      () => sendWifiOverWebSerial(wifiSsid, wifiPass, appendLog, terminalId),
+                      'WiFi & Terminal-ID via USB naar Pico W gestuurd!'
+                    )
+                  }
+                  className="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 text-[11px] font-bold flex items-center gap-1.5 disabled:opacity-50"
+                  title="Stuur WiFi & Terminal-ID naar een reeds geflashte Pico W via USB (nieuwste .INO firmware)"
+                >
+                  {busyAction === 'webserial_wifi' ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Usb className="w-3.5 h-3.5" />
+                  )}
+                  <span>Stuur WiFi via USB (zonder flashen)</span>
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
 
       {/* 1-Step Flash C++ UF2 */}
       <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-3">
         <div>
           <div className="text-xs font-black text-white">
-            2. Flash C++ Firmware (.UF2) in 1 stap op je Pico W
+            2. Flash C++ Firmware (.UF2) op je Pico W
           </div>
           <ol className="text-[11px] text-slate-400 mt-1.5 space-y-1 list-decimal list-inside leading-relaxed">
             <li>
@@ -223,8 +416,8 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
               Laat BOOTSEL los zodra de USB-schijf <code className="text-cyan-300 font-bold">RPI-RP2</code> verschijnt.
             </li>
             <li>
-              Flash of kopieer <code className="text-emerald-300">WerkPay_PicoW_Cpp.uf2</code> naar{' '}
-              <code className="text-cyan-300 font-bold">RPI-RP2</code> — de Pico herstart vanzelf en draait direct C++!
+              Flash of sleep <code className="text-emerald-300">{skipWifiPatch ? 'WerkPay_PicoW_Base.uf2' : 'WerkPay_PicoW_Cpp.uf2'}</code> naar{' '}
+              <code className="text-cyan-300 font-bold">RPI-RP2</code> — de Pico herstart vanzelf in C++!
             </li>
           </ol>
         </div>
@@ -274,6 +467,8 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
             <span>
               {caps.isMobileOrTablet
                 ? 'Zet C++ .UF2 op RPI-RP2 (Bestanden)'
+                : skipWifiPatch
+                ? 'Download Basis C++ .UF2'
                 : 'Download C++ .UF2 (met WiFi)'}
             </span>
           </button>
@@ -282,15 +477,17 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
         {/* Arduino .INO fallback */}
         <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2 flex-wrap">
           <span className="text-[11px] text-slate-400">
-            Liever zelf compileren in Arduino IDE v2?
+            Arduino IDE (.INO bevat <strong className="text-slate-200">WerkPay-Setup Captive Portal, USB Terminal-ID &amp; B-knop Saldo/WerkCoins check</strong>):
           </span>
           <button
             type="button"
+            disabled={!terminalId}
             onClick={handleDownloadConfiguredIno}
-            className="min-h-[38px] px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 text-[11px] font-bold flex items-center gap-1.5"
+            title={!terminalId ? 'Stel eerst zelf een Terminal-ID in bij stap 1' : undefined}
+            className="min-h-[38px] px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-45 border border-slate-700 text-slate-200 text-[11px] font-bold flex items-center gap-1.5"
           >
             <FileCode2 className="w-3.5 h-3.5 text-amber-400" />
-            <span>Download C++ Broncode (.INO)</span>
+            <span>{terminalId ? 'Download C++ Broncode (.INO)' : 'Stel eerst Terminal-ID in voor .INO'}</span>
           </button>
         </div>
       </div>
@@ -315,7 +512,7 @@ export const PicoFlasherPanel: React.FC<PicoFlasherPanelProps> = ({ compact = fa
         {logs.length === 0 ? (
           <div className="text-slate-500 flex items-center gap-1.5 py-1 font-sans">
             <Info className="w-3.5 h-3.5 shrink-0" />
-            <span>Vul hierboven je WiFi in en klik op Flash C++ .UF2 (zet Pico W eerst in BOOTSEL-modus).</span>
+            <span>Kies een opgeslagen WiFi, vul je netwerk in, of kies Basis .UF2 en klik op Flash.</span>
           </div>
         ) : (
           <div className="max-h-32 overflow-y-auto space-y-0.5">

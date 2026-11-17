@@ -1,17 +1,22 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { ShieldAlert, Lock, Unlock, LogOut, Key, AlertCircle } from 'lucide-react';
+import { ShieldAlert, Lock, Unlock, LogOut, Key, AlertCircle, Radio, Clock } from 'lucide-react';
 import { showToast } from '../../services/appToast';
+import { PicoCardLoginPanel } from '../PicoCardLoginPanel';
 
 export const SystemLockScreen: React.FC = () => {
-  const { 
-    currentPosUser, 
-    isSystemLocked, 
-    setIsSystemLocked, 
+  const {
+    currentPosUser,
+    isSystemLocked,
+    setIsSystemLocked,
     logoutPos,
-    verify2FACodeForUser
+    verify2FACodeForUser,
+    autoLockMinutes,
+    setAutoLockMinutes,
+    unlockSystemWithCard
   } = useApp();
 
+  const [unlockTab, setUnlockTab] = useState<'password' | 'card'>('password');
   const [passwordInput, setPasswordInput] = useState<string>('');
   const [twoFactorInput, setTwoFactorInput] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -30,10 +35,9 @@ export const SystemLockScreen: React.FC = () => {
     setErrorMsg(null);
 
     try {
-      // 1. Verify password/pin
       const cleanPass = passwordInput.trim();
-      const isPassValid = 
-        cleanPass === currentPosUser.password || 
+      const isPassValid =
+        cleanPass === currentPosUser.password ||
         cleanPass.toLowerCase() === currentPosUser.password?.toLowerCase() ||
         (currentPosUser.username === 'joas' && (cleanPass === '1234' || cleanPass === 'admin123' || cleanPass === '0000'));
 
@@ -44,7 +48,6 @@ export const SystemLockScreen: React.FC = () => {
         return;
       }
 
-      // 2. Verify 2FA if enabled
       if (currentPosUser.is_2fa_enabled) {
         const clean2FA = twoFactorInput.trim();
         if (!clean2FA) {
@@ -62,8 +65,10 @@ export const SystemLockScreen: React.FC = () => {
         }
       }
 
-      // Success! Unlock the terminal
       setIsSystemLocked(false);
+      setPasswordInput('');
+      setTwoFactorInput('');
+      setErrorMsg(null);
       showToast(`🔓 Welkom terug, ${currentPosUser.name}!`, 'success');
     } catch (err: any) {
       setErrorMsg(err?.message || 'Fout bij ontgrendelen van terminal.');
@@ -79,105 +84,175 @@ export const SystemLockScreen: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-[999999] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(168,85,247,0.1),transparent_70%)] pointer-events-none" />
-      
-      <div className="bg-slate-900 border-2 border-purple-500/50 w-full max-w-md rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6 text-white text-center animate-in fade-in zoom-in-95 duration-200">
-        
+    <div className="fixed inset-0 z-[999999] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center p-4 overflow-y-auto">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(168,85,247,0.12),transparent_70%)] pointer-events-none" />
+
+      <div className="bg-slate-900 border-2 border-purple-500/50 w-full max-w-md rounded-3xl p-6 sm:p-7 shadow-2xl space-y-5 text-white text-center relative">
         {/* Lock Icon */}
-        <div className="w-20 h-20 bg-purple-500/10 border border-purple-500/30 rounded-full flex items-center justify-center mx-auto shadow-lg shadow-purple-950/40 relative">
-          <Lock className="w-10 h-10 text-purple-400 animate-pulse" />
-          <span className="absolute -top-1 -right-1 w-6 h-6 rounded-full bg-rose-600 border-2 border-slate-900 flex items-center justify-center text-[10px] font-black">
-            🔒
-          </span>
+        <div className="w-16 h-16 bg-purple-500/10 border border-purple-500/30 rounded-full flex items-center justify-center mx-auto shadow-lg shadow-purple-950/40 relative">
+          <Lock className="w-8 h-8 text-purple-400 animate-pulse" />
         </div>
 
         {/* User Info */}
-        <div className="space-y-1.5">
-          <span className="px-3 py-1 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 text-[10px] font-black tracking-widest uppercase inline-block animate-pulse">
-            🚨 SYSTEEM GEBLOKKEERD
+        <div className="space-y-1">
+          <span className="px-3 py-1 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 text-[10px] font-black tracking-widest uppercase inline-block">
+            SYSTEEM VERGRENDELD
           </span>
-          <h2 className="text-xl font-black text-white">Snelkoppeling Lockout</h2>
+          <h2 className="text-xl font-black text-white">Kassa Vergrendeling</h2>
           <p className="text-xs text-slate-300 leading-relaxed max-w-xs mx-auto">
-            Terminal is momenteel vergrendeld door <strong className="text-purple-300">@{currentPosUser.username}</strong> ({currentPosUser.name}).
+            Terminal vergrendeld door <strong className="text-purple-300">@{currentPosUser.username}</strong> ({currentPosUser.name}).
           </p>
         </div>
 
-        {/* Unlock Form */}
-        <form onSubmit={handleUnlock} className="space-y-4 text-left text-xs">
-          
-          {/* Password Input */}
-          <div>
-            <label className="text-slate-300 font-bold block mb-1.5 flex items-center gap-1.5">
-              <Key className="w-3.5 h-3.5 text-purple-400" />
-              <span>Medewerker Wachtwoord of Pincode:</span>
+        {/* Shared 2FA field when enabled */}
+        {currentPosUser.is_2fa_enabled && (
+          <div className="text-left text-xs bg-slate-950/80 border border-purple-500/30 rounded-2xl p-3">
+            <label className="text-slate-300 font-bold block mb-1.5 flex items-center justify-between">
+              <span className="flex items-center gap-1.5">
+                <ShieldAlert className="w-3.5 h-3.5 text-purple-400" />
+                <span>2FA Code (ook vereist bij NFC pas):</span>
+              </span>
+              <span className="text-[10px] bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.5 rounded font-black font-mono">
+                VERPLICHT
+              </span>
             </label>
             <input
-              type="password"
-              required
-              value={passwordInput}
-              onChange={e => setPasswordInput(e.target.value)}
-              placeholder="Voer je wachtwoord of pincode in..."
-              autoFocus
-              className="w-full bg-slate-950 border border-purple-500/40 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-400 focus:ring-2 focus:ring-purple-500/25"
+              type="text"
+              maxLength={12}
+              value={twoFactorInput}
+              onChange={(e) => setTwoFactorInput(e.target.value.toUpperCase())}
+              placeholder="123456"
+              className="w-full bg-slate-900 border border-purple-500/40 rounded-xl px-4 py-2.5 text-center text-base font-mono font-black tracking-widest text-white focus:outline-none focus:border-purple-400"
             />
           </div>
+        )}
 
-          {/* 2FA Input (Conditional on user's 2FA status) */}
-          {currentPosUser.is_2fa_enabled && (
-            <div className="animate-in slide-in-from-top-2 duration-200">
-              <label className="text-slate-300 font-bold block mb-1.5 flex items-center justify-between">
-                <span className="flex items-center gap-1.5">
-                  <ShieldAlert className="w-3.5 h-3.5 text-purple-400" />
-                  <span>6-Cijferige 2FA Code of Noodcode:</span>
-                </span>
-                <span className="text-[10px] bg-purple-500/20 text-purple-300 border border-purple-500/30 px-2 py-0.2 rounded font-black font-mono">
-                  VERPLICHT
-                </span>
+        {/* Tab Toggle: Password vs NFC Card */}
+        <div className="grid grid-cols-2 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+          <button
+            type="button"
+            onClick={() => {
+              setUnlockTab('password');
+              setErrorMsg(null);
+            }}
+            className={`py-2 px-2 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+              unlockTab === 'password'
+                ? 'bg-purple-600 text-white shadow font-black'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Key className="w-3.5 h-3.5" />
+            <span>Wachtwoord / PIN</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setUnlockTab('card');
+              setErrorMsg(null);
+            }}
+            className={`py-2 px-2 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+              unlockTab === 'card'
+                ? 'bg-cyan-500 text-slate-950 shadow font-black'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            <span>NFC Pas (Pico W)</span>
+          </button>
+        </div>
+
+        {/* Tab Content */}
+        {unlockTab === 'password' ? (
+          <form onSubmit={handleUnlock} className="space-y-3 text-left text-xs">
+            <div>
+              <label className="text-slate-300 font-bold block mb-1.5 flex items-center gap-1.5">
+                <Key className="w-3.5 h-3.5 text-purple-400" />
+                <span>Medewerker Wachtwoord of Pincode:</span>
               </label>
               <input
-                type="text"
-                maxLength={12}
-                value={twoFactorInput}
-                onChange={e => setTwoFactorInput(e.target.value.toUpperCase())}
-                placeholder="123456"
-                className="w-full bg-slate-950 border border-purple-500/40 rounded-xl px-4 py-3 text-center text-lg font-mono font-black tracking-widest text-white focus:outline-none focus:border-purple-400 focus:ring-2 focus:ring-purple-500/25"
+                type="password"
+                required
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="Voer je wachtwoord of pincode in..."
+                autoFocus
+                className="w-full bg-slate-950 border border-purple-500/40 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-purple-400 focus:ring-2 focus:ring-purple-500/25"
               />
             </div>
-          )}
 
-          {/* Feedback messages */}
-          {errorMsg && (
-            <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 font-bold text-xs flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
-              <span>{errorMsg}</span>
+            {errorMsg && (
+              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 font-bold text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={verifying}
+              className="w-full py-3.5 rounded-xl font-black text-sm bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white transition shadow-lg shadow-purple-600/20 flex items-center justify-center gap-2"
+            >
+              <Unlock className="w-4 h-4" />
+              <span>{verifying ? 'Ontgrendelen...' : 'Ontgrendel Terminal'}</span>
+            </button>
+          </form>
+        ) : (
+          <div className="text-left space-y-2">
+            <PicoCardLoginPanel
+              mode="unlock"
+              compact
+              onCustomCardAuth={async (uid, pin, style) => {
+                const res = await unlockSystemWithCard(uid, pin, style === 'pin', twoFactorInput);
+                if (res.success) {
+                  setPasswordInput('');
+                  setTwoFactorInput('');
+                  setErrorMsg(null);
+                }
+                return res;
+              }}
+            />
+          </div>
+        )}
+
+        {/* Auto-lock timeout setting + Switch User */}
+        <div className="pt-3 border-t border-slate-800 space-y-3">
+          <div className="flex items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3 py-2 text-[11px]">
+            <div className="flex items-center gap-1.5 text-slate-300 font-semibold">
+              <Clock className="w-3.5 h-3.5 text-purple-400" />
+              <span>Auto-vergrendeling bij inactiviteit:</span>
             </div>
-          )}
+            <select
+              value={autoLockMinutes}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setAutoLockMinutes(v);
+                showToast(
+                  v === 0
+                    ? 'Automatische vergrendeling uitgeschakeld.'
+                    : `Auto-vergrendeling ingesteld op ${v} minuten.`,
+                  'info'
+                );
+              }}
+              className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white font-bold focus:outline-none focus:border-purple-400"
+            >
+              <option value={0}>Uit</option>
+              <option value={1}>1 min</option>
+              <option value={2}>2 min</option>
+              <option value={5}>5 min</option>
+              <option value={10}>10 min</option>
+              <option value={15}>15 min</option>
+            </select>
+          </div>
 
-          {/* Unlock Button */}
-          <button
-            type="submit"
-            disabled={verifying}
-            className="w-full py-3.5 rounded-xl font-black text-sm bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white transition shadow-lg shadow-purple-600/20 flex items-center justify-center gap-2"
-          >
-            <Unlock className="w-4 h-4" />
-            <span>{verifying ? 'Ontgrendelen...' : 'Ontgrendel Terminal'}</span>
-          </button>
-
-        </form>
-
-        {/* Switch User Footer Link */}
-        <div className="pt-2 border-t border-slate-800 flex justify-center">
           <button
             type="button"
             onClick={handleSwitchUser}
-            className="text-xs text-slate-400 hover:text-white flex items-center gap-1.5 transition font-bold"
+            className="mx-auto text-xs text-slate-400 hover:text-white flex items-center gap-1.5 transition font-bold"
           >
             <LogOut className="w-4 h-4 text-slate-500" />
             <span>Uitloggen / Wissel van Medewerker</span>
           </button>
         </div>
-
       </div>
     </div>
   );

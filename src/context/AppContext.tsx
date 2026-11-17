@@ -49,12 +49,24 @@ import {
   pendingOrderMutations
 } from '../services/syncHelpers';
 import { calculateDiscount } from '../services/discountService';
-import { redeemVoucherAnyCustomer, addCoinsToCustomer, isVipSubscriberPhone, issueVoucherForCustomer } from '../services/loyalty';
+import { redeemVoucherAnyCustomer, addCoinsToCustomer, isVipSubscriberPhone, issueVoucherForCustomer, findLoyaltyCustomerByPhoneOrName } from '../services/loyalty';
 import { verifyTotpCode } from '../services/totp';
+import {
+  enqueueOfflineMutation,
+  flushOfflineQueue,
+  getOfflineQueue,
+  OFFLINE_QUEUE_EVENT,
+  OfflineMutationItem
+} from '../services/offlineQueue';
 import {
   fsGetCollection,
   fsSubscribeCollection,
   fsSubscribeDoc,
+  getActiveHardwareTerminalId,
+  getConfiguredHardwareTerminals,
+  HARDWARE_TERMINAL_EVENT,
+  setHardwareTerminalCheckResult,
+  subscribeHardwareTerminal,
   testFirestoreConnection
 } from '../services/firebase';
 import {
@@ -144,6 +156,10 @@ interface AppContextType {
   lastSyncTime: Date | null;
   forceSyncNow: () => Promise<void>;
   testConnection: () => Promise<{ success: boolean; message: string }>;
+  offlineQueueCount: number;
+  offlineQueueItems: OfflineMutationItem[];
+  isFlushingOfflineQueue: boolean;
+  flushOfflineQueueNow: () => Promise<{ flushed: number; remaining: number; lastError?: string }>;
 
   // POS State
   products: Product[];
@@ -165,6 +181,14 @@ interface AppContextType {
   pickupClosed: boolean;
   isSystemLocked: boolean;
   setIsSystemLocked: (locked: boolean) => void;
+  autoLockMinutes: number;
+  setAutoLockMinutes: (mins: number) => void;
+  unlockSystemWithCard: (
+    cardUid: string,
+    pin?: string,
+    requirePin?: boolean,
+    twoFactorCode?: string
+  ) => Promise<{ success: boolean; message: string; requires2FA?: boolean }>;
   setOrderStopActiveWithText: (active: boolean, text: string, config?: Partial<OrderStopConfig>) => Promise<void>;
   currentPosUser: PosUser | null;
   setCurrentPosUser: (user: PosUser | null) => void;
@@ -237,6 +261,7 @@ interface AppContextType {
   // POS Auth
   canAccess: (perm: string) => boolean;
   loginPos: (username: string, pass: string) => Promise<{ success: boolean; message: string }>;
+  loginPosWithCard: (cardUid: string, pin?: string, requirePin?: boolean) => Promise<{ success: boolean; message: string }>;
   logoutPos: () => void;
   updatePosUser: (user: PosUser) => Promise<{ success: boolean; message: string }>;
   createPosUser: (user: Omit<PosUser, 'id'>) => Promise<{ success: boolean; message: string }>;
@@ -250,6 +275,7 @@ interface AppContextType {
   bankTransactions: BankTransaction[];
   setBankTransactions: React.Dispatch<React.SetStateAction<BankTransaction[]>>;
   loginWerkPay: (username: string, secret: string, mode: 'password' | 'pin') => Promise<{ success: boolean; message: string }>;
+  loginWerkPayWithCard: (cardUid: string, pin?: string, requirePin?: boolean) => Promise<{ success: boolean; message: string }>;
   logoutWerkPay: () => void;
   topUpWerkPay: (amount: number) => Promise<{ success: boolean; message: string }>;
   transferWerkPay: (to: string, amount: number, note?: string) => Promise<{ success: boolean; message: string }>;
@@ -1113,15 +1139,71 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return localStorage.getItem('wd_system_locked') === 'true';
   });
 
+  const [autoLockMinutes, setAutoLockMinutesState] = useState<number>(() => {
+    const raw = localStorage.getItem('wd_auto_lock_minutes');
+    const parsed = raw !== null ? parseInt(raw, 10) : 5;
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5;
+  });
+
+  const setAutoLockMinutes = useCallback((mins: number) => {
+    const clean = Math.max(0, Math.min(120, Math.floor(mins)));
+    setAutoLockMinutesState(clean);
+    try {
+      localStorage.setItem('wd_auto_lock_minutes', String(clean));
+    } catch {}
+  }, []);
+
   const setIsSystemLocked = (locked: boolean) => {
     setIsSystemLockedState(locked);
     localStorage.setItem('wd_system_locked', String(locked));
     if (locked) {
-      logAuditAction('SYSTEEM_VERGRENDELD', 'Systeem handmatig vergrendeld via Numpad Enter.');
+      logAuditAction('SYSTEEM_VERGRENDELD', 'Systeem vergrendeld.');
     } else {
-      logAuditAction('SYSTEEM_ONTGRENDELD', 'Systeem succesvol ontgrendeld met wachtwoord en 2FA.');
+      logAuditAction('SYSTEEM_ONTGRENDELD', 'Systeem succesvol ontgrendeld.');
     }
   };
+
+  // Offline Queue State & Handlers
+  const [offlineQueueItems, setOfflineQueueItems] = useState<OfflineMutationItem[]>(() => getOfflineQueue());
+  const [isFlushingOfflineQueue, setIsFlushingOfflineQueue] = useState<boolean>(false);
+  const offlineQueueCount = offlineQueueItems.length;
+
+  const flushOfflineQueueNow = useCallback(async () => {
+    setIsFlushingOfflineQueue(true);
+    try {
+      const res = await flushOfflineQueue();
+      setOfflineQueueItems(getOfflineQueue());
+      if (res.flushed > 0) {
+        showToast(
+          `☁️ ${res.flushed} offline wachtrij-item(s) gesynchroniseerd met Firebase!`,
+          'success'
+        );
+      }
+      return res;
+    } finally {
+      setIsFlushingOfflineQueue(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const syncLocalQueue = () => setOfflineQueueItems(getOfflineQueue());
+    const handleOnline = () => {
+      setIsOnline(true);
+      flushOfflineQueueNow().catch(() => {});
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      setSyncStatus('offline');
+    };
+    window.addEventListener(OFFLINE_QUEUE_EVENT, syncLocalQueue);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener(OFFLINE_QUEUE_EVENT, syncLocalQueue);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [flushOfflineQueueNow]);
 
   const [pickupClosed, setPickupClosed] = useState<boolean>(() => {
     return localStorage.getItem('wd_pickup_closed') === 'true';
@@ -1764,8 +1846,128 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   }, [applyRemoteSettings]);
 
   const forceSyncNow = async () => {
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      await flushOfflineQueueNow().catch(() => {});
+    }
     await fetchCloudData(false);
   };
+
+  // Staff Auto-Lock Idle Timer (only applies to logged-in staff, never kiosks/customers)
+  useEffect(() => {
+    if (typeof window === 'undefined' || autoLockMinutes <= 0 || isSystemLocked || !currentPosUser) {
+      return;
+    }
+    const uname = String(currentPosUser.username || '').toLowerCase();
+    const isStaffMember =
+      uname !== 'bestel_kassa' &&
+      uname !== 'klant' &&
+      uname !== 'rpi' &&
+      !currentPosUser.is_terminal_locked;
+    if (!isStaffMember) return;
+
+    const timeoutMs = autoLockMinutes * 60 * 1000;
+    let timerId: number | null = null;
+    let lastReset = 0;
+
+    const armTimer = () => {
+      const now = Date.now();
+      if (now - lastReset < 1000 && timerId !== null) return;
+      lastReset = now;
+      if (timerId !== null) window.clearTimeout(timerId);
+      timerId = window.setTimeout(() => {
+        setIsSystemLockedState(true);
+        try {
+          localStorage.setItem('wd_system_locked', 'true');
+        } catch {}
+        logAuditAction('SYSTEEM_AUTOLOCK', `Kassa automatisch vergrendeld na ${autoLockMinutes} min inactiviteit (@${uname}).`);
+        showToast(`🔒 Kassa automatisch vergrendeld na ${autoLockMinutes} min inactiviteit.`, 'info');
+      }, timeoutMs);
+    };
+
+    armTimer();
+    const events: Array<keyof WindowEventMap> = ['mousemove', 'keydown', 'pointerdown', 'touchstart'];
+    events.forEach((ev) => window.addEventListener(ev, armTimer, { passive: true }));
+
+    return () => {
+      if (timerId !== null) window.clearTimeout(timerId);
+      events.forEach((ev) => window.removeEventListener(ev, armTimer));
+    };
+  }, [autoLockMinutes, isSystemLocked, currentPosUser]);
+
+  // Multi-Terminal Live Responder for Pico W Quick Balance & Loyalty Check (KEY 'B')
+  const handledCheckCardSigRef = useRef<Record<string, string>>({});
+  useEffect(() => {
+    let active = true;
+    let unsubs: Array<() => void> = [];
+
+    const setupSubscriptions = () => {
+      unsubs.forEach((u) => u());
+      unsubs = [];
+
+      const termIds = Array.from(
+        new Set([
+          getActiveHardwareTerminalId(),
+          ...getConfiguredHardwareTerminals().map((t) => t.id)
+        ])
+      ).filter(Boolean);
+
+      for (const tid of termIds) {
+        const unsub = subscribeHardwareTerminal(
+          async (st) => {
+            if (!active || !st || st.status !== 'CHECK_CARD' || !st.scannedUid) return;
+            const sig = `${tid}:${st.scannedUid}:${st.updatedAt}`;
+            if (handledCheckCardSigRef.current[tid] === sig) return;
+            handledCheckCardSigRef.current[tid] = sig;
+
+            const normUid = normalizeCardUid(st.scannedUid);
+            let matched = bankAccountsRef.current.find((a) => accountMatchesUid(a, normUid));
+            if (!matched) {
+              try {
+                const dbAccs = await getAllBankAccountsFromFirestore();
+                matched = dbAccs.find((a) => accountMatchesUid(a, normUid));
+              } catch {}
+            }
+
+            if (!matched) {
+              await setHardwareTerminalCheckResult(
+                { found: false, scannedUid: normUid, reason: 'Pas onbekend!' },
+                tid
+              ).catch(() => {});
+              return;
+            }
+
+            const loyalty =
+              findLoyaltyCustomerByPhoneOrName(matched.account_holder) ||
+              findLoyaltyCustomerByPhoneOrName(matched.username);
+            await setHardwareTerminalCheckResult(
+              {
+                found: true,
+                accountHolder: matched.account_holder,
+                balance: matched.is_admin ? 99999 : Number(matched.balance || 0),
+                coins: loyalty?.coins ?? 0,
+                tier: loyalty?.tier ?? (matched.is_admin ? 'VIP' : 'Brons'),
+                scannedUid: normUid
+              },
+              tid
+            ).catch(() => {});
+          },
+          () => {},
+          tid
+        );
+        unsubs.push(unsub);
+      }
+    };
+
+    setupSubscriptions();
+    const handleTermListChange = () => setupSubscriptions();
+    window.addEventListener(HARDWARE_TERMINAL_EVENT, handleTermListChange);
+
+    return () => {
+      active = false;
+      unsubs.forEach((u) => u());
+      window.removeEventListener(HARDWARE_TERMINAL_EVENT, handleTermListChange);
+    };
+  }, []);
 
   // Initial Firebase seed check for products & bank accounts
   useEffect(() => {
@@ -2436,7 +2638,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setInventory(updated);
     if (touchedIds.size > 0 && !currentPosUser?.is_shadowbanned && !tablesFrozen) {
       const changedItems = updated.filter(i => touchedIds.has(i.id));
-      saveInventoryBatchToFirestore(changedItems).catch(() => {});
+      saveInventoryBatchToFirestore(changedItems).catch(() => {
+        enqueueOfflineMutation({ type: 'inventory_batch', payload: changedItems });
+      });
     }
   };
 
@@ -2556,7 +2760,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           }
           newBal = txRes.newBalance;
         } catch (err) {
-          console.warn('Firestore checkout balance transaction fallback:', err);
+          console.warn('Firestore checkout balance transaction fallback (queued offline):', err);
+          enqueueOfflineMutation({
+            type: 'bank_delta',
+            payload: {
+              username: chargedAccount.username,
+              delta: -finalTotal,
+              fallbackAccount: chargedAccount
+            }
+          });
         }
       }
 
@@ -2587,7 +2799,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       setBankTransactions(prev => [tx, ...prev]);
 
       saveBankTransactionToFirestore(tx).catch((err) => {
-        console.warn('Firestore save bank transaction error:', err);
+        console.warn('Firestore save bank transaction queued offline:', err);
+        enqueueOfflineMutation({ type: 'bank_tx', payload: tx });
       });
 
       paymentMeta.account = chargedAccount.username;
@@ -2678,7 +2891,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       try {
         await saveGiftCardToFirestore(updatedCard);
       } catch (err) {
-        console.error('Error updating gift card balance in Firestore during checkout:', err);
+        console.error('Gift card queued offline:', err);
+        enqueueOfflineMutation({ type: 'gift_card', payload: updatedCard });
       }
     }
 
@@ -2696,7 +2910,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       syncCashRequests(nextReqs);
       if (consumedReqObj) {
         saveCashRequestToFirestore(consumedReqObj).catch((err) => {
-          console.warn('Firestore consume cash request error:', err);
+          console.warn('Firestore consume cash request queued offline:', err);
+          enqueueOfflineMutation({ type: 'cash_request', payload: consumedReqObj! });
         });
       }
     }
@@ -2750,11 +2965,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setTrackedOrderNo(newOrder.no);
     addMyOrderNumber(newOrder.no);
 
-    // 6. Push to Firebase Cloud Firestore
+    // 6. Push to Firebase Cloud Firestore (with Offline Queue fallback)
     try {
       await saveOrderToFirestore(newOrder);
     } catch (err) {
-      console.warn('Firestore insert order error:', err);
+      console.warn('Firestore insert order queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: newOrder });
     }
 
     // Instant cross-tab broadcast for other open windows
@@ -2919,7 +3135,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           }
           newBal = txRes.newBalance;
         } catch (err) {
-          console.warn('Firestore WerkPin balance transaction fallback:', err);
+          console.warn('Firestore WerkPin balance transaction queued offline:', err);
+          enqueueOfflineMutation({
+            type: 'bank_delta',
+            payload: {
+              username: chargedAccount.username,
+              delta: -finalTotal,
+              fallbackAccount: chargedAccount
+            }
+          });
         }
       }
 
@@ -2942,7 +3166,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       setBankTransactions(prev => [tx, ...prev]);
 
       saveBankTransactionToFirestore(tx).catch((err) => {
-        console.warn('Firestore SumUp tx save error:', err);
+        console.warn('Firestore SumUp tx queued offline:', err);
+        enqueueOfflineMutation({ type: 'bank_tx', payload: tx });
       });
 
       meta.account = chargedAccount.username;
@@ -3012,7 +3237,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       await saveOrderToFirestore(newOrder);
     } catch (err) {
-      console.warn('Firestore SumUp order save error:', err);
+      console.warn('Firestore SumUp order queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: newOrder });
     }
 
     broadcastSync('SYNC_ORDER_NEW', newOrder);
@@ -3060,7 +3286,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           try {
             const res = await adjustBankBalanceTransaction(acc.username, targetOrder.total, acc);
             if (res.success) nextBalance = res.newBalance;
-          } catch {}
+          } catch {
+            enqueueOfflineMutation({
+              type: 'bank_delta',
+              payload: { username: acc.username, delta: targetOrder.total, fallbackAccount: acc }
+            });
+          }
         }
 
         setBankAccounts(prev => prev.map(a => a.id === acc!.id ? { ...a, balance: nextBalance } : a));
@@ -3081,7 +3312,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         };
         setBankTransactions(prev => [refundTx, ...prev]);
 
-        saveBankTransactionToFirestore(refundTx).catch(() => {});
+        saveBankTransactionToFirestore(refundTx).catch(() => {
+          enqueueOfflineMutation({ type: 'bank_tx', payload: refundTx });
+        });
       }
     }
 
@@ -3098,7 +3331,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     try {
       await saveOrderToFirestore(updatedOrder);
-    } catch {}
+    } catch {
+      enqueueOfflineMutation({ type: 'order', payload: updatedOrder });
+    }
 
     logAuditAction('WERKPIN_REFUND', `Transactie #${targetOrderNo} (€ ${targetOrder.total.toFixed(2)}) terugbetaald door ${refundedBy}.`);
     return {
@@ -3157,7 +3392,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       await saveOrderToFirestore(updatedOrder);
     } catch (err) {
-      console.warn('Firestore order status update error:', err);
+      console.warn('Firestore order status queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: updatedOrder });
     }
   };
 
@@ -3207,7 +3443,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       await saveOrderToFirestore(updatedOrder);
     } catch (err) {
-      console.warn('Firestore order item stage update error:', err);
+      console.warn('Firestore order item stage queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: updatedOrder });
     }
   };
 
@@ -3258,7 +3495,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       await saveOrderToFirestore(updatedOrder);
     } catch (err) {
-      console.warn('Firestore toggleOrderItemDone error:', err);
+      console.warn('Firestore toggleOrderItemDone queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: updatedOrder });
     }
   };
 
@@ -3284,7 +3522,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       await saveOrderToFirestore(updatedOrder);
     } catch (err) {
-      console.warn('Firestore toggleOrderPrio error:', err);
+      console.warn('Firestore toggleOrderPrio queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: updatedOrder });
     }
   };
 
@@ -3328,7 +3567,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       await saveOrderToFirestore(updatedOrder);
     } catch (err) {
-      console.warn('Firestore setAllOrderItemsDone error:', err);
+      console.warn('Firestore setAllOrderItemsDone queued offline:', err);
+      enqueueOfflineMutation({ type: 'order', payload: updatedOrder });
     }
   };
 
@@ -3489,7 +3729,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     syncCashRequests(updated);
 
     saveCashRequestToFirestore(newReq).catch((err) => {
-      console.warn('Firestore cash_requests insert error:', err);
+      console.warn('Firestore cash_requests insert queued offline:', err);
+      enqueueOfflineMutation({ type: 'cash_request', payload: newReq });
     });
 
     return newReq;
@@ -3543,7 +3784,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     );
 
     saveCashRequestToFirestore(approvedReq).catch((err) => {
-      console.warn('Firestore cash_requests approve error:', err);
+      console.warn('Firestore cash_requests approve queued offline:', err);
+      enqueueOfflineMutation({ type: 'cash_request', payload: approvedReq });
     });
 
     return { success: true, message: 'Contant verzoek goedgekeurd.' };
@@ -3570,7 +3812,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (rejectedReq) {
       saveCashRequestToFirestore(rejectedReq).catch((err) => {
-        console.warn('Firestore cash_requests reject error:', err);
+        console.warn('Firestore cash_requests reject queued offline:', err);
+        enqueueOfflineMutation({ type: 'cash_request', payload: rejectedReq });
       });
     }
   };
@@ -3595,6 +3838,49 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     setPending2FALogin(null);
     setCurrentBankAccount(acc);
     return { success: true, message: `Welkom terug, ${acc.account_holder}!` };
+  };
+
+  const loginWerkPayWithCard = async (
+    cardUid: string,
+    pin?: string,
+    requirePin: boolean = true
+  ): Promise<{ success: boolean; message: string }> => {
+    const normUid = normalizeCardUid(cardUid);
+    if (!normUid) {
+      return { success: false, message: 'Ongeldige of lege pas-UID ontvangen.' };
+    }
+
+    let matchedAcc: BankAccount | undefined;
+    try {
+      const dbBanks = await getAllBankAccountsFromFirestore();
+      matchedAcc = dbBanks.find(a => accountMatchesUid(a, normUid));
+    } catch {
+      // fallback to local
+    }
+    if (!matchedAcc) {
+      matchedAcc = bankAccounts.find(a => accountMatchesUid(a, normUid));
+    }
+    if (!matchedAcc) {
+      return { success: false, message: `Pas (${normUid}) is nog niet gekoppeld aan een WerkPay rekening.` };
+    }
+
+    const cleanU = matchedAcc.username.trim().toLowerCase();
+    if (matchedAcc.is_banned || matchedAcc.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
+      logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerde pas (${normUid}) voor @${cleanU} probeerde in te loggen.`);
+      return { success: false, message: 'Dit account is geblokkeerd door de beheerder.' };
+    }
+
+    if (requirePin) {
+      const cleanPin = (pin || '').trim();
+      if (!cleanPin || (matchedAcc.pin_code !== cleanPin && matchedAcc.password !== cleanPin)) {
+        return { success: false, message: 'Onjuiste pincode voor deze pas.' };
+      }
+    }
+
+    setPending2FALogin(null);
+    setCurrentBankAccount(matchedAcc);
+    logAuditAction('WERKPAY_PAS_LOGIN', `@${cleanU} ingelogd bij WerkPay via NFC pas (${normUid}).`);
+    return { success: true, message: `Welkom terug, ${matchedAcc.account_holder}!` };
   };
 
   const logoutWerkPay = () => {
@@ -4045,7 +4331,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
 
     if (!targetAcc.is_admin && !shouldBlockTableWrite(`Saldo @${targetAcc.username} aanpassen`)) {
-      adjustBankBalanceTransaction(targetAcc.username, delta, targetAcc).catch(() => {});
+      adjustBankBalanceTransaction(targetAcc.username, delta, targetAcc).catch(() => {
+        enqueueOfflineMutation({
+          type: 'bank_delta',
+          payload: { username: targetAcc.username, delta, fallbackAccount: targetAcc }
+        });
+      });
     }
   };
 
@@ -4228,6 +4519,152 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
 
     return { success: false, message: 'Onjuiste gebruikersnaam of wachtwoord! Controleer je invoer.' };
+  };
+
+  const loginPosWithCard = async (
+    cardUid: string,
+    pin?: string,
+    requirePin: boolean = true
+  ): Promise<{ success: boolean; message: string }> => {
+    const normUid = normalizeCardUid(cardUid);
+    if (!normUid) {
+      return { success: false, message: 'Ongeldige of lege pas-UID ontvangen.' };
+    }
+
+    let matchedAcc: BankAccount | undefined;
+    try {
+      const dbBanks = await getAllBankAccountsFromFirestore();
+      matchedAcc = dbBanks.find(a => accountMatchesUid(a, normUid));
+    } catch {
+      // fallback to local
+    }
+    if (!matchedAcc) {
+      matchedAcc = bankAccounts.find(a => accountMatchesUid(a, normUid));
+    }
+    if (!matchedAcc) {
+      return { success: false, message: `Pas (${normUid}) is niet bekend. Koppel deze pas eerst via Medewerkers of WerkPin.` };
+    }
+
+    const cleanU = matchedAcc.username.trim().toLowerCase();
+    if (matchedAcc.is_banned || matchedAcc.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
+      logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerde pas (${normUid}) voor @${cleanU} probeerde op POS in te loggen.`);
+      return { success: false, message: 'Dit account is geblokkeerd door de beheerder.' };
+    }
+
+    if (requirePin) {
+      const cleanPin = (pin || '').trim();
+      if (!cleanPin || (matchedAcc.pin_code !== cleanPin && matchedAcc.password !== cleanPin)) {
+        return { success: false, message: 'Onjuiste pincode voor deze pas.' };
+      }
+    }
+
+    let matchedPosUser: PosUser | undefined;
+    try {
+      const dbUsers = await fsGetCollection('pos_users');
+      const row = dbUsers.find((u: any) => String(u.username || '').trim().toLowerCase() === cleanU);
+      if (row) {
+        matchedPosUser = parsePosUserFromDb(row);
+      }
+    } catch {}
+    if (!matchedPosUser) {
+      matchedPosUser = posUsers.find(u => u.username.toLowerCase() === cleanU);
+    }
+
+    if (matchedPosUser) {
+      if (matchedPosUser.is_banned || matchedPosUser.is_suspended) {
+        logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd POS account @${cleanU} probeerde via NFC pas in te loggen.`);
+        return { success: false, message: 'Dit POS account is geblokkeerd.' };
+      }
+      logAuditAction('POS_PAS_LOGIN', `@${cleanU} ingelogd op kassa via NFC pas (${normUid}).`);
+      return await finalizeOrChallengePosLogin(matchedPosUser);
+    }
+
+    const bankUser: PosUser = {
+      id: typeof matchedAcc.id === 'number' ? matchedAcc.id : Date.now(),
+      name: matchedAcc.account_holder,
+      username: matchedAcc.username,
+      password: matchedAcc.password,
+      perms: matchedAcc.is_admin
+        ? ['pos', 'kitchen', 'pickup', 'voorraad', 'manager', 'medewerkers', 'producten', 'coupons_giftcards', 'cash_pay']
+        : ['pos', 'pickup'],
+      is_admin: matchedAcc.is_admin,
+      is_shadowbanned: Boolean(matchedAcc.is_shadowbanned),
+      is_2fa_enabled: Boolean(matchedAcc.is_2fa_enabled),
+      totp_secret: matchedAcc.totp_secret,
+      backup_codes: matchedAcc.backup_codes
+    };
+    logAuditAction('POS_PAS_LOGIN', `@${cleanU} ingelogd op kassa via NFC pas (${normUid}).`);
+    return await finalizeOrChallengePosLogin(bankUser);
+  };
+
+  const unlockSystemWithCard = async (
+    cardUid: string,
+    pin?: string,
+    requirePin: boolean = true,
+    twoFactorCode?: string
+  ): Promise<{ success: boolean; message: string; requires2FA?: boolean }> => {
+    const activeStaff = currentPosUserRef.current;
+    if (!activeStaff) {
+      return { success: false, message: 'Geen vergrendeld medewerker-account gevonden.' };
+    }
+    const normUid = normalizeCardUid(cardUid);
+    if (!normUid) {
+      return { success: false, message: 'Ongeldige of lege pas-UID ontvangen.' };
+    }
+
+    const activeUsernameLower = activeStaff.username.trim().toLowerCase();
+    let matchedAcc: BankAccount | undefined;
+    try {
+      const dbBanks = await getAllBankAccountsFromFirestore();
+      matchedAcc = dbBanks.find((a) => accountMatchesUid(a, normUid));
+    } catch {}
+    if (!matchedAcc) {
+      matchedAcc = bankAccountsRef.current.find((a) => accountMatchesUid(a, normUid));
+    }
+    if (!matchedAcc) {
+      return { success: false, message: `Pas (${normUid}) is onbekend.` };
+    }
+
+    if (matchedAcc.username.trim().toLowerCase() !== activeUsernameLower) {
+      logAuditAction(
+        'LOCK_PAS_WEIGERING',
+        `Pas van @${matchedAcc.username} gebruikt om sessie van @${activeStaff.username} te ontgrendelen.`
+      );
+      return {
+        success: false,
+        message: `Deze pas hoort bij @${matchedAcc.username}, niet bij vergrendeld account @${activeStaff.username}.`
+      };
+    }
+
+    if (requirePin) {
+      const cleanPin = (pin || '').trim();
+      if (!cleanPin || (matchedAcc.pin_code !== cleanPin && matchedAcc.password !== cleanPin)) {
+        return { success: false, message: 'Onjuiste pincode voor deze pas.' };
+      }
+    }
+
+    if (activeStaff.is_2fa_enabled) {
+      const clean2FA = (twoFactorCode || '').trim();
+      if (!clean2FA) {
+        return {
+          success: false,
+          requires2FA: true,
+          message: 'Voer eerst je 6-cijferige 2FA Authenticator code of Noodcode in.'
+        };
+      }
+      const is2FAValid = await verify2FACodeForUser(activeUsernameLower, clean2FA);
+      if (!is2FAValid) {
+        return {
+          success: false,
+          requires2FA: true,
+          message: 'Ongeldige 2FA Authenticator code of Noodcode!'
+        };
+      }
+    }
+
+    setIsSystemLocked(false);
+    logAuditAction('SYSTEEM_ONTGRENDELD_PAS', `@${activeStaff.username} ontgrendelde terminal via NFC pas (${normUid}).`);
+    return { success: true, message: `🔓 Welkom terug, ${activeStaff.name}!` };
   };
 
   const canAccess = (perm: string): boolean => {
@@ -4617,6 +5054,10 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         lastSyncTime,
         forceSyncNow,
         testConnection,
+        offlineQueueCount,
+        offlineQueueItems,
+        isFlushingOfflineQueue,
+        flushOfflineQueueNow,
         products,
         cart,
         orders,
@@ -4631,6 +5072,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         pickupClosed,
         isSystemLocked,
         setIsSystemLocked,
+        autoLockMinutes,
+        setAutoLockMinutes,
+        unlockSystemWithCard,
         setOrderStopActiveWithText,
         customBranding,
         updateCustomBranding,
@@ -4682,6 +5126,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         toggleCouponActive,
         canAccess,
         loginPos,
+        loginPosWithCard,
         logoutPos,
         updatePosUser,
         createPosUser,
@@ -4693,6 +5138,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         bankTransactions,
         setBankTransactions,
         loginWerkPay,
+        loginWerkPayWithCard,
         logoutWerkPay,
         topUpWerkPay,
         transferWerkPay,

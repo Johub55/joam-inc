@@ -31,7 +31,8 @@ import {
   Sliders,
   Megaphone,
   Radio,
-  Palette
+  Palette,
+  Lock
 } from 'lucide-react';
 import { getStatusMeta } from '../services/orderStatus';
 
@@ -64,6 +65,10 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
     isRealtimeActive,
     lastSyncTime,
     forceSyncNow,
+    offlineQueueCount,
+    isFlushingOfflineQueue,
+    flushOfflineQueueNow,
+    setIsSystemLocked,
     orders,
     cart,
     activeUserOrders,
@@ -339,6 +344,26 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
             >
               <RotateCw className={`w-3 h-3 ${syncStatus === 'syncing' ? 'animate-spin text-cyan-400' : ''}`} />
             </button>
+
+            {offlineQueueCount > 0 && (
+              <button
+                type="button"
+                onClick={async () => {
+                  const res = await flushOfflineQueueNow();
+                  if (res.flushed > 0) {
+                    showToast(`${res.flushed} offline wachtrij-item(s) gesynchroniseerd!`, 'success');
+                  } else if (res.remaining > 0) {
+                    showToast(`Nog ${res.remaining} item(s) in offline wachtrij (controleer verbinding).`, 'error');
+                  }
+                }}
+                disabled={isFlushingOfflineQueue}
+                className="flex items-center gap-1 px-2 py-1 rounded-full bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-[11px] font-black transition animate-pulse"
+                title="Klik om offline opgeslagen bestellingen/betalingen direct naar Firebase te sturen"
+              >
+                <Database className="w-3 h-3" />
+                <span>{offlineQueueCount} wachtrij</span>
+              </button>
+            )}
           </div>
 
           {/* Active Order Live Tracking Shortcut */}
@@ -402,6 +427,16 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
               >
                 <Palette className="w-3.5 h-3.5" />
               </button>
+              {isLoggedInStaff && (
+                <button
+                  type="button"
+                  onClick={() => setIsSystemLocked(true)}
+                  className="hover:text-purple-300 p-0.5 transition"
+                  title="Vergrendel Kassa Direct (Auto-Lock Beveiliging)"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                </button>
+              )}
               <button 
                 onClick={logoutPos} 
                 className="hover:text-rose-400 p-0.5 transition" 

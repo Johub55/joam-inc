@@ -7,6 +7,9 @@ import {
   TerminalCallbacks 
 } from '../../services/terminalService';
 import { showToast } from '../../services/appToast';
+import { useApp } from '../../context/AppContext';
+import { findLoyaltyCustomerByPhoneOrName } from '../../services/loyalty';
+import { accountMatchesUid } from '../../services/store';
 import { PicoFlasherPanel } from './PicoFlasherPanel';
 import { 
   Cpu, 
@@ -34,6 +37,7 @@ interface DiyTerminalModalProps {
 }
 
 export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onSimulateCardScan }) => {
+  const { bankAccounts } = useApp();
   const [selectedBoard, setSelectedBoard] = useState<'pico_w' | 'arduino'>('pico_w');
   const [nfcMode, setNfcMode] = useState<'i2c' | 'spi'>('i2c');
   const [isConnected, setIsConnected] = useState<boolean>(terminalManager.getIsConnected());
@@ -45,10 +49,10 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
 
   // Simulator State
   const [simLcdLine1, setSimLcdLine1] = useState<string>('WerkPay Terminal');
-  const [simLcdLine2, setSimLcdLine2] = useState<string>('Wacht op kassa..');
+  const [simLcdLine2, setSimLcdLine2] = useState<string>('B=Saldo/PasCheck');
   const [simUid, setSimUid] = useState<string>('4129883155049012');
   const [simPin, setSimPin] = useState<string>('');
-  const [simState, setSimState] = useState<'idle' | 'card_scanned' | 'approved' | 'declined'>('idle');
+  const [simState, setSimState] = useState<'idle' | 'check_card' | 'card_scanned' | 'approved' | 'declined'>('idle');
 
   const currentSketchCode = selectedBoard === 'pico_w' 
     ? (nfcMode === 'i2c' ? PICO_W_I2C_NFC_SKETCH_CODE : PICO_W_SKETCH_CODE)
@@ -124,7 +128,47 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   };
 
   // Simulator actions
-  const handleSimTapCard = () => {
+  const normalizeSimUid = (val: string) => val.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+  const handleSimTapCard = async () => {
+    if (simState === 'check_card') {
+      const cleanUid = normalizeSimUid(simUid);
+      const match = bankAccounts.find((acc) => accountMatchesUid(acc, cleanUid));
+      setSimLcdLine1('Pas checken...');
+      setSimLcdLine2('Even geduld...');
+      if (!match) {
+        setTimeout(() => {
+          setSimState('declined');
+          setSimLcdLine1('Geweigerd!');
+          setSimLcdLine2('Pas onbekend!');
+          setTimeout(() => {
+            setSimState('idle');
+            setSimLcdLine1('WerkPay Terminal');
+            setSimLcdLine2('B=Saldo/PasCheck');
+          }, 2600);
+        }, 450);
+        return;
+      }
+      const loyalty =
+        findLoyaltyCustomerByPhoneOrName(match.account_holder) ||
+        findLoyaltyCustomerByPhoneOrName(match.username);
+      const coins = loyalty?.coins ?? 0;
+      const tier = loyalty?.tier ?? (match.is_admin ? 'VIP' : 'Brons');
+      const line1 = `${match.account_holder} [${tier}]`.slice(0, 16);
+      const line2 = `EUR ${Number(match.balance || 0).toFixed(2)} ${coins}C`.slice(0, 16);
+      setTimeout(() => {
+        setSimState('approved');
+        setSimLcdLine1(line1);
+        setSimLcdLine2(line2);
+        setTimeout(() => {
+          setSimState('idle');
+          setSimLcdLine1('WerkPay Terminal');
+          setSimLcdLine2('B=Saldo/PasCheck');
+        }, 4200);
+      }, 450);
+      return;
+    }
+
     setSimState('card_scanned');
     setSimLcdLine1('#OK *Wis  A=Stop');
     setSimLcdLine2('PIN: ');
@@ -132,6 +176,24 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   };
 
   const handleSimKeyPress = (char: string) => {
+    if (simState === 'idle') {
+      if (char === 'B') {
+        setSimState('check_card');
+        setSimLcdLine1('Scan pas: Saldo');
+        setSimLcdLine2('Houd pas  A=Stop');
+      }
+      return;
+    }
+
+    if (simState === 'check_card') {
+      if (char === 'A' || char === 'D') {
+        setSimState('idle');
+        setSimLcdLine1('WerkPay Terminal');
+        setSimLcdLine2('B=Saldo/PasCheck');
+      }
+      return;
+    }
+
     if (simState !== 'card_scanned') return;
 
     if (char === '*' || char === 'C') {
@@ -144,7 +206,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
       setSimLcdLine2('Terug naar start');
       setTimeout(() => {
         setSimLcdLine1('WerkPay Terminal');
-        setSimLcdLine2('Wacht op kassa..');
+        setSimLcdLine2('B=Saldo/PasCheck');
       }, 1000);
       return;
     }
@@ -162,7 +224,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           setTimeout(() => {
             setSimState('idle');
             setSimLcdLine1('WerkPay Terminal');
-            setSimLcdLine2('Wacht op kassa..');
+            setSimLcdLine2('B=Saldo/PasCheck');
             setSimPin('');
           }, 2500);
         }, 1000);
@@ -932,8 +994,17 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                       </button>
                     ))}
                   </div>
-                  <div className="text-[10px] text-slate-400 text-center">
-                    Toets: <strong>[0-9]</strong> PIN, <strong>[DEL/*]</strong> Wissen, <strong>[OK/#]</strong> Bevestigen
+                  <div className="text-[10px] text-slate-400 text-center flex flex-col gap-1">
+                    <div>
+                      Toets: <strong>[B]</strong> Saldo/Coins Check, <strong>[0-9]</strong> PIN, <strong>[DEL/*]</strong> Wissen, <strong>[OK/#]</strong> Bevestigen
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleSimKeyPress('B')}
+                      className="mx-auto px-3 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 font-bold text-[10px]"
+                    >
+                      Saldo Check (B) Starten
+                    </button>
                   </div>
                 </div>
 

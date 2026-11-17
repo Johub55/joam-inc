@@ -14,8 +14,11 @@ import {
   Unlock,
   Activity,
   Sparkles,
-  Wifi
+  Wifi,
+  Clock,
+  Inbox
 } from 'lucide-react';
+import { showToast } from '../services/appToast';
 
 interface CloudSyncModalProps {
   onClose: () => void;
@@ -32,6 +35,12 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({ onClose }) => {
     resetProductsToDefault,
     tablesFrozen,
     toggleTablesFrozen,
+    offlineQueueCount,
+    offlineQueueItems,
+    isFlushingOfflineQueue,
+    flushOfflineQueueNow,
+    autoLockMinutes,
+    setAutoLockMinutes,
     products,
     orders,
     bankAccounts,
@@ -264,6 +273,98 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({ onClose }) => {
                 <ShieldCheck className="w-3.5 h-3.5" />
                 <span>{tablesFrozen ? 'Ontgrendel Cloud Tabellen' : 'Bevries Cloud Tabellen'}</span>
               </button>
+            </div>
+          </div>
+
+          {/* Offline Buffer Queue + Auto-Lock Security */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between gap-3">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="font-bold text-white flex items-center gap-2 text-xs">
+                    <Inbox className="w-4 h-4 text-cyan-400" />
+                    <span>Offline Buffer Wachtrij</span>
+                  </h4>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-black border ${
+                    offlineQueueCount > 0
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                      : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                  }`}>
+                    {offlineQueueCount} wachtend
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Bestellingen, WerkPay betalingen en voorraadwijzigingen bij wegvallende Wi-Fi worden lokaal bewaard en automatisch doorgestuurd.
+                </p>
+                {offlineQueueItems.length > 0 && (
+                  <div className="mt-2 max-h-20 overflow-y-auto space-y-1 text-[10px] font-mono text-amber-200/90 bg-slate-900 rounded-lg p-2 border border-slate-800">
+                    {offlineQueueItems.slice(0, 5).map((item) => (
+                      <div key={item.id} className="truncate">
+                        • {item.label} ({item.attempts}x)
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                disabled={isFlushingOfflineQueue || offlineQueueCount === 0}
+                onClick={async () => {
+                  const res = await flushOfflineQueueNow();
+                  if (res.flushed > 0) {
+                    showToast(`${res.flushed} wachtrij-item(s) verwerkt naar Cloud!`, 'success');
+                  } else if (res.remaining > 0) {
+                    showToast(`Synchronisatie mislukt: ${res.lastError || 'nog geen verbinding'}`, 'error');
+                  }
+                }}
+                className="w-full py-2 px-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-45 text-slate-950 font-black text-xs transition flex items-center justify-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isFlushingOfflineQueue ? 'animate-spin' : ''}`} />
+                <span>{isFlushingOfflineQueue ? 'Synchroniseren...' : 'Nu Wachtrij Synchroniseren'}</span>
+              </button>
+            </div>
+
+            <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between gap-3">
+              <div>
+                <h4 className="font-bold text-white flex items-center gap-2 text-xs">
+                  <Clock className="w-4 h-4 text-purple-400" />
+                  <span>Kassa Auto-Lock Beveiliging</span>
+                </h4>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Vergrendelt ingelogde medewerkers automatisch na inactiviteit. Ontgrendelen kan met Wachtwoord/PIN of NFC pas (+ evt. 2FA).
+                </p>
+              </div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[
+                  { mins: 0, label: 'Uit' },
+                  { mins: 1, label: '1 min' },
+                  { mins: 2, label: '2 min' },
+                  { mins: 5, label: '5 min' },
+                  { mins: 10, label: '10 min' },
+                  { mins: 15, label: '15 min' }
+                ].map((opt) => (
+                  <button
+                    key={opt.mins}
+                    type="button"
+                    onClick={() => {
+                      setAutoLockMinutes(opt.mins);
+                      showToast(
+                        opt.mins === 0
+                          ? 'Kassa Auto-Lock uitgeschakeld.'
+                          : `Kassa Auto-Lock ingesteld op ${opt.label}.`,
+                        'info'
+                      );
+                    }}
+                    className={`py-1.5 px-2 rounded-lg text-[11px] font-black border transition ${
+                      autoLockMinutes === opt.mins
+                        ? 'bg-purple-600 text-white border-purple-400'
+                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         </div>

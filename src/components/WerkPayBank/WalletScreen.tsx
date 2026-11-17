@@ -24,6 +24,7 @@ import {
   ShoppingBag
 } from 'lucide-react';
 import { getStatusMeta, isOrderReady } from '../../services/orderStatus';
+import { PicoCardLoginPanel } from '../PicoCardLoginPanel';
 
 export const WalletScreen: React.FC = () => {
   const {
@@ -47,7 +48,7 @@ export const WalletScreen: React.FC = () => {
   // Login form state - clean and secured, no prefilled credentials
   const [loginUser, setLoginUser] = useState<string>('');
   const [loginSecret, setLoginSecret] = useState<string>('');
-  const [loginMode, setLoginMode] = useState<'password' | 'pin'>('password');
+  const [loginMode, setLoginMode] = useState<'password' | 'pin' | 'terminal'>('password');
   const [loginError, setLoginError] = useState<string>('');
 
   // Top Up State
@@ -93,6 +94,7 @@ export const WalletScreen: React.FC = () => {
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loginMode === 'terminal') return;
     setLoginError('');
     const res = await loginWerkPay(loginUser, loginSecret, loginMode);
     if (!res.success) {
@@ -193,7 +195,10 @@ export const WalletScreen: React.FC = () => {
           <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs font-bold">
             <button
               type="button"
-              onClick={() => setLoginMode('password')}
+              onClick={() => {
+                setLoginMode('password');
+                setLoginError('');
+              }}
               className={`flex-1 py-1.5 rounded-lg transition ${
                 loginMode === 'password' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400'
               }`}
@@ -202,60 +207,80 @@ export const WalletScreen: React.FC = () => {
             </button>
             <button
               type="button"
-              onClick={() => setLoginMode('pin')}
+              onClick={() => {
+                setLoginMode('pin');
+                setLoginError('');
+              }}
               className={`flex-1 py-1.5 rounded-lg transition ${
                 loginMode === 'pin' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400'
               }`}
             >
               Pincode
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLoginMode('terminal');
+                setLoginError('');
+              }}
+              className={`flex-1 py-1.5 rounded-lg transition flex items-center justify-center gap-1 ${
+                loginMode === 'terminal' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400'
+              }`}
+            >
+              <Radio className="w-3 h-3" />
+              <span>Pinapparaat</span>
+            </button>
           </div>
 
-          <form onSubmit={handleLogin} className="space-y-3 text-xs">
-            <div>
-              <label className="text-slate-400 font-bold block mb-1">Gebruikersnaam</label>
-              <input
-                type="text"
-                required
-                value={loginUser}
-                onChange={e => setLoginUser(e.target.value)}
-                placeholder="Gebruikersnaam invoeren..."
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-cyan-400"
-              />
-            </div>
+          {loginMode === 'terminal' ? (
+            <PicoCardLoginPanel mode="werkpay" />
+          ) : (
+            <form onSubmit={handleLogin} className="space-y-3 text-xs">
+              <div>
+                <label className="text-slate-400 font-bold block mb-1">Gebruikersnaam</label>
+                <input
+                  type="text"
+                  required
+                  value={loginUser}
+                  onChange={e => setLoginUser(e.target.value)}
+                  placeholder="Gebruikersnaam invoeren..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-cyan-400"
+                />
+              </div>
 
-            <div>
-              <label className="text-slate-400 font-bold block mb-1">
-                {loginMode === 'pin' ? 'Pincode' : 'Wachtwoord'}
-              </label>
-              <input
-                type="password"
-                required
-                value={loginSecret}
-                onChange={e => setLoginSecret(e.target.value)}
-                placeholder={loginMode === 'pin' ? '1234' : '••••••••'}
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-cyan-400"
-              />
-            </div>
+              <div>
+                <label className="text-slate-400 font-bold block mb-1">
+                  {loginMode === 'pin' ? 'Pincode' : 'Wachtwoord'}
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={loginSecret}
+                  onChange={e => setLoginSecret(e.target.value)}
+                  placeholder={loginMode === 'pin' ? '1234' : '••••••••'}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-cyan-400"
+                />
+              </div>
 
-            {loginError && (
-              <p className="text-rose-400 text-xs font-bold bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20">
-                {loginError}
-              </p>
-            )}
+              {loginError && (
+                <p className="text-rose-400 text-xs font-bold bg-rose-500/10 p-2.5 rounded-xl border border-rose-500/20">
+                  {loginError}
+                </p>
+              )}
 
-            <button
-              type="submit"
-              className="w-full py-3 rounded-xl font-black text-sm bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg shadow-cyan-500/20 transition"
-            >
-              Inloggen
-            </button>
+              <button
+                type="submit"
+                className="w-full py-3 rounded-xl font-black text-sm bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-lg shadow-cyan-500/20 transition"
+              >
+                Inloggen
+              </button>
 
-            <div className="pt-3 border-t border-slate-800 text-[11px] text-slate-400 text-center flex items-center justify-center gap-1.5">
-              <span className="text-cyan-400">🔒</span>
-              <span>Wachtwoorden en pincodes zijn privé en beveiligd. Alleen bevoegde accounthouders kunnen inloggen.</span>
-            </div>
-          </form>
+              <div className="pt-3 border-t border-slate-800 text-[11px] text-slate-400 text-center flex items-center justify-center gap-1.5">
+                <span className="text-cyan-400">🔒</span>
+                <span>Wachtwoorden en pincodes zijn privé en beveiligd. Alleen bevoegde accounthouders kunnen inloggen.</span>
+              </div>
+            </form>
+          )}
         </div>
       ) : (
         /* Logged In Wallet View */

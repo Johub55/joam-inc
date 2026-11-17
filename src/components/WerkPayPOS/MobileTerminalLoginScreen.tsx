@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { AlertCircle, CreditCard, Lock, LogIn, Monitor, User } from 'lucide-react';
+import { PicoCardLoginPanel } from '../PicoCardLoginPanel';
+import { AlertCircle, CreditCard, Lock, LogIn, Monitor, Radio, User } from 'lucide-react';
 
 interface MobileTerminalLoginScreenProps {
   onSwitchToFullVersion: () => void;
@@ -10,6 +11,7 @@ export const MobileTerminalLoginScreen: React.FC<MobileTerminalLoginScreenProps>
   onSwitchToFullVersion
 }) => {
   const { loginPos, brandConfig, customBranding, activeBrand } = useApp();
+  const [loginTab, setLoginTab] = useState<'credentials' | 'terminal'>('credentials');
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [error, setError] = useState<string>('');
@@ -81,69 +83,106 @@ export const MobileTerminalLoginScreen: React.FC<MobileTerminalLoginScreenProps>
             </p>
           </div>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-1.5">
-              <label
-                htmlFor="mobile-terminal-user"
-                className="text-xs font-bold text-slate-300 flex items-center gap-1.5"
-              >
-                <User className="w-3.5 h-3.5 text-slate-400" />
-                <span>Gebruikersnaam</span>
-              </label>
-              <input
-                id="mobile-terminal-user"
-                type="text"
-                required
-                autoComplete="username"
-                value={username}
-                onChange={(e) => {
-                  setUsername(e.target.value);
-                  setError('');
-                }}
-                placeholder="Medewerker gebruikersnaam..."
-                className="w-full min-h-[46px] bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label
-                htmlFor="mobile-terminal-pass"
-                className="text-xs font-bold text-slate-300 flex items-center gap-1.5"
-              >
-                <Lock className="w-3.5 h-3.5 text-slate-400" />
-                <span>Wachtwoord of Pincode</span>
-              </label>
-              <input
-                id="mobile-terminal-pass"
-                type="password"
-                required
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value);
-                  setError('');
-                }}
-                placeholder="••••••••"
-                className="w-full min-h-[46px] bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-cyan-500"
-              />
-            </div>
-
-            {error && (
-              <div className="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs font-medium flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                <span>{error}</span>
-              </div>
-            )}
-
+          <div className="grid grid-cols-2 gap-1.5 bg-slate-950 p-1 rounded-2xl border border-slate-800 text-xs font-bold">
             <button
-              type="submit"
-              disabled={isSubmitting}
-              className="w-full min-h-[48px] py-3 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 active:scale-[0.98] text-slate-950 font-black text-sm flex items-center justify-center gap-2 transition shadow-lg shadow-cyan-500/20"
+              type="button"
+              onClick={() => {
+                setLoginTab('credentials');
+                setError('');
+              }}
+              className={`min-h-[40px] px-3 rounded-xl flex items-center justify-center gap-1.5 transition ${
+                loginTab === 'credentials'
+                  ? 'bg-cyan-500 text-slate-950 font-black shadow'
+                  : 'text-slate-400 hover:text-white'
+              }`}
             >
-              <LogIn className="w-4 h-4" />
-              <span>{isSubmitting ? 'Controleren...' : 'Open WerkPin Terminal'}</span>
+              <User className="w-3.5 h-3.5" />
+              <span>Wachtwoord</span>
             </button>
-          </form>
+            <button
+              type="button"
+              onClick={() => {
+                setLoginTab('terminal');
+                setError('');
+              }}
+              className={`min-h-[40px] px-3 rounded-xl flex items-center justify-center gap-1.5 transition ${
+                loginTab === 'terminal'
+                  ? 'bg-cyan-500 text-slate-950 font-black shadow'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>Pinapparaat (NFC)</span>
+            </button>
+          </div>
+
+          {loginTab === 'credentials' ? (
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="mobile-terminal-user"
+                  className="text-xs font-bold text-slate-300 flex items-center gap-1.5"
+                >
+                  <User className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Gebruikersnaam</span>
+                </label>
+                <input
+                  id="mobile-terminal-user"
+                  type="text"
+                  required
+                  autoComplete="username"
+                  value={username}
+                  onChange={(e) => {
+                    setUsername(e.target.value);
+                    setError('');
+                  }}
+                  placeholder="Medewerker gebruikersnaam..."
+                  className="w-full min-h-[46px] bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="mobile-terminal-pass"
+                  className="text-xs font-bold text-slate-300 flex items-center gap-1.5"
+                >
+                  <Lock className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Wachtwoord of Pincode</span>
+                </label>
+                <input
+                  id="mobile-terminal-pass"
+                  type="password"
+                  required
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    setError('');
+                  }}
+                  placeholder="••••••••"
+                  className="w-full min-h-[46px] bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              {error && (
+                <div className="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs font-medium flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full min-h-[48px] py-3 px-4 rounded-2xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 active:scale-[0.98] text-slate-950 font-black text-sm flex items-center justify-center gap-2 transition shadow-lg shadow-cyan-500/20"
+              >
+                <LogIn className="w-4 h-4" />
+                <span>{isSubmitting ? 'Controleren...' : 'Open WerkPin Terminal'}</span>
+              </button>
+            </form>
+          ) : (
+            <PicoCardLoginPanel mode="pos" compact />
+          )}
         </div>
       </main>
 

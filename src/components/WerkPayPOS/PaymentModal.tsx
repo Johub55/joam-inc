@@ -4,8 +4,15 @@ import { euro, formatCardUid } from '../../services/store';
 import { CashApprovalModal } from './CashApprovalModal';
 import { DiyTerminalModal } from './DiyTerminalModal';
 import { terminalManager, TerminalCallbacks } from '../../services/terminalService';
+import { TerminalSelector } from './TerminalSelector';
 import {
-  setHardwareTerminalPayMode,
+  claimHardwareTerminalPayMode,
+  getActiveHardwareTerminalId,
+  getTerminalTabSessionId,
+  HARDWARE_TERMINAL_EVENT,
+  HardwareTerminalState,
+  isHardwareTerminalBusy,
+  releaseHardwareTerminalIfOwned,
   setHardwareTerminalResult,
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
@@ -43,7 +50,8 @@ import {
   Award,
   Search,
   UserPlus,
-  Receipt
+  Receipt,
+  RotateCcw
 } from 'lucide-react';
 
 interface PaymentModalProps {
@@ -109,11 +117,16 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   const cashCheckoutInFlightRef = useRef<boolean>(false);
 
   // DIY Terminal Modal
+  const [selectedTerminalId, setSelectedTerminalId] = useState<string>(() => getActiveHardwareTerminalId());
+  const selectedTerminalIdRef = useRef<string>(selectedTerminalId);
+  selectedTerminalIdRef.current = selectedTerminalId;
   const [showDiyTerminalModal, setShowDiyTerminalModal] = useState<boolean>(false);
   const [terminalConnected, setTerminalConnected] = useState<boolean>(terminalManager.getIsConnected());
   const [terminalWaitingCard, setTerminalWaitingCard] = useState<boolean>(false);
   const [terminalCloudWaiting, setTerminalCloudWaiting] = useState<boolean>(false);
+  const [terminalLiveState, setTerminalLiveState] = useState<HardwareTerminalState | null>(null);
   const handledCloudSubmitRef = useRef<string>('');
+  const activeClaimTokenRef = useRef<string>('');
 
   // Feedback & Loading
   const [errorMessage, setErrorMessage] = useState<string>('');
@@ -185,14 +198,15 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       const targetIdentifier = identifier.trim() || (orderType === 'dine_in' ? 'Terminal Tafel' : 'Terminal Klant');
       const meta = { mode: 'terminal', cardUid: uid, pin };
       const res = await processCheckout('workpay', orderType, targetIdentifier, meta);
+      const currentTerm = selectedTerminalIdRef.current;
       if (res.success) {
-        try { await setHardwareTerminalResult('APPROVED', 'Eet smakelijk!'); } catch {}
+        try { await setHardwareTerminalResult('APPROVED', 'Eet smakelijk!', currentTerm); } catch {}
         if (terminalManager.getIsConnected()) {
           await terminalManager.notifyApproved('Eet smakelijk!');
         }
         onClose();
       } else {
-        try { await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16)); } catch {}
+        try { await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16), currentTerm); } catch {}
         if (terminalManager.getIsConnected()) {
           await terminalManager.notifyDeclined(res.message.slice(0, 16));
         }
@@ -228,15 +242,40 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   terminalCloudWaitingRef.current = terminalCloudWaiting;
 
   const handleCancelTerminalPayment = async (notifyIdle = true) => {
+    const token = activeClaimTokenRef.current;
+    activeClaimTokenRef.current = '';
     setTerminalCloudWaiting(false);
     setTerminalWaitingCard(false);
     if (terminalManager.getIsConnected()) {
       terminalManager.cancel().catch(() => {});
     }
-    if (notifyIdle) {
-      setHardwareTerminalIdle().catch(() => {});
+    if (notifyIdle && token) {
+      releaseHardwareTerminalIfOwned(token, selectedTerminalIdRef.current).catch(() => {});
     }
   };
+
+  useEffect(() => {
+    const syncTerm = () => {
+      if (!terminalCloudWaitingRef.current) {
+        setSelectedTerminalId(getActiveHardwareTerminalId());
+      }
+    };
+    window.addEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+    return () => window.removeEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+  }, []);
+
+  // Monitor live terminal busy state when viewing DIY Pinapparaat tab
+  useEffect(() => {
+    if (paymentMethod !== 'workpay' || werkpayMode !== 'terminal') return;
+    const unsub = subscribeHardwareTerminal(
+      (state) => {
+        setTerminalLiveState(state);
+      },
+      () => {},
+      selectedTerminalId
+    );
+    return () => unsub();
+  }, [paymentMethod, werkpayMode, selectedTerminalId]);
 
   useEffect(() => {
     if (!terminalCloudWaiting) return;
@@ -244,6 +283,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
     const unsub = subscribeHardwareTerminal(
       async (state) => {
         if (!state) return;
+        setTerminalLiveState(state);
         if (state.status !== 'IDLE') {
           sawActiveCloudState = true;
         }
@@ -256,6 +296,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
           setWpPin(state.enteredPin);
           setTerminalCloudWaiting(false);
           setTerminalWaitingCard(false);
+          activeClaimTokenRef.current = '';
           await executeTerminalCheckoutRef.current(state.scannedUid, state.enteredPin);
         } else if (
           state.status === 'IDLE' &&
@@ -264,6 +305,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
             state.reason?.toLowerCase().includes('geannuleerd') ||
             state.reason?.toLowerCase().includes('timeout'))
         ) {
+          activeClaimTokenRef.current = '';
           setTerminalCloudWaiting(false);
           setTerminalWaitingCard(false);
           setErrorMessage(state.reason || 'Betaling geannuleerd op het pinapparaat.');
@@ -271,15 +313,17 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       },
       (err) => {
         console.error('Firebase terminal listener error:', err);
+        activeClaimTokenRef.current = '';
         setTerminalCloudWaiting(false);
         setTerminalWaitingCard(false);
         setErrorMessage('Verbinding met Firebase terminal relay onderbroken. Probeer opnieuw.');
-      }
+      },
+      selectedTerminalId
     );
     return () => unsub();
-  }, [terminalCloudWaiting]);
+  }, [terminalCloudWaiting, selectedTerminalId]);
 
-  // If user switches payment method/mode or closes modal while waiting on Pico W, reset terminal to IDLE immediately
+  // If user switches payment method/mode or closes modal while waiting on Pico W, release OWN lock cleanly
   useEffect(() => {
     if (terminalCloudWaiting && (paymentMethod !== 'workpay' || werkpayMode !== 'terminal')) {
       handleCancelTerminalPayment(true);
@@ -288,11 +332,16 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
 
   useEffect(() => {
     return () => {
-      if (terminalCloudWaitingRef.current) {
-        setHardwareTerminalIdle().catch(() => {});
+      if (terminalCloudWaitingRef.current && activeClaimTokenRef.current) {
+        releaseHardwareTerminalIfOwned(activeClaimTokenRef.current, selectedTerminalIdRef.current).catch(() => {});
+        activeClaimTokenRef.current = '';
       }
     };
   }, []);
+
+  const terminalBusyCheck = !terminalCloudWaiting
+    ? isHardwareTerminalBusy(terminalLiveState, activeClaimTokenRef.current || undefined)
+    : { busy: false };
 
   const handleStartTerminalPayment = async () => {
     setErrorMessage('');
@@ -301,13 +350,27 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       : Math.floor(1000 + Math.random() * 9000);
     handledCloudSubmitRef.current = '';
 
+    const claimToken = `${getTerminalTabSessionId()}_pospay_${Date.now()}`;
     let cloudActivated = false;
     let usbActivated = false;
     let cloudErrMessage = '';
 
-    // 1. Always activate Firebase Cloud Relay for Pico W (works wirelessly without USB or cookies!)
+    // 1. Atomic single-payment lock via Firebase Cloud Relay
     try {
-      await setHardwareTerminalPayMode(finalTotal, simOrderNo);
+      const claimRes = await claimHardwareTerminalPayMode(
+        finalTotal,
+        simOrderNo,
+        claimToken,
+        undefined,
+        selectedTerminalIdRef.current
+      );
+      if (!claimRes.acquired) {
+        setErrorMessage(
+          claimRes.busyMessage || 'Pinapparaat is al bezig met een andere betaling.'
+        );
+        return;
+      }
+      activeClaimTokenRef.current = claimToken;
       cloudActivated = true;
       setTerminalCloudWaiting(true);
       setTerminalWaitingCard(true);
@@ -1357,15 +1420,49 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
                       </span>
                     </div>
 
+                    <TerminalSelector
+                      compact
+                      disabled={terminalCloudWaiting || terminalWaitingCard}
+                      value={selectedTerminalId}
+                      onChange={setSelectedTerminalId}
+                    />
+
                     <p className="text-[11px] text-slate-300 leading-relaxed">
-                      Klik op <strong>Activeer Pinapparaat</strong> om het bedrag draadloos naar je Raspberry Pi Pico W (via Firebase Cloud) en/of USB te sturen.
+                      Klik op <strong>Activeer Pinapparaat</strong> om het bedrag draadloos naar het gekozen Pico W pinapparaat (via Firebase Cloud) en/of USB te sturen. Maximaal 1 betaling tegelijk actief.
                     </p>
+
+                    {terminalBusyCheck.busy && !terminalCloudWaiting && (
+                      <div className="p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-amber-200 text-[11px] space-y-1.5">
+                        <div className="font-bold flex items-center gap-1.5">
+                          <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          <span>{terminalBusyCheck.reason}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await setHardwareTerminalIdle(selectedTerminalIdRef.current).catch(() => {});
+                            setErrorMessage('');
+                          }}
+                          className="w-full py-1 px-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold text-[10px] flex items-center justify-center gap-1 transition"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Forceer Vrijgeven (IDLE)</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {!selectedTerminalId && (
+                      <div className="p-2.5 rounded-xl bg-amber-950/35 border border-amber-500/35 text-amber-200 text-[11px] font-semibold">
+                        Nog geen pinapparaat ingesteld. Voeg hierboven eerst zelf een pinapparaat toe.
+                      </div>
+                    )}
 
                     <div className="flex gap-2 pt-1">
                       <button
                         type="button"
+                        disabled={!selectedTerminalId || terminalCloudWaiting || terminalWaitingCard || Boolean(terminalBusyCheck.busy)}
                         onClick={handleStartTerminalPayment}
-                        className="flex-1 py-2 px-3 rounded-xl text-xs font-black bg-cyan-500 hover:bg-cyan-400 text-slate-950 flex items-center justify-center gap-1.5 transition"
+                        className="flex-1 py-2 px-3 rounded-xl text-xs font-black bg-cyan-500 hover:bg-cyan-400 disabled:opacity-45 text-slate-950 flex items-center justify-center gap-1.5 transition"
                       >
                         <Radio className="w-3.5 h-3.5" />
                         <span>{terminalWaitingCard || terminalCloudWaiting ? 'Wachten op Pas & PIN...' : 'Activeer Pinapparaat'}</span>

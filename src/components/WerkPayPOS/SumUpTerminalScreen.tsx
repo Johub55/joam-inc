@@ -3,16 +3,24 @@ import { useApp } from '../../context/AppContext';
 import { euro, normalizeCardUid, accountMatchesUid, formatCardUid } from '../../services/store';
 import { showToast } from '../../services/appToast';
 import {
-  setHardwareTerminalPayMode,
+  claimHardwareTerminalPayMode,
+  getActiveHardwareTerminalId,
+  getTerminalTabSessionId,
+  HARDWARE_TERMINAL_EVENT,
+  isHardwareTerminalBusy,
+  releaseHardwareTerminalIfOwned,
   setHardwareTerminalResult,
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
+  triggerHardwareTerminalCheckCard,
   HardwareTerminalState
 } from '../../services/firebase';
+import { findLoyaltyCustomerByPhoneOrName } from '../../services/loyalty';
 import { terminalManager, TerminalCallbacks } from '../../services/terminalService';
 import { DiyTerminalModal } from './DiyTerminalModal';
 import { PicoFlasherPanel } from './PicoFlasherPanel';
 import { LinkCardModal } from './LinkCardModal';
+import { TerminalSelector } from './TerminalSelector';
 import { generateGiftCardCode } from '../../services/discountService';
 import { getStatusMeta, isOrderInProgress, isOrderReady } from '../../services/orderStatus';
 import { AudioFX } from '../../services/audio';
@@ -143,11 +151,27 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   const [mobileOrderNote, setMobileOrderNote] = useState<string>('');
 
   // Pico W Cloud Relay Live State
+  const [selectedTerminalId, setSelectedTerminalId] = useState<string>(() => getActiveHardwareTerminalId());
+  const selectedTerminalIdRef = useRef<string>(selectedTerminalId);
+  selectedTerminalIdRef.current = selectedTerminalId;
   const [picoWaiting, setPicoWaiting] = useState<boolean>(false);
   const [picoLiveState, setPicoLiveState] = useState<HardwareTerminalState | null>(null);
   const handledCloudSigRef = useRef<string>('');
+  const activeClaimTokenRef = useRef<string>('');
   const picoWaitingRef = useRef<boolean>(false);
   picoWaitingRef.current = picoWaiting;
+
+  // Quick NFC Balance & Loyalty Check state
+  const [checkUidInput, setCheckUidInput] = useState<string>('');
+  const [lastCheckResult, setLastCheckResult] = useState<{
+    holder: string;
+    username?: string;
+    balance: number;
+    coins: number;
+    tier: string;
+    uid: string;
+    at: string;
+  } | null>(null);
 
   // History & Refunds
   const [historyFilter, setHistoryFilter] = useState<'all' | 'sumup' | 'workpay' | 'cash'>('sumup');
@@ -203,17 +227,38 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     return Math.round((baseAmount + tipAmount) * 100) / 100;
   }, [baseAmount, tipAmount]);
 
-  // Keep global Firebase subscription active in Tools or while waiting on Pico
   useEffect(() => {
-    if (activeTab !== 'tools' && !picoWaiting) return;
+    const syncTerm = () => {
+      if (!picoWaitingRef.current) {
+        setSelectedTerminalId(getActiveHardwareTerminalId());
+      }
+    };
+    window.addEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+    return () => window.removeEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+  }, []);
+
+  // Keep global Firebase subscription active in Tools, Pay Sheet, or while waiting on Pico
+  useEffect(() => {
+    if (activeTab !== 'tools' && !picoWaiting && !showPaySheet) return;
     const unsub = subscribeHardwareTerminal(
       (st) => {
         setPicoLiveState(st);
+        if (st?.status === 'CHECK_RESULT') {
+          setLastCheckResult({
+            holder: st.username || 'WerkPay Pas',
+            balance: Number(st.amount || 0),
+            coins: Number(st.orderNo || 0),
+            tier: (st.reason || '').replace(/^OK\|/, '') || 'Brons',
+            uid: st.scannedUid || '',
+            at: new Date().toLocaleTimeString('nl-NL')
+          });
+        }
       },
-      () => {}
+      () => {},
+      selectedTerminalId
     );
     return () => unsub();
-  }, [activeTab, picoWaiting]);
+  }, [activeTab, picoWaiting, showPaySheet, selectedTerminalId]);
 
   // Execute payment helper
   const executeCharge = async (
@@ -251,9 +296,10 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         notes: mobileOrderNote.trim() || undefined
       });
 
+      const currentTerm = selectedTerminalIdRef.current;
       if (res.success && res.order) {
         if (fromPicoCloud) {
-          await setHardwareTerminalResult('APPROVED', 'Bedankt!').catch(() => {});
+          await setHardwareTerminalResult('APPROVED', 'Bedankt!', currentTerm).catch(() => {});
         }
         if (terminalManager.getIsConnected()) {
           await terminalManager.notifyApproved('Bedankt!').catch(() => {});
@@ -278,7 +324,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         showToast(res.message, 'success');
       } else {
         if (fromPicoCloud) {
-          await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16)).catch(() => {});
+          await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16), currentTerm).catch(() => {});
         }
         if (terminalManager.getIsConnected()) {
           await terminalManager.notifyDeclined(res.message.slice(0, 16)).catch(() => {});
@@ -321,6 +367,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
           if (handledCloudSigRef.current === sig) return;
           handledCloudSigRef.current = sig;
           setPicoWaiting(false);
+          activeClaimTokenRef.current = '';
           await executeChargeRef.current(
             'workpay',
             { mode: 'terminal', cardUid: st.scannedUid, pin: st.enteredPin },
@@ -333,23 +380,27 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
             st.reason?.toLowerCase().includes('geannuleerd') ||
             st.reason?.toLowerCase().includes('timeout'))
         ) {
+          activeClaimTokenRef.current = '';
           setPicoWaiting(false);
           setPayError(st.reason || 'Geannuleerd op het pinapparaat.');
         }
       },
       () => {
+        activeClaimTokenRef.current = '';
         setPicoWaiting(false);
         setPayError('Verbinding met Firebase terminal onderbroken.');
-      }
+      },
+      selectedTerminalId
     );
     return () => unsub();
-  }, [picoWaiting]);
+  }, [picoWaiting, selectedTerminalId]);
 
-  // Reset Pico W to IDLE if modal closes while still waiting
+  // Release OWN lock cleanly if component unmounts while waiting
   useEffect(() => {
     return () => {
-      if (picoWaitingRef.current) {
-        setHardwareTerminalIdle().catch(() => {});
+      if (picoWaitingRef.current && activeClaimTokenRef.current) {
+        releaseHardwareTerminalIfOwned(activeClaimTokenRef.current, selectedTerminalIdRef.current).catch(() => {});
+        activeClaimTokenRef.current = '';
       }
     };
   }, []);
@@ -417,11 +468,27 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     setCashReceived(finalTotal.toFixed(2));
   };
 
+  const picoBusyCheck = !picoWaiting
+    ? isHardwareTerminalBusy(picoLiveState, activeClaimTokenRef.current || undefined)
+    : { busy: false };
+
   const handleStartPicoCloud = async () => {
     setPayError('');
     handledCloudSigRef.current = '';
+    const claimToken = `${getTerminalTabSessionId()}_werkpin_${Date.now()}`;
     try {
-      await setHardwareTerminalPayMode(finalTotal, orderNo);
+      const claimRes = await claimHardwareTerminalPayMode(
+        finalTotal,
+        orderNo,
+        claimToken,
+        undefined,
+        selectedTerminalIdRef.current
+      );
+      if (!claimRes.acquired) {
+        setPayError(claimRes.busyMessage || 'Pinapparaat is al bezig met een andere betaling.');
+        return;
+      }
+      activeClaimTokenRef.current = claimToken;
       setPicoWaiting(true);
       if (terminalManager.getIsConnected()) {
         await terminalManager.startPayment(finalTotal, orderNo).catch(() => {});
@@ -432,11 +499,15 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   };
 
   const handleCancelPicoCloud = async () => {
+    const token = activeClaimTokenRef.current;
+    activeClaimTokenRef.current = '';
     setPicoWaiting(false);
     if (terminalManager.getIsConnected()) {
       await terminalManager.cancel().catch(() => {});
     }
-    await setHardwareTerminalIdle().catch(() => {});
+    if (token) {
+      await releaseHardwareTerminalIfOwned(token, selectedTerminalIdRef.current).catch(() => {});
+    }
   };
 
   const handleCardSubmit = async (e: React.FormEvent) => {
@@ -1791,83 +1862,170 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
               {/* Pico W Hardware Terminal Status & Reset */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
                 <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-black text-white flex items-center gap-2">
-                      <Wifi className="w-4 h-4 text-cyan-400" />
-                      <span>Pico W Pinapparaat (Cloud Relay)</span>
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Live status in Firebase, directe reset en ingebouwde Pico W USB/Mobiele flasher.
+                    <div>
+                      <h3 className="text-sm font-black text-white flex items-center gap-2">
+                        <Wifi className="w-4 h-4 text-cyan-400" />
+                        <span>Pico W Pinapparaat (Cloud Relay)</span>
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        Multi-Terminal status in Firebase, directe reset, B-knop Saldo Check &amp; USB/Mobiele flasher.
+                      </p>
+                    </div>
+                    <span className={`px-2.5 py-1 rounded-lg text-xs font-mono font-black border ${
+                      !selectedTerminalId
+                        ? 'bg-slate-800 text-slate-300 border-slate-700'
+                        : picoLiveState?.status === 'IDLE' || !picoLiveState
+                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                        : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                    }`}>
+                      {!selectedTerminalId ? 'NIET INGESTELD' : (picoLiveState?.status || 'VERBINDEN...')}
+                    </span>
+                  </div>
+
+                  <TerminalSelector
+                    disabled={picoWaiting}
+                    value={selectedTerminalId}
+                    onChange={setSelectedTerminalId}
+                  />
+
+                  {picoLiveState && (
+                    <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs font-mono space-y-1 text-slate-300">
+                      <div>Laatste UID: <span className="text-cyan-300">{picoLiveState.scannedUid || '—'}</span></div>
+                      <div>Reden/Info: <span className="text-slate-400">{picoLiveState.reason || 'Klaar voor betaling'}</span></div>
+                      <div>Update: <span className="text-slate-500">{picoLiveState.updatedAt || '—'}</span></div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={!selectedTerminalId}
+                      onClick={async () => {
+                        await setHardwareTerminalIdle(selectedTerminalIdRef.current);
+                        showToast(`Pinapparaat (${selectedTerminalIdRef.current}) teruggezet naar IDLE.`, 'success');
+                      }}
+                      className="flex-1 min-w-[160px] py-2.5 px-3 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 disabled:opacity-45 border border-amber-500/40 text-amber-300 font-black text-xs flex items-center justify-center gap-1.5"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                      <span>Forceer Reset (IDLE)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowInlineFlasher(p => !p)}
+                      className={`flex-1 min-w-[160px] py-2.5 px-3 rounded-xl border font-black text-xs flex items-center justify-center gap-1.5 transition ${
+                        showInlineFlasher
+                          ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                          : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/40'
+                      }`}
+                    >
+                      <Zap className="w-4 h-4" />
+                      <span>{showInlineFlasher ? 'Verberg Pi Flasher' : '⚡ Pico W Flashen'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowDiyModal(true)}
+                      className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center gap-1.5"
+                    >
+                      <Cpu className="w-4 h-4 text-cyan-400" />
+                      <span>Schema / .INO</span>
+                    </button>
+                  </div>
+
+                  {/* Quick NFC Balance & Loyalty Check card */}
+                  <div className="bg-slate-950 border border-cyan-500/30 rounded-xl p-3 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-black text-cyan-300 flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Snelle Pas Saldo &amp; WerkCoins Check (Toets B op Pico)</span>
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      Druk op <strong>B</strong> op het fysieke Pico W keypad in ruststand en scan de pas voor direct saldo op het LCD-scherm — of controleer een UID hieronder:
                     </p>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={checkUidInput}
+                        onChange={(e) => setCheckUidInput(e.target.value.toUpperCase())}
+                        placeholder="Plak pas UID (bijv. 04A1B2C3)..."
+                        className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const norm = normalizeCardUid(checkUidInput);
+                          if (!norm) {
+                            showToast('Vul eerst een pas-UID in.', 'error');
+                            return;
+                          }
+                          const acc = bankAccounts.find((a) => accountMatchesUid(a, norm));
+                          if (acc) {
+                            const loy = findLoyaltyCustomerByPhoneOrName(acc.account_holder) || findLoyaltyCustomerByPhoneOrName(acc.username);
+                            setLastCheckResult({
+                              holder: acc.account_holder,
+                              username: acc.username,
+                              balance: acc.is_admin ? 9999 : Number(acc.balance || 0),
+                              coins: loy ? loy.coins : 0,
+                              tier: loy ? loy.tier : 'Brons',
+                              uid: norm,
+                              at: new Date().toLocaleTimeString('nl-NL')
+                            });
+                            if (selectedTerminalIdRef.current) {
+                              await triggerHardwareTerminalCheckCard(norm, selectedTerminalIdRef.current).catch(() => {});
+                              showToast(`Saldo van ${acc.account_holder} opgehaald en naar Pico gestuurd.`, 'success');
+                            } else {
+                              showToast(`Saldo van ${acc.account_holder} opgehaald (voeg een pinapparaat toe om naar Pico te sturen).`, 'info');
+                            }
+                          } else {
+                            if (selectedTerminalIdRef.current) {
+                              await triggerHardwareTerminalCheckCard(norm, selectedTerminalIdRef.current).catch(() => {});
+                            }
+                            showToast(`Pas ${norm} niet gevonden in WerkPay.`, 'error');
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-black text-xs whitespace-nowrap"
+                      >
+                        Check &amp; Toon op Pico
+                      </button>
+                    </div>
+                    {lastCheckResult && (
+                      <div className="bg-slate-900 border border-emerald-500/40 rounded-lg p-2.5 flex items-center justify-between gap-2 text-xs">
+                        <div>
+                          <div className="font-black text-white flex items-center gap-1.5">
+                            <span>{lastCheckResult.holder}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-bold">
+                              {lastCheckResult.tier}
+                            </span>
+                          </div>
+                          <div className="text-[11px] font-mono text-slate-400">
+                            UID: {lastCheckResult.uid} · {lastCheckResult.at}
+                          </div>
+                        </div>
+                        <div className="text-right font-mono">
+                          <div className="font-black text-emerald-400 text-sm">{euro(lastCheckResult.balance)}</div>
+                          <div className="text-[11px] text-amber-300 font-bold">{lastCheckResult.coins} WerkCoins</div>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  <span className={`px-2.5 py-1 rounded-lg text-xs font-mono font-black border ${
-                    picoLiveState?.status === 'IDLE' || !picoLiveState
-                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                      : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                  }`}>
-                    {picoLiveState?.status || 'VERBINDEN...'}
-                  </span>
+
+                  {showInlineFlasher && (
+                    <div className="pt-2 border-t border-slate-800">
+                      <PicoFlasherPanel compact />
+                    </div>
+                  )}
                 </div>
 
-                {picoLiveState && (
-                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs font-mono space-y-1 text-slate-300">
-                    <div>Laatste UID: <span className="text-cyan-300">{picoLiveState.scannedUid || '—'}</span></div>
-                    <div>Reden/Info: <span className="text-slate-400">{picoLiveState.reason || 'Klaar voor betaling'}</span></div>
-                    <div>Update: <span className="text-slate-500">{picoLiveState.updatedAt || '—'}</span></div>
-                  </div>
-                )}
-
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await setHardwareTerminalIdle();
-                      showToast('Pinapparaat teruggezet naar IDLE (klaar voor nieuw gebruik).', 'success');
-                    }}
-                    className="flex-1 min-w-[160px] py-2.5 px-3 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 font-black text-xs flex items-center justify-center gap-1.5"
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                    <span>Forceer Reset (IDLE)</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setShowInlineFlasher(p => !p)}
-                    className={`flex-1 min-w-[160px] py-2.5 px-3 rounded-xl border font-black text-xs flex items-center justify-center gap-1.5 transition ${
-                      showInlineFlasher
-                        ? 'bg-emerald-500 text-slate-950 border-emerald-400'
-                        : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/40'
-                    }`}
-                  >
-                    <Zap className="w-4 h-4" />
-                    <span>{showInlineFlasher ? 'Verberg Pi Flasher' : '⚡ Pico W Flashen'}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setShowDiyModal(true)}
-                    className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center gap-1.5"
-                  >
-                    <Cpu className="w-4 h-4 text-cyan-400" />
-                    <span>Schema / .INO</span>
-                  </button>
-                </div>
-
-                {showInlineFlasher && (
-                  <div className="pt-2 border-t border-slate-800">
-                    <PicoFlasherPanel compact />
-                  </div>
-                )}
-              </div>
-
-              {/* NFC Saldo Check, Pas Koppelen & Direct Opwaarderen */}
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-black text-white flex items-center gap-2">
-                      <Wallet className="w-4 h-4 text-emerald-400" />
-                      <span>NFC Pas Koppelen, Check &amp; Opwaarderen</span>
-                    </h3>
+                {/* NFC Saldo Check, Pas Koppelen & Direct Opwaarderen */}
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-black text-white flex items-center gap-2">
+                        <Wallet className="w-4 h-4 text-emerald-400" />
+                        <span>NFC Pas Koppelen, Check &amp; Opwaarderen</span>
+                      </h3>
                     <p className="text-xs text-slate-400">
                       Zoek op naam/UID, waardeer op of koppel direct een nieuwe NFC pas.
                     </p>
@@ -2036,17 +2194,53 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 <div className="space-y-4 text-center">
                   {!picoWaiting ? (
                     <>
+                      <TerminalSelector
+                        compact
+                        disabled={picoWaiting}
+                        value={selectedTerminalId}
+                        onChange={setSelectedTerminalId}
+                      />
+
                       <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
                         <Radio className="w-10 h-10 text-cyan-400 mx-auto" />
-                        <p className="text-sm font-bold text-white">Stuur {euro(finalTotal)} naar Pico W Pinapparaat</p>
+                        <p className="text-sm font-bold text-white">
+                          {selectedTerminalId
+                            ? `Stuur ${euro(finalTotal)} naar Pico W (${selectedTerminalId})`
+                            : 'Nog geen pinapparaat ingesteld'}
+                        </p>
                         <p className="text-xs text-slate-400">
-                          De klant houdt zijn NFC-pas bij de terminal en typt de pincode in.
+                          {selectedTerminalId
+                            ? 'De klant houdt zijn NFC-pas bij het gekozen pinapparaat en typt de pincode in. (Beveiligd: 1 betaling tegelijk.)'
+                            : 'Voeg hierboven eerst zelf je eigen pinapparaat Terminal-ID toe om af te rekenen.'}
                         </p>
                       </div>
+
+                      {picoBusyCheck.busy && (
+                        <div className="p-3 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-amber-200 text-xs text-left space-y-2">
+                          <div className="flex items-start gap-2 font-bold">
+                            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                            <span>{picoBusyCheck.reason}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await setHardwareTerminalIdle(selectedTerminalIdRef.current).catch(() => {});
+                              setPayError('');
+                              showToast(`Pinapparaat (${selectedTerminalIdRef.current}) vrijgegeven (IDLE).`, 'info');
+                            }}
+                            className="w-full py-1.5 px-3 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold text-[11px] flex items-center justify-center gap-1.5"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Forceer Vrijgeven (IDLE)</span>
+                          </button>
+                        </div>
+                      )}
+
                       <button
                         type="button"
+                        disabled={!selectedTerminalId || Boolean(picoBusyCheck.busy)}
                         onClick={handleStartPicoCloud}
-                        className="w-full py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-black text-sm shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2"
+                        className="w-full py-3.5 rounded-2xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-45 text-slate-950 font-black text-sm shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2"
                       >
                         <Radio className="w-4 h-4" />
                         <span>Activeer Pinapparaat</span>

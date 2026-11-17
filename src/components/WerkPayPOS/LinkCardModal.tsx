@@ -2,11 +2,16 @@ import React, { useState, useEffect, useRef } from 'react';
 import { showToast } from '../../services/appToast';
 import { useApp } from '../../context/AppContext';
 import {
-  setHardwareTerminalLinkMode,
+  claimHardwareTerminalLinkMode,
+  getActiveHardwareTerminalId,
+  getTerminalTabSessionId,
+  HARDWARE_TERMINAL_EVENT,
+  releaseHardwareTerminalIfOwned,
   setHardwareTerminalLinked,
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
 } from '../../services/firebase';
+import { TerminalSelector } from './TerminalSelector';
 import {
   normalizeCardUid,
   isVirtualCardNumber,
@@ -26,6 +31,7 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
   defaultMode = 'primary',
 }) => {
   const { bankAccounts, posUsers, saveBankAccount } = useApp();
+  const [terminalId, setTerminalId] = useState<string>(() => getActiveHardwareTerminalId());
   const [status, setStatus] = useState('Terminal activeren via Firebase Cloud...');
   const [linkedUid, setLinkedUid] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -35,7 +41,11 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
   const [showManual, setShowManual] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
 
+  const terminalIdRef = useRef(terminalId);
+  terminalIdRef.current = terminalId;
   const handledRef = useRef(false);
+  const claimTokenRef = useRef<string>(`${getTerminalTabSessionId()}_link_${Date.now()}`);
+  const lockAcquiredRef = useRef(false);
   const bankAccountsRef = useRef(bankAccounts);
   bankAccountsRef.current = bankAccounts;
   const posUsersRef = useRef(posUsers);
@@ -63,7 +73,6 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
     const targetAcc = accounts.find((a) => a.username.toLowerCase() === cleanUser);
     const matchingPosUser = posUsersRef.current.find((u) => u.username.toLowerCase() === cleanUser);
 
-    // Kijk of deze fysieke UID al aan een ander account hing (voor nette melding)
     const previousOwner = accounts.find((a) => {
       if (a.username.toLowerCase() === cleanUser) return false;
       const prim = normalizeCardUid(a.card_uid);
@@ -89,7 +98,6 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
           linked_uids: nextExtras,
         });
       } else {
-        // Vervang hoofdpas (en zorg dat hij niet dubbel als extra staat)
         const nextExtras = existingExtras.filter((t) => t.uid !== uid);
         res = await saveBankAccountRef.current({
           ...targetAcc,
@@ -119,7 +127,8 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
     }
 
     if (fromPico) {
-      await setHardwareTerminalLinked(username, uid).catch(() => {});
+      lockAcquiredRef.current = false;
+      await setHardwareTerminalLinked(username, uid, terminalIdRef.current).catch(() => {});
     }
 
     setLinkedUid(uid);
@@ -130,15 +139,72 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
   };
 
   useEffect(() => {
+    const syncTerm = () => {
+      if (!saving && !linkedUid && !lockAcquiredRef.current) {
+        setTerminalId(getActiveHardwareTerminalId());
+      }
+    };
+    window.addEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+    return () => window.removeEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
+  }, [saving, linkedUid]);
+
+  useEffect(() => {
     handledRef.current = false;
+    lockAcquiredRef.current = false;
+    claimTokenRef.current = `${getTerminalTabSessionId()}_link_${Date.now()}`;
     let active = true;
+    let unsub: (() => void) | null = null;
+    const currentTerminal = terminalId;
 
     const startLinkMode = async () => {
+      setSaveError(null);
+      if (!currentTerminal) {
+        setStatus('Stel hierboven eerst zelf een pinapparaat in om te scannen, of vul handmatig een UID in.');
+        setShowManual(true);
+        return;
+      }
+      setStatus(`Terminal (${currentTerminal}) activeren via Firebase Cloud...`);
       try {
-        await setHardwareTerminalLinkMode(username);
-        if (active) {
-          setStatus('📡 Scan nu de NFC pas op het Pico W pinapparaat...');
+        const claimRes = await claimHardwareTerminalLinkMode(username, claimTokenRef.current, currentTerminal);
+        if (!active) return;
+
+        if (!claimRes.acquired) {
+          setSaveError(
+            claimRes.busyMessage ||
+              'Het pinapparaat is momenteel bezig met een betaling. Je kunt nog wel handmatig een UID invullen.'
+          );
+          setStatus('Pinapparaat is momenteel bezet.');
+          setShowManual(true);
+          return;
         }
+
+        lockAcquiredRef.current = true;
+        setStatus(`📡 Scan nu de NFC pas op pinapparaat (${currentTerminal})...`);
+
+        unsub = subscribeHardwareTerminal(
+          async (terminalState) => {
+            if (!active || !terminalState) return;
+            if (terminalState.status === 'CARD_SCANNED' && terminalState.scannedUid && !handledRef.current) {
+              handledRef.current = true;
+              await commitScannedUid(terminalState.scannedUid, true);
+            } else if (
+              terminalState.status === 'IDLE' &&
+              terminalState.reason?.toLowerCase().includes('geannuleerd') &&
+              !handledRef.current
+            ) {
+              if (active) {
+                lockAcquiredRef.current = false;
+                setStatus('Koppelen geannuleerd op de terminal.');
+              }
+            }
+          },
+          () => {
+            if (active) {
+              setStatus('Fout bij realtime luisteren naar Firebase.');
+            }
+          },
+          currentTerminal
+        );
       } catch (e) {
         console.error('Firebase link mode error:', e);
         if (active) {
@@ -150,34 +216,15 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
 
     startLinkMode();
 
-    const unsub = subscribeHardwareTerminal(
-      async (terminalState) => {
-        if (!active || !terminalState) return;
-        if (terminalState.status === 'CARD_SCANNED' && terminalState.scannedUid && !handledRef.current) {
-          handledRef.current = true;
-          await commitScannedUid(terminalState.scannedUid, true);
-        } else if (
-          terminalState.status === 'IDLE' &&
-          terminalState.reason?.toLowerCase().includes('geannuleerd') &&
-          !handledRef.current
-        ) {
-          if (active) {
-            setStatus('Koppelen geannuleerd op de terminal.');
-          }
-        }
-      },
-      () => {
-        if (active) {
-          setStatus('Fout bij realtime luisteren naar Firebase.');
-        }
-      }
-    );
-
     return () => {
       active = false;
-      unsub();
+      if (unsub) unsub();
+      if (lockAcquiredRef.current) {
+        lockAcquiredRef.current = false;
+        releaseHardwareTerminalIfOwned(claimTokenRef.current, currentTerminal).catch(() => {});
+      }
     };
-  }, [username]);
+  }, [username, terminalId]);
 
   const handleManualSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -191,7 +238,10 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
   };
 
   const handleClose = () => {
-    setHardwareTerminalIdle().catch(() => {});
+    if (lockAcquiredRef.current) {
+      lockAcquiredRef.current = false;
+      releaseHardwareTerminalIfOwned(claimTokenRef.current, terminalIdRef.current).catch(() => {});
+    }
     onClose();
   };
 
@@ -217,6 +267,19 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
             )}
           </p>
         </div>
+
+        <TerminalSelector
+          compact
+          disabled={saving || Boolean(linkedUid)}
+          value={terminalId}
+          onChange={(next) => {
+            if (lockAcquiredRef.current) {
+              lockAcquiredRef.current = false;
+              releaseHardwareTerminalIfOwned(claimTokenRef.current, terminalIdRef.current).catch(() => {});
+            }
+            setTerminalId(next);
+          }}
+        />
 
         {/* Koppelmodus: Hoofdpas vervangen vs Extra Tag toevoegen */}
         {!linkedUid && (
@@ -282,10 +345,30 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
             <AlertTriangle className="w-7 h-7 text-rose-400" />
           ) : linkedUid ? (
             <CheckCircle2 className="w-8 h-8 text-emerald-400" />
+          ) : !terminalId ? (
+            <Radio className="w-7 h-7 text-amber-400" />
           ) : (
             <Loader2 className="w-7 h-7 animate-spin text-purple-400" />
           )}
           <span>{saveError || status}</span>
+          {saveError && (saveError.toLowerCase().includes('bezig') || saveError.toLowerCase().includes('bezet')) && (
+            <button
+              type="button"
+              onClick={async () => {
+                const currentTerm = terminalIdRef.current;
+                await setHardwareTerminalIdle(currentTerm).catch(() => {});
+                setSaveError(null);
+                const retryRes = await claimHardwareTerminalLinkMode(username, claimTokenRef.current, currentTerm);
+                if (retryRes.acquired) {
+                  lockAcquiredRef.current = true;
+                  setStatus(`📡 Scan nu de NFC pas op pinapparaat (${currentTerm})...`);
+                }
+              }}
+              className="mt-1 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-sans font-bold text-xs"
+            >
+              Forceer Vrijgeven &amp; Opnieuw Scannen
+            </button>
+          )}
         </div>
 
         {/* Handmatige invoer toggle */}

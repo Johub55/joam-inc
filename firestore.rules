@@ -43,7 +43,7 @@ service cloud.firestore {
           'updatedAt'
         ])
         && isStrLen(data.status, 32)
-        && data.status in ['IDLE', 'LINK', 'CARD_SCANNED', 'LINKED', 'PAY', 'SUBMITTED', 'APPROVED', 'DECLINED']
+        && data.status in ['IDLE', 'LINK', 'CARD_SCANNED', 'LINKED', 'PAY', 'SUBMITTED', 'APPROVED', 'DECLINED', 'CHECK_CARD', 'CHECK_RESULT']
         && isStrLen(data.updatedAt, 64)
         && (!('username' in data) || isStrLen(data.username, 100))
         && (!('amount' in data) || isNumRange(data.amount, 0, 100000))

@@ -15,8 +15,10 @@ export interface FlasherCapabilities {
 export interface PicoWifiConfig {
   ssid: string;
   password: string;
+  terminalId?: string;
   nfcBus?: 'i2c' | 'spi';
   lcdAddress?: '0x27' | '0x3F' | 'auto';
+  skipWifiPatch?: boolean;
 }
 
 export interface SavedWifiProfile {
@@ -76,7 +78,7 @@ export function saveWifiProfile(profile: Omit<SavedWifiProfile, 'savedAt'>): Sav
   const next: SavedWifiProfile[] = [
     {
       ssid: cleanSsid,
-      password: profile.password,
+      password: profile.password || '',
       lcdAddress: profile.lcdAddress || 'auto',
       savedAt: new Date().toISOString()
     },
@@ -99,10 +101,15 @@ export function removeWifiProfile(ssid: string): SavedWifiProfile[] {
 }
 
 export function validateWifiCredentials(cfg: PicoWifiConfig): void {
+  if (cfg.skipWifiPatch) {
+    return;
+  }
   const encoder = new TextEncoder();
   const cleanSsid = (cfg.ssid || '').trim();
   if (!cleanSsid) {
-    throw new Error('Vul eerst je WiFi-naam (SSID) in voordat je de C++ .UF2 flasht.');
+    throw new Error(
+      'Vul je WiFi-naam (SSID) in, kies een opgeslagen profiel, of vink "Basis .UF2 zonder WiFi" aan.'
+    );
   }
   const ssidBytes = encoder.encode(cleanSsid).length;
   if (ssidBytes > 63) {
@@ -156,12 +163,29 @@ export function detectFlasherCapabilities(): FlasherCapabilities {
  */
 export function generateConfiguredPicoIno(cfg: PicoWifiConfig): { code: string; filename: string } {
   const baseCode = cfg.nfcBus === 'spi' ? PICO_W_SKETCH_CODE : PICO_W_I2C_NFC_SKETCH_CODE;
-  const safeSsid = (cfg.ssid || 'JOUW_WIFI_NAAM').replace(/"/g, '\\"');
-  const safePass = (cfg.password || 'JOUW_WIFI_WACHTWOORD').replace(/"/g, '\\"');
+  const cleanSsid = (cfg.ssid || '').trim();
+  const safeSsid = (cleanSsid || 'JOUW_WIFI_NAAM').replace(/"/g, '\\"');
+  const safePass = (cfg.password ?? (cleanSsid ? '' : 'JOUW_WIFI_WACHTWOORD')).replace(/"/g, '\\"');
+  const cleanTerminalId = (cfg.terminalId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 30);
+  if (!cleanTerminalId) {
+    throw new Error('Stel eerst zelf een Pinapparaat Terminal-ID in voordat je de .INO downloadt.');
+  }
+
+  if (cleanSsid) {
+    saveWifiProfile({
+      ssid: cleanSsid,
+      password: cfg.password || '',
+      lcdAddress: cfg.lcdAddress || 'auto'
+    });
+  }
 
   let patched = baseCode
     .replace(/const char\*\s+ssid\s*=\s*"[^"]*";/, `const char* ssid = "${safeSsid}";`)
-    .replace(/const char\*\s+password\s*=\s*"[^"]*";/, `const char* password = "${safePass}";`);
+    .replace(/const char\*\s+password\s*=\s*"[^"]*";/, `const char* password = "${safePass}";`)
+    .replace(/const char\*\s+terminalId\s*=\s*"[^"]*";/, `const char* terminalId = "${cleanTerminalId}";`);
 
   if (cfg.lcdAddress === '0x3F') {
     patched = patched.replace(/LiquidCrystal_I2C lcd\(0x27,\s*16,\s*2\);/, 'LiquidCrystal_I2C lcd(0x3F, 16, 2);');
@@ -171,8 +195,8 @@ export function generateConfiguredPicoIno(cfg: PicoWifiConfig): { code: string; 
     code: patched,
     filename:
       cfg.nfcBus === 'spi'
-        ? 'WerkPay_PicoW_SPI_Terminal.ino'
-        : 'WerkPay_PicoW_I2C_NFC_Terminal.ino'
+        ? `WerkPay_PicoW_SPI_${cleanTerminalId}.ino`
+        : `WerkPay_PicoW_I2C_${cleanTerminalId}.ino`
   };
 }
 
@@ -241,15 +265,17 @@ export function patchCppUf2Firmware(uf2Buffer: ArrayBuffer, cfg: PicoWifiConfig)
   const passIdx = findAsciiSubarray(flatPayload, PASS_MARKER);
   const lcdIdx = findAsciiSubarray(flatPayload, LCD_MARKER);
 
-  if (ssidIdx === -1 || passIdx === -1) {
-    throw new Error(
-      'C++ firmware mist de WiFi-configuratieslots. Download in dat geval het gevulde .INO bestand hieronder.'
-    );
-  }
+  if (!cfg.skipWifiPatch) {
+    if (ssidIdx === -1 || passIdx === -1) {
+      throw new Error(
+        'C++ firmware mist de WiFi-configuratieslots. Download in dat geval het gevulde .INO bestand hieronder.'
+      );
+    }
 
-  const cleanSsid = (cfg.ssid || '').trim();
-  writeFixedCString(flatPayload, ssidIdx, 64, cleanSsid);
-  writeFixedCString(flatPayload, passIdx, 64, cfg.password || '');
+    const cleanSsid = (cfg.ssid || '').trim();
+    writeFixedCString(flatPayload, ssidIdx, 64, cleanSsid);
+    writeFixedCString(flatPayload, passIdx, 64, cfg.password || '');
+  }
 
   if (lcdIdx !== -1) {
     const lcdVal =
@@ -270,7 +296,7 @@ export function patchCppUf2Firmware(uf2Buffer: ArrayBuffer, cfg: PicoWifiConfig)
 
 /**
  * Haalt de gecompileerde C++ Pico W .UF2 firmware op (GitHub Pages subpath-safe)
- * en injecteert direct jouw WiFi-gegevens.
+ * en injecteert direct jouw WiFi-gegevens (tenzij skipWifiPatch actief is).
  */
 export async function buildConfiguredCppUf2Blob(
   cfg: PicoWifiConfig,
@@ -308,19 +334,34 @@ export async function buildConfiguredCppUf2Blob(
     throw new Error(`C++ .UF2 firmware kon niet worden geladen (HTTP ${lastStatus || 404}).`);
   }
 
-  onLog(`📦 Base C++ .UF2 geladen (${(rawBuf.byteLength / 1024).toFixed(0)} KB). WiFi invullen...`);
+  onLog(`📦 Base C++ .UF2 geladen (${(rawBuf.byteLength / 1024).toFixed(0)} KB).`);
 
   const patchedBuf = patchCppUf2Firmware(rawBuf, cfg);
-  onLog(`✓ WiFi "${cfg.ssid.trim()}" ingebakken in de C++ binary.`);
+  if (cfg.skipWifiPatch) {
+    onLog('ℹ️ Basis C++ .UF2 zonder ingebakken WiFi klaargezet.');
+  } else {
+    const cleanSsid = cfg.ssid.trim();
+    saveWifiProfile({
+      ssid: cleanSsid,
+      password: cfg.password || '',
+      lcdAddress: cfg.lcdAddress || 'auto'
+    });
+    onLog(
+      cfg.password
+        ? `✓ WiFi "${cleanSsid}" ingebakken en opgeslagen in je browser-profielen.`
+        : `✓ Open WiFi "${cleanSsid}" (zonder wachtwoord) ingebakken in C++ binary.`
+    );
+  }
 
   return {
     blob: new Blob([patchedBuf], { type: 'application/octet-stream' }),
-    filename: 'WerkPay_PicoW_Cpp.uf2'
+    filename: cfg.skipWifiPatch ? 'WerkPay_PicoW_Base.uf2' : 'WerkPay_PicoW_Cpp.uf2'
   };
 }
 
 /**
- * 1-Stap Flashen (Desktop Chrome/Edge): Schrijft de gepatchte C++ .UF2 direct naar de RPI-RP2 schijf
+ * 1-Stap Flashen (Desktop Chrome/Edge): Schrijft de gepatchte C++ .UF2 direct naar de RPI-RP2 schijf.
+ * Als Chrome/Edge root-toegang tot de USB-schijf blokkeert, schakelt hij automatisch over op directe download.
  */
 export async function flashCppUf2ViaDirectoryPicker(
   cfg: PicoWifiConfig,
@@ -328,22 +369,42 @@ export async function flashCppUf2ViaDirectoryPicker(
 ): Promise<void> {
   const picker = (window as any).showDirectoryPicker;
   if (typeof picker !== 'function') {
-    throw new Error(
-      'Deze browser ondersteunt geen directe schijf-toegang. Gebruik "Download C++ .UF2" en kopieer naar RPI-RP2.'
-    );
+    onLog('ℹ️ Directe schijftoegang niet ondersteund in deze browser -> download wordt gestart...');
+    await exportCppUf2ForMobileOrDownload(cfg, onLog, false);
+    return;
   }
 
   const { blob, filename } = await buildConfiguredCppUf2Blob(cfg, onLog);
   onLog('📂 Selecteer nu in het pop-up venster de USB-schijf "RPI-RP2" (BOOTSEL)...');
-  const dirHandle = await picker({ mode: 'readwrite' });
 
-  onLog(`💾 Echte C++ firmware (${filename}) flashen naar "${dirHandle.name}"...`);
-  const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(blob);
-  await writable.close();
-
-  onLog('✅ KLAAR! C++ .UF2 is geflasht. De Pico W herstart nu automatisch en verbindt met WiFi!');
+  try {
+    const dirHandle = await picker({ mode: 'readwrite' });
+    onLog(`💾 Echte C++ firmware (${filename}) flashen naar "${dirHandle.name}"...`);
+    const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    onLog('✅ KLAAR! C++ .UF2 is geflasht. De Pico W herstart nu automatisch en verbindt met WiFi!');
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Mapkeuze geannuleerd.');
+    }
+    // Chrome/Edge blocks root folder writes to removable drives (e.g. SecurityError / NotAllowedError)
+    onLog(
+      `⚠️ Browser blokkeerde directe USB-schrijf ("${err?.name || 'Toegang geweigerd'}"). Automatisch overschakelen naar download...`
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    onLog(
+      `✅ ${filename} gedownload! Sleep dit bestand handmatig naar de USB-schijf "RPI-RP2" in Verkenner/Finder.`
+    );
+  }
 }
 
 /**
@@ -388,6 +449,158 @@ export async function exportCppUf2ForMobileOrDownload(
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 10000);
   onLog(`✅ ${filename} gedownload! Kopieer dit bestand naar de "RPI-RP2" schijf van je Pico W.`);
+}
+
+/**
+ * Stuurt WiFi-naam en wachtwoord live via USB WebSerial naar een geflashte Pico W (.INO v2+ met EEPROM).
+ * Zo hoef je de Pico NIET meer opnieuw te flashen als je op een ander WiFi-netwerk gaat!
+ */
+export async function sendWifiOverWebSerial(
+  ssid: string,
+  password: string,
+  onLog: (msg: string) => void,
+  terminalId?: string
+): Promise<void> {
+  const serial = (navigator as any).serial;
+  if (!serial) {
+    throw new Error('WebSerial werkt alleen op desktop/Android in Chrome of Edge via HTTPS.');
+  }
+  const cleanSsid = ssid.trim();
+  if (!cleanSsid) {
+    throw new Error('Vul eerst een WiFi-naam (SSID) in om via USB te versturen.');
+  }
+  const safeTid = terminalId
+    ? terminalId.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30)
+    : '';
+
+  onLog('🔌 Selecteer de USB-poort van je aangesloten Pico W (normale modus, NIET BOOTSEL)...');
+  const port = await serial.requestPort();
+  await port.open({ baudRate: 115200 });
+
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+
+  try {
+    writer = port.writable.getWriter();
+    const payload = `SET_WIFI:${cleanSsid}\t${password || ''}${safeTid ? `\t${safeTid}` : ''}\n`;
+    await writer.write(new TextEncoder().encode(payload));
+    writer.releaseLock();
+    writer = null;
+
+    saveWifiProfile({
+      ssid: cleanSsid,
+      password: password || '',
+      lcdAddress: 'auto'
+    });
+    onLog(
+      `📤 WiFi "${cleanSsid}"${safeTid ? ` (Terminal: ${safeTid})` : ''} verstuurd via USB. Wachten op reactie van Pico W...`
+    );
+
+    if (port.readable) {
+      reader = port.readable.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      const deadline = Date.now() + 2500;
+      while (Date.now() < deadline) {
+        const res = await Promise.race([
+          reader.read(),
+          new Promise<{ value: undefined; done: true }>((resolve) =>
+            setTimeout(() => resolve({ value: undefined, done: true }), 400)
+          )
+        ]);
+        if (res.done || !res.value) break;
+        buf += decoder.decode(res.value, { stream: true });
+        if (buf.includes('WIFI_SAVED')) break;
+      }
+      const lines = buf
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      for (const l of lines) {
+        onLog(`Pico > ${l}`);
+      }
+    }
+    onLog('✅ WiFi-gegevens verzonden over USB! (Werkt met de nieuwe .INO firmware.)');
+  } finally {
+    try {
+      if (writer) writer.releaseLock();
+    } catch {}
+    try {
+      if (reader) {
+        await reader.cancel();
+        reader.releaseLock();
+      }
+    } catch {}
+    try {
+      await port.close();
+    } catch {}
+  }
+}
+
+/**
+ * Stuurt alleen een Terminal-ID via USB WebSerial naar een reeds geconfigureerde Pico W (.INO v2+).
+ */
+export async function sendTerminalIdOverWebSerial(
+  terminalId: string,
+  onLog: (msg: string) => void
+): Promise<void> {
+  const serial = (navigator as any).serial;
+  if (!serial) {
+    throw new Error('WebSerial werkt alleen op desktop/Android in Chrome of Edge via HTTPS.');
+  }
+  const safeTid = terminalId.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30);
+  if (!safeTid) {
+    throw new Error('Stel eerst zelf een Pinapparaat Terminal-ID in.');
+  }
+
+  onLog(`🔌 Selecteer de USB-poort van je Pico W om Terminal-ID "${safeTid}" in te stellen...`);
+  const port = await serial.requestPort();
+  await port.open({ baudRate: 115200 });
+
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+
+  try {
+    writer = port.writable.getWriter();
+    await writer.write(new TextEncoder().encode(`SET_TERM:${safeTid}\n`));
+    writer.releaseLock();
+    writer = null;
+
+    if (port.readable) {
+      reader = port.readable.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        const res = await Promise.race([
+          reader.read(),
+          new Promise<{ value: undefined; done: true }>((resolve) =>
+            setTimeout(() => resolve({ value: undefined, done: true }), 400)
+          )
+        ]);
+        if (res.done || !res.value) break;
+        buf += decoder.decode(res.value, { stream: true });
+        if (buf.includes('TERM_SAVED')) break;
+      }
+      for (const l of buf.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)) {
+        onLog(`Pico > ${l}`);
+      }
+    }
+    onLog(`✅ Terminal-ID "${safeTid}" opgeslagen op de Pico W!`);
+  } finally {
+    try {
+      if (writer) writer.releaseLock();
+    } catch {}
+    try {
+      if (reader) {
+        await reader.cancel();
+        reader.releaseLock();
+      }
+    } catch {}
+    try {
+      await port.close();
+    } catch {}
+  }
 }
 
 /**

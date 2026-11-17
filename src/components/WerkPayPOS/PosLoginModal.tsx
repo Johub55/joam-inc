@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { ORDER_KIOSK_USER } from '../../services/store';
-import { ShieldCheck, User, Lock, X, LogIn, Sparkles, CheckCircle2, AlertCircle, ShoppingBag } from 'lucide-react';
+import { PicoCardLoginPanel } from '../PicoCardLoginPanel';
+import { ShieldCheck, User, Lock, X, LogIn, Sparkles, CheckCircle2, AlertCircle, ShoppingBag, Radio } from 'lucide-react';
 
 interface PosLoginModalProps {
   onClose: () => void;
@@ -10,6 +11,7 @@ interface PosLoginModalProps {
 
 export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess }) => {
   const { loginPos, setCurrentPosUser } = useApp();
+  const [loginTab, setLoginTab] = useState<'credentials' | 'terminal'>('credentials');
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [error, setError] = useState<string>('');
@@ -77,61 +79,97 @@ export const PosLoginModal: React.FC<PosLoginModalProps> = ({ onClose, onSuccess
             </p>
           </div>
 
-          <div className="relative flex py-1 items-center">
-            <div className="flex-grow border-t border-slate-800"></div>
-            <span className="flex-shrink mx-3 text-[10px] text-slate-500 font-bold uppercase tracking-wider">
-              Inloggen op POS / Kassa
-            </span>
-            <div className="flex-grow border-t border-slate-800"></div>
+          {/* Login method tabs */}
+          <div className="grid grid-cols-2 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs font-bold">
+            <button
+              type="button"
+              onClick={() => {
+                setLoginTab('credentials');
+                setError('');
+              }}
+              className={`py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition ${
+                loginTab === 'credentials'
+                  ? 'bg-blue-600 text-white shadow font-black'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <User className="w-3.5 h-3.5" />
+              <span>Wachtwoord</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLoginTab('terminal');
+                setError('');
+              }}
+              className={`py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition ${
+                loginTab === 'terminal'
+                  ? 'bg-cyan-500 text-slate-950 shadow font-black'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>Pinapparaat (NFC)</span>
+            </button>
           </div>
 
-          <form onSubmit={handleSubmit} className="space-y-3.5 text-xs">
-            <div>
-              <label className="text-slate-300 font-bold block mb-1 flex items-center gap-1.5">
-                <User className="w-3.5 h-3.5 text-slate-400" />
-                Gebruikersnaam
-              </label>
-              <input
-                type="text"
-                required
-                value={username}
-                onChange={e => setUsername(e.target.value)}
-                placeholder="Voer medewerker gebruikersnaam in..."
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-blue-500"
-              />
-            </div>
-
-            <div>
-              <label className="text-slate-300 font-bold block mb-1 flex items-center gap-1.5">
-                <Lock className="w-3.5 h-3.5 text-slate-400" />
-                Wachtwoord of Pincode
-              </label>
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
-              />
-            </div>
-
-            {error && (
-              <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-300 text-xs flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
-                <span>{error}</span>
+          {loginTab === 'credentials' ? (
+            <form onSubmit={handleSubmit} className="space-y-3.5 text-xs">
+              <div>
+                <label className="text-slate-300 font-bold block mb-1 flex items-center gap-1.5">
+                  <User className="w-3.5 h-3.5 text-slate-400" />
+                  Gebruikersnaam
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  placeholder="Voer medewerker gebruikersnaam in..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-blue-500"
+                />
               </div>
-            )}
 
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-black text-sm flex items-center justify-center gap-2 transition shadow-lg shadow-blue-600/20"
-            >
-              <LogIn className="w-4 h-4" />
-              <span>{isSubmitting ? 'Bezig met verifiëren...' : 'Inloggen als Medewerker'}</span>
-            </button>
-          </form>
+              <div>
+                <label className="text-slate-300 font-bold block mb-1 flex items-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-slate-400" />
+                  Wachtwoord of Pincode
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              {error && (
+                <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-300 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-black text-sm flex items-center justify-center gap-2 transition shadow-lg shadow-blue-600/20"
+              >
+                <LogIn className="w-4 h-4" />
+                <span>{isSubmitting ? 'Bezig met verifiëren...' : 'Inloggen als Medewerker'}</span>
+              </button>
+            </form>
+          ) : (
+            <PicoCardLoginPanel
+              mode="pos"
+              onSuccess={() => {
+                if (onSuccess) onSuccess();
+                onClose();
+              }}
+            />
+          )}
 
           <p className="text-[11px] text-slate-500 text-center leading-relaxed">
             Medewerker accounts worden veilig beheerd in Firebase Cloud. Wachtwoorden worden nooit publiekelijk op het scherm getoond.
