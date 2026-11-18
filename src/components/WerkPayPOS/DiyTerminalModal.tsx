@@ -10,7 +10,6 @@ import { showToast } from '../../services/appToast';
 import { useApp } from '../../context/AppContext';
 import { findLoyaltyCustomerByPhoneOrName } from '../../services/loyalty';
 import { accountMatchesUid } from '../../services/store';
-import { PicoFlasherPanel } from './PicoFlasherPanel';
 import { 
   Cpu, 
   Usb, 
@@ -27,8 +26,7 @@ import {
   HelpCircle,
   Smartphone,
   Info,
-  ShieldAlert,
-  Zap
+  ShieldAlert
 } from 'lucide-react';
 
 interface DiyTerminalModalProps {
@@ -45,7 +43,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   const [logs, setLogs] = useState<string[]>([]);
   const [copied, setCopied] = useState<boolean>(false);
   const [downloaded, setDownloaded] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<'flasher' | 'connect' | 'code' | 'wiring' | 'guide' | 'simulator'>('flasher');
+  const [activeTab, setActiveTab] = useState<'code' | 'wiring' | 'guide' | 'connect' | 'simulator'>('code');
 
   // Simulator State
   const [simLcdLine1, setSimLcdLine1] = useState<string>('WerkPay Terminal');
@@ -345,20 +343,20 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
         <div className="px-5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center gap-2 text-xs font-bold overflow-x-auto">
           <button
             type="button"
-            onClick={() => setActiveTab('flasher')}
+            onClick={() => setActiveTab('code')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
-              activeTab === 'flasher' ? 'bg-emerald-500 text-slate-950 font-black shadow' : 'text-emerald-400 hover:bg-emerald-950/50 border border-emerald-500/30'
+              activeTab === 'code' ? 'bg-cyan-500 text-slate-950 font-black shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
-            <Zap className="w-3.5 h-3.5" />
-            <span>⚡ Pico W Flashen (USB / Mobiel)</span>
+            <Cpu className="w-3.5 h-3.5" />
+            <span>{selectedBoard === 'pico_w' ? 'Pico W .INO Code' : 'Arduino .INO Code'}</span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('wiring')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
-              activeTab === 'wiring' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
+              activeTab === 'wiring' ? 'bg-cyan-500 text-slate-950 font-black shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
@@ -369,7 +367,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
             type="button"
             onClick={() => setActiveTab('guide')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
-              activeTab === 'guide' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
+              activeTab === 'guide' ? 'bg-cyan-500 text-slate-950 font-black shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
             <HelpCircle className="w-3.5 h-3.5" />
@@ -378,20 +376,9 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
 
           <button
             type="button"
-            onClick={() => setActiveTab('code')}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
-              activeTab === 'code' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
-            }`}
-          >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>{selectedBoard === 'pico_w' ? 'Pico W .INO Code' : 'Arduino .INO Code'}</span>
-          </button>
-
-          <button
-            type="button"
             onClick={() => setActiveTab('connect')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
-              activeTab === 'connect' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
+              activeTab === 'connect' ? 'bg-cyan-500 text-slate-950 font-black shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
             <Usb className="w-3.5 h-3.5" />
@@ -402,7 +389,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
             type="button"
             onClick={() => setActiveTab('simulator')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl transition whitespace-nowrap ${
-              activeTab === 'simulator' ? 'bg-cyan-500 text-slate-950 shadow' : 'text-slate-400 hover:bg-slate-800'
+              activeTab === 'simulator' ? 'bg-cyan-500 text-slate-950 font-black shadow' : 'text-slate-400 hover:bg-slate-800'
             }`}
           >
             <Smartphone className="w-3.5 h-3.5" />
@@ -412,11 +399,6 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
 
         {/* Tab Content */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
-
-          {/* TAB: INGEBOUWDE PICO W FLASHER */}
-          {activeTab === 'flasher' && (
-            <PicoFlasherPanel />
-          )}
           
           {/* TAB: WIRING */}
           {activeTab === 'wiring' && (
@@ -790,16 +772,24 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                 <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
                   <div className="flex items-center gap-2 text-cyan-400 font-bold">
                     <span className="w-5 h-5 rounded-full bg-cyan-500/20 flex items-center justify-center text-xs">3</span>
-                    <span>De 3 benodigde Libraries installeren</span>
+                    <span>De benodigde Libraries installeren</span>
                   </div>
                   <p className="text-slate-300">
                     Klik links op het <strong>Library Manager icoontje</strong> (stapel boeken) en zoek &amp; installeer:
                   </p>
-                  <ul className="list-disc list-inside space-y-1 text-slate-300 pl-1 font-mono text-[11px]">
-                    <li><strong className="text-white font-sans">LiquidCrystal I2C</strong> (door Frank de Brabander of Marco Schwartz)</li>
-                    <li><strong className="text-white font-sans">MFRC522</strong> (door GithubCommunity)</li>
-                    <li><strong className="text-white font-sans">Keypad</strong> (door Mark Stanley, Alexander Brevig)</li>
-                  </ul>
+                  {selectedBoard === 'pico_w' && nfcMode === 'i2c' ? (
+                    <ul className="list-disc list-inside space-y-1 text-slate-300 pl-1 font-mono text-[11px]">
+                      <li><strong className="text-white font-sans">LiquidCrystal I2C</strong> (door Frank de Brabander of Marco Schwartz)</li>
+                      <li><strong className="text-white font-sans">Adafruit PN532</strong> (door Adafruit)</li>
+                      <li><strong className="text-white font-sans">ArduinoJson</strong> (door Benoit Blanchon)</li>
+                    </ul>
+                  ) : (
+                    <ul className="list-disc list-inside space-y-1 text-slate-300 pl-1 font-mono text-[11px]">
+                      <li><strong className="text-white font-sans">LiquidCrystal I2C</strong> (door Frank de Brabander of Marco Schwartz)</li>
+                      <li><strong className="text-white font-sans">MFRC522</strong> (door GithubCommunity)</li>
+                      <li><strong className="text-white font-sans">Keypad</strong> (door Mark Stanley, Alexander Brevig)</li>
+                    </ul>
+                  )}
                 </div>
 
                 {/* Stap 4 */}
@@ -836,6 +826,18 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           {/* TAB: CODE */}
           {activeTab === 'code' && (
             <div className="space-y-3">
+              {selectedBoard === 'pico_w' && nfcMode === 'i2c' && (
+                <div className="p-3.5 rounded-2xl bg-cyan-950/30 border border-cyan-500/35 text-xs text-slate-200 space-y-1">
+                  <div className="font-black text-cyan-300 flex items-center gap-1.5">
+                    <Info className="w-4 h-4 shrink-0" />
+                    <span>WiFi &amp; Terminal-ID zelf instellen (zonder wachtwoord in de website)</span>
+                  </div>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Kopieer of download de code voor <strong>Arduino IDE v2</strong>. Vul bovenaan in de code zelf <code className="text-cyan-300 font-mono">ssid</code>, <code className="text-cyan-300 font-mono">password</code> en <code className="text-cyan-300 font-mono">terminalId</code> in — óf upload zonder WiFi en verbind daarna via de tijdelijke Pico-hotspot <code className="text-white font-bold">WerkPay-Setup</code> op <code className="text-white font-mono">192.168.4.1</code>.
+                  </p>
+                </div>
+              )}
+
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <span className="text-xs font-bold text-slate-300 flex items-center gap-2">
                   <span>Code voor {selectedBoard === 'pico_w' ? 'Raspberry Pi Pico W' : 'Arduino Uno/Nano'}:</span>

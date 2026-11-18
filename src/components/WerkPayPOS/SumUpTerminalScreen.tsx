@@ -18,7 +18,6 @@ import {
 import { findLoyaltyCustomerByPhoneOrName } from '../../services/loyalty';
 import { terminalManager, TerminalCallbacks } from '../../services/terminalService';
 import { DiyTerminalModal } from './DiyTerminalModal';
-import { PicoFlasherPanel } from './PicoFlasherPanel';
 import { LinkCardModal } from './LinkCardModal';
 import { TerminalSelector } from './TerminalSelector';
 import { generateGiftCardCode } from '../../services/discountService';
@@ -52,7 +51,6 @@ import {
   ShoppingBag,
   Gift,
   Share2,
-  Zap,
   Link2,
   Volume2,
   VolumeX,
@@ -185,11 +183,10 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   const [showGiftSection, setShowGiftSection] = useState<boolean>(false);
   const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
 
-  // Tools: Card balance checker, DIY Terminal Modal, Inline Flasher, Quick Products, Orders & Gift cards
+  // Tools: Card balance checker, DIY Terminal Modal, Quick Products, Orders & Gift cards
   const [toolSearch, setToolSearch] = useState<string>('');
   const [customTopUpAmt, setCustomTopUpAmt] = useState<string>('10');
   const [showDiyModal, setShowDiyModal] = useState<boolean>(false);
-  const [showInlineFlasher, setShowInlineFlasher] = useState<boolean>(false);
   const [linkCardTargetUsername, setLinkCardTargetUsername] = useState<string | null>(null);
   const [showProductDrawer, setShowProductDrawer] = useState<boolean>(false);
   const [productSearch, setProductSearch] = useState<string>('');
@@ -1868,7 +1865,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                         <span>Pico W Pinapparaat (Cloud Relay)</span>
                       </h3>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        Multi-Terminal status in Firebase, directe reset, B-knop Saldo Check &amp; USB/Mobiele flasher.
+                        Multi-Terminal status in Firebase, directe reset, B-knop Saldo Check &amp; .INO broncode.
                       </p>
                     </div>
                     <span className={`px-2.5 py-1 rounded-lg text-xs font-mono font-black border ${
@@ -1912,24 +1909,11 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
 
                     <button
                       type="button"
-                      onClick={() => setShowInlineFlasher(p => !p)}
-                      className={`flex-1 min-w-[160px] py-2.5 px-3 rounded-xl border font-black text-xs flex items-center justify-center gap-1.5 transition ${
-                        showInlineFlasher
-                          ? 'bg-emerald-500 text-slate-950 border-emerald-400'
-                          : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/40'
-                      }`}
-                    >
-                      <Zap className="w-4 h-4" />
-                      <span>{showInlineFlasher ? 'Verberg Pi Flasher' : '⚡ Pico W Flashen'}</span>
-                    </button>
-
-                    <button
-                      type="button"
                       onClick={() => setShowDiyModal(true)}
-                      className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center gap-1.5"
+                      className="flex-1 min-w-[160px] py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center gap-1.5"
                     >
                       <Cpu className="w-4 h-4 text-cyan-400" />
-                      <span>Schema / .INO</span>
+                      <span>Pico W Code / Schema (.INO)</span>
                     </button>
                   </div>
 
@@ -2010,12 +1994,6 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                       </div>
                     )}
                   </div>
-
-                  {showInlineFlasher && (
-                    <div className="pt-2 border-t border-slate-800">
-                      <PicoFlasherPanel compact />
-                    </div>
-                  )}
                 </div>
 
                 {/* NFC Saldo Check, Pas Koppelen & Direct Opwaarderen */}

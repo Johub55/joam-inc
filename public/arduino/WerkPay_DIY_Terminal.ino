@@ -2,15 +2,18 @@
  * ==============================================================================
  *  WERKPAY - DIY PINAPPARAAT (RASPBERRY PI PICO W + FIREBASE CLOUD RELAY)
  * ==============================================================================
- *  - Multi-Terminal support (eigen Terminal-ID zelf instellen via Website/USB/AP)
- *  - Werkt voor Betalingen, NFC Pas-Login, Vergrendelen & Snelle Saldo/Coins Check (B-toets)
- *  - Slaat WiFi & Terminal-ID op in EEPROM: instellen kan via WerkPay-Setup AP (192.168.4.1)
- *    óf direct via USB vanuit de website ("Stuur WiFi / Terminal via USB")!
- *  - Ghost-toets vrije keypad scanner + schone Keep-Alive HTTPS client
- *  - Exacte hardware pinout:
- *      LCD & PN532 NFC (I2C): SDA = GP4, SCL = GP5 (PN532 IRQ=-1, RESET=-1)
- *      4x4 Matrix Keypad    : Rijen = {13, 12, 11, 10}, Kolommen = {9, 8, 7, 6}
- *      Buzzer               : GP14
+ *  - Multi-Terminal support (eigen Terminal-ID zelf instellen via code / AP / USB)
+ *  - Werkt voor Betalingen, NFC Pas-Login, Vergrendelen & Snelle Saldo Check (B)
+ *  - Slaat WiFi & Terminal-ID op in EEPROM: vul ze direct in bovenaan de .INO
+ *    of stel ze draadloos in via de hotspot WerkPay-Setup (192.168.4.1)
+ *  - Vereiste Arduino Libraries (Library Manager):
+ *      1. LiquidCrystal I2C (Frank de Brabander / Marco Schwartz)
+ *      2. Adafruit PN532 (Adafruit)
+ *      3. ArduinoJson (Benoit Blanchon - versie 7+)
+ *  - Exacte hardware pinout (Raspberry Pi Pico W):
+ *      LCD (0x27) & PN532 (I2C): SDA = GP4, SCL = GP5 (IRQ=-1, RESET=-1)
+ *      4x4 Matrix Keypad       : Rijen = {13, 12, 11, 10}, Kolommen = {9, 8, 7, 6}
+ *      Buzzer                  : GP14
  * ==============================================================================
  */
 
@@ -70,10 +73,10 @@ const byte ROWS = 4;
 const byte COLS = 4;
 
 char hexaKeys[ROWS][COLS] = {
-  {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
 };
 
 byte rowPins[ROWS] = {13, 12, 11, 10};
@@ -110,6 +113,38 @@ unsigned long lastPollMs = 0;
 
 WiFiClientSecure secureClient;
 
+// --- EXPLICIETE FUNCTIE-DECLARATIES (VOORKOMT ARDUINO IDE PROTOTYPE FOUTEN) ---
+String getFirestoreDocUrl();
+String sanitizeTerminalId(const String& raw);
+String escapeHtmlAttr(const String& raw);
+void beep(int freq, int ms);
+String pad16(const String& s);
+void lcdShow(const String& line1, const String& line2);
+String formatShortReason(const String& rawReason);
+void saveConfigToEeprom(const String& newSsid, const String& newPass, const String& newTermId);
+void loadWifiConfig();
+void handlePortalRoot();
+void handlePortalSave();
+void startApSetupPortal();
+bool connectWifiBlocking(int maxTries);
+void handleSerialCommands();
+void setIdleScreen();
+void toonPincodeScherm();
+void updatePinDisplay();
+char scanKeypad();
+bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload);
+bool patchFirestore(const String& maskQuery, const JsonDocument& doc);
+void patchStatusIdle(const String& reason = "");
+void patchCardScanned(const String& uid);
+void patchCheckCard(const String& uid);
+void patchPaymentSubmitted(const String& uid, const String& pin);
+void annuleerDirect();
+void simuleerBonPrinten();
+void startBalanceCheckState();
+void startLinkingState(const String& user);
+void startPayState(double amt, const String& ordNo, const String& payUser);
+void pollFirestore();
+
 String getFirestoreDocUrl() {
   if (activeTerminalId.length() == 0) return String("");
   return String(FIRESTORE_DOC_BASE) + activeTerminalId + "?key=" + String(FIRESTORE_API_KEY);
@@ -125,6 +160,16 @@ String sanitizeTerminalId(const String& raw) {
       out += '_';
     }
   }
+  return out;
+}
+
+String escapeHtmlAttr(const String& raw) {
+  String out = raw;
+  out.replace("&", "&amp;");
+  out.replace("'", "&#39;");
+  out.replace("\"", "&quot;");
+  out.replace("<", "&lt;");
+  out.replace(">", "&gt;");
   return out;
 }
 
@@ -193,7 +238,9 @@ void loadWifiConfig() {
   WifiPrefsV2 prefsV2;
   EEPROM.get(0, prefsV2);
   if (memcmp(prefsV2.magic, "WPW2", 4) == 0) {
-    if (strlen(prefsV2.terminalId) > 0) {
+    if (strlen(prefsV2.terminalId) > 0 && activeTerminalId.length() == 0) {
+      activeTerminalId = sanitizeTerminalId(String(prefsV2.terminalId));
+    } else if (strlen(prefsV2.terminalId) > 0 && defaultTid.length() == 0) {
       activeTerminalId = sanitizeTerminalId(String(prefsV2.terminalId));
     }
     if (strlen(prefsV2.ssid) > 0) {
@@ -227,10 +274,11 @@ void handlePortalRoot() {
   for (int i = 0; i < n; i++) {
     String net = WiFi.SSID(i);
     if (net.length() > 0) {
-      options += "<option value='" + net + "'>" + net + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+      String safeNet = escapeHtmlAttr(net);
+      options += "<option value='" + safeNet + "'>" + safeNet + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
     }
   }
-  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>WerkPay WiFi & Terminal Setup</title>"
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>WerkPay WiFi &amp; Terminal Setup</title>"
                 "<style>body{font-family:sans-serif;background:#020617;color:#f8fafc;padding:20px;max-width:420px;margin:auto}"
                 "input,select,button{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#fff;box-sizing:border-box}"
                 "label{font-size:12px;color:#94a3b8;font-weight:bold;display:block;margin-top:8px}"
@@ -240,11 +288,11 @@ void handlePortalRoot() {
                 "<label>Gescande WiFi-netwerken</label>"
                 "<select onchange=\"document.getElementById('s').value=this.value\"><option value=''>-- Scan resultaten --</option>" + options + "</select>"
                 "<label>WiFi Naam (SSID)</label>"
-                "<input id='s' name='ssid' placeholder='WiFi Naam (SSID)' required value='" + activeSsid + "'>"
+                "<input id='s' name='ssid' placeholder='WiFi Naam (SSID)' required value='" + escapeHtmlAttr(activeSsid) + "'>"
                 "<label>WiFi Wachtwoord (leeg = open netwerk)</label>"
                 "<input name='pass' type='password' placeholder='WiFi Wachtwoord'>"
                 "<label>Terminal ID (zelf instellen, verplicht)</label>"
-                "<input name='termid' placeholder='Bijv. kassa_1 of bar_links' required value='" + activeTerminalId + "'>"
+                "<input name='termid' placeholder='Bijv. kassa1 of bar1' required value='" + escapeHtmlAttr(activeTerminalId) + "'>"
                 "<button type='submit'>Opslaan &amp; Verbinden</button></form></body></html>";
   setupPortalServer.send(200, "text/html", html);
 }
@@ -261,7 +309,7 @@ void handlePortalSave() {
     return;
   }
   saveConfigToEeprom(s, p, nextTid);
-  setupPortalServer.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#020617;color:#10b981;padding:24px'><h2>Opgeslagen!</h2><p>Terminal <b>" + nextTid + "</b> herstart nu en verbindt met " + s + "...</p></body></html>");
+  setupPortalServer.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#020617;color:#10b981;padding:24px'><h2>Opgeslagen!</h2><p>Terminal <b>" + escapeHtmlAttr(nextTid) + "</b> herstart nu en verbindt met " + escapeHtmlAttr(s) + "...</p></body></html>");
   lcdShow("WiFi Opgeslagen", nextTid);
   delay(800);
   rp2040.reboot();
@@ -276,7 +324,11 @@ void startApSetupPortal() {
   setupPortalServer.on("/save", HTTP_POST, handlePortalSave);
   setupPortalServer.begin();
   Serial.println("[SETUP] Hotspot actief: 'WerkPay-Setup' -> open http://192.168.4.1");
-  lcdShow("WiFi:WerkPay-Set", "IP: 192.168.4.1");
+  if (activeTerminalId.length() == 0 && WiFi.status() == WL_CONNECTED) {
+    lcdShow("Geen Terminal-ID", "AP:192.168.4.1");
+  } else {
+    lcdShow("WiFi:WerkPay-Set", "IP: 192.168.4.1");
+  }
 }
 
 bool connectWifiBlocking(int maxTries) {
@@ -309,6 +361,9 @@ void handleSerialCommands() {
         memset(&empty, 0, sizeof(empty));
         EEPROM.put(0, empty);
         EEPROM.commit();
+        activeSsid = "";
+        activePass = "";
+        activeTerminalId = "";
         Serial.println("WIFI_CLEARED");
       } else if (cmd.startsWith("SET_TERM:")) {
         String newTerm = sanitizeTerminalId(cmd.substring(9));
@@ -352,6 +407,7 @@ void handleSerialCommands() {
             lcdShow("WiFi Verbonden!", WiFi.localIP().toString());
             beep(2400, 120);
             delay(800);
+            setIdleScreen();
           } else {
             Serial.println("WIFI_SAVED:" + activeSsid + " (verbinden mislukt)");
             startApSetupPortal();
@@ -375,7 +431,7 @@ void setIdleScreen() {
   if (apPortalActive && WiFi.status() != WL_CONNECTED) {
     lcdShow("WiFi:WerkPay-Set", "IP: 192.168.4.1");
   } else if (activeTerminalId.length() == 0) {
-    lcdShow("Geen Terminal-ID", "Stel in USB / AP");
+    lcdShow("Geen Terminal-ID", apPortalActive ? "AP:192.168.4.1" : "Stel in USB / AP");
   } else if (betalingGeslaagd) {
     lcdShow("WerkPay Terminal", "D=Bon  B=Saldo");
   } else {
@@ -508,7 +564,7 @@ bool patchFirestore(const String& maskQuery, const JsonDocument& doc) {
   return (code >= 200 && code < 300);
 }
 
-void patchStatusIdle(const String& reason = "") {
+void patchStatusIdle(const String& reason) {
   JsonDocument doc;
   JsonObject fields = doc["fields"].to<JsonObject>();
   fields["status"]["stringValue"] = "IDLE";
@@ -702,21 +758,25 @@ void pollFirestore() {
         line2 += coinsSuffix;
       }
 
-      beep(2400, 80); beep(3000, 140);
+      beep(2400, 80);
+      beep(3000, 140);
       lcdShow(line1, line2);
       patchStatusIdle("Klaar");
       currentState = STATE_SHOW_RESULT;
       stateTimer = millis();
       resultDurationMs = 4500;
     } else if (status == "LINKED") {
-      beep(2200, 100); beep(2800, 180);
+      beep(2200, 100);
+      beep(2800, 180);
       lcdShow(isLoginSession ? "Ingelogd!" : "Pas gekoppeld!", isLoginSession ? "Welkom!" : activeUsername);
       patchStatusIdle("Klaar");
       currentState = STATE_SHOW_RESULT;
       stateTimer = millis();
       resultDurationMs = 2000;
     } else if (status == "APPROVED") {
-      beep(2000, 100); beep(2500, 100); beep(3000, 200);
+      beep(2000, 100);
+      beep(2500, 100);
+      beep(3000, 200);
       if (isLoginSession) {
         lcdShow("Ingelogd!", "Welkom!");
       } else {
@@ -732,7 +792,8 @@ void pollFirestore() {
     } else if (status == "DECLINED") {
       betalingGeslaagd = false;
       String reason = fields["reason"]["stringValue"] | "Geweigerd";
-      beep(700, 220); beep(500, 320);
+      beep(700, 220);
+      beep(500, 320);
       lcdShow("Geweigerd!", formatShortReason(reason));
       patchStatusIdle("Klaar");
       currentState = STATE_SHOW_RESULT;
@@ -760,6 +821,7 @@ void setup() {
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
   Wire.begin();
+  delay(100);
 
   lcd.init();
   lcd.backlight();
@@ -770,6 +832,10 @@ void setup() {
   if (connectWifiBlocking(28)) {
     lcdShow("WiFi Verbonden!", WiFi.localIP().toString());
     delay(700);
+    if (activeTerminalId.length() == 0) {
+      startApSetupPortal();
+      delay(900);
+    }
   } else {
     startApSetupPortal();
     delay(1200);
@@ -792,16 +858,14 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 0. USB WiFi/Terminal config en AP Setup portaal altijd responsief houden
+  // 0. USB configuratie en AP Setup portaal altijd responsief houden
   handleSerialCommands();
   if (apPortalActive) {
     setupPortalServer.handleClient();
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
       apPortalActive = false;
       WiFi.softAPdisconnect(true);
-      if (activeTerminalId.length() > 0) {
-        patchStatusIdle("Online");
-      }
+      patchStatusIdle("Online");
       setIdleScreen();
     }
   }
