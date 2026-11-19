@@ -260,20 +260,54 @@ void saveConfigToEeprom(const String& newSsid, const String& newPass, const Stri
 }
 
 void loadWifiConfig() {
+  String compiledSsid = String(ssid);
+  compiledSsid.trim();
+  String compiledPass = String(password);
   String defaultTid = String(terminalId);
-  if (defaultTid.length() > 0 && !defaultTid.startsWith("__WP_")) {
+  defaultTid.trim();
+
+  bool hasSketchSsid = (compiledSsid.length() > 0 && compiledSsid != "JOUW_WIFI_NAAM" && !compiledSsid.startsWith("__WP_SSID"));
+  bool hasSketchTid = (defaultTid.length() > 0 && !defaultTid.startsWith("__WP_"));
+
+  if (hasSketchTid) {
     activeTerminalId = sanitizeTerminalId(defaultTid);
+  }
+
+  if (hasSketchSsid) {
+    activeSsid = compiledSsid.substring(0, 63);
+    activePass = (compiledPass == "JOUW_WIFI_WACHTWOORD" || compiledPass.startsWith("__WP_"))
+      ? String("")
+      : compiledPass.substring(0, 63);
+    Serial.println("[CONFIG] WiFi uit sketch code: " + activeSsid + " | Terminal=" + activeTerminalId);
+
+    if (activeTerminalId.length() > 0) {
+      WifiPrefsV2 existing;
+      EEPROM.get(0, existing);
+      existing.ssid[sizeof(existing.ssid) - 1] = '\0';
+      existing.pass[sizeof(existing.pass) - 1] = '\0';
+      existing.terminalId[sizeof(existing.terminalId) - 1] = '\0';
+      bool eepromMatches = (memcmp(existing.magic, "WPW2", 4) == 0) &&
+        (String(existing.ssid) == activeSsid) &&
+        (String(existing.pass) == activePass) &&
+        (String(existing.terminalId) == activeTerminalId);
+      if (!eepromMatches) {
+        saveConfigToEeprom(activeSsid, activePass, activeTerminalId);
+      }
+      return;
+    }
   }
 
   WifiPrefsV2 prefsV2;
   EEPROM.get(0, prefsV2);
   if (memcmp(prefsV2.magic, "WPW2", 4) == 0) {
+    prefsV2.ssid[sizeof(prefsV2.ssid) - 1] = '\0';
+    prefsV2.pass[sizeof(prefsV2.pass) - 1] = '\0';
+    prefsV2.terminalId[sizeof(prefsV2.terminalId) - 1] = '\0';
+
     if (strlen(prefsV2.terminalId) > 0 && activeTerminalId.length() == 0) {
       activeTerminalId = sanitizeTerminalId(String(prefsV2.terminalId));
-    } else if (strlen(prefsV2.terminalId) > 0 && defaultTid.length() == 0) {
-      activeTerminalId = sanitizeTerminalId(String(prefsV2.terminalId));
     }
-    if (strlen(prefsV2.ssid) > 0) {
+    if (!hasSketchSsid && strlen(prefsV2.ssid) > 0) {
       activeSsid = String(prefsV2.ssid);
       activePass = String(prefsV2.pass);
       Serial.println("[CONFIG] Geladen uit EEPROM (WPW2): " + activeSsid + " | Terminal=" + activeTerminalId);
@@ -283,22 +317,20 @@ void loadWifiConfig() {
 
   WifiPrefsV1 prefsV1;
   EEPROM.get(0, prefsV1);
-  if (memcmp(prefsV1.magic, "WPW1", 4) == 0 && strlen(prefsV1.ssid) > 0) {
-    activeSsid = String(prefsV1.ssid);
-    activePass = String(prefsV1.pass);
-    Serial.println("[WIFI] Inladen uit EEPROM (WPW1): " + activeSsid);
-    return;
+  if (memcmp(prefsV1.magic, "WPW1", 4) == 0) {
+    prefsV1.ssid[sizeof(prefsV1.ssid) - 1] = '\0';
+    prefsV1.pass[sizeof(prefsV1.pass) - 1] = '\0';
+    if (!hasSketchSsid && strlen(prefsV1.ssid) > 0) {
+      activeSsid = String(prefsV1.ssid);
+      activePass = String(prefsV1.pass);
+      Serial.println("[WIFI] Inladen uit EEPROM (WPW1): " + activeSsid);
+      return;
+    }
   }
 
-  String compiledSsid = String(ssid);
-  if (compiledSsid.length() > 0 && compiledSsid != "JOUW_WIFI_NAAM" && !compiledSsid.startsWith("__WP_SSID")) {
-    activeSsid = compiledSsid;
-    activePass = String(password);
-    Serial.println("[WIFI] Inladen uit sketch: " + activeSsid + " | Terminal=" + activeTerminalId);
-    return;
+  if (!hasSketchSsid) {
+    Serial.println("[CONFIG] Geen WiFi opgeslagen");
   }
-
-  Serial.println("[CONFIG] Geen WiFi opgeslagen");
 }
 
 void handlePortalRoot() {
@@ -367,7 +399,9 @@ void startApSetupPortal() {
 
 bool connectWifiBlocking(int maxTries) {
   if (activeSsid.length() == 0) return false;
-  Serial.println("[WIFI] Verbinden met " + activeSsid + "...");
+  Serial.println("[WIFI] Verbinden met '" + activeSsid + "' (2.4 GHz)...");
+  WiFi.disconnect();
+  delay(120);
   WiFi.mode(WIFI_STA);
   if (activePass.length() == 0) {
     WiFi.begin(activeSsid.c_str());
@@ -385,7 +419,7 @@ bool connectWifiBlocking(int maxTries) {
     Serial.println("[WIFI] Verbonden! IP=" + WiFi.localIP().toString());
     return true;
   }
-  Serial.println("[WIFI] Verbinden mislukt");
+  Serial.println("[WIFI] Verbinden mislukt (status=" + String((int)WiFi.status()) + ")");
   return false;
 }
 
@@ -979,7 +1013,7 @@ void setup() {
   lcdShow("WerkPay Terminal", "WiFi verbinden..");
 
   loadWifiConfig();
-  if (connectWifiBlocking(28)) {
+  if (connectWifiBlocking(45)) {
     lcdShow("WiFi Verbonden!", WiFi.localIP().toString());
     delay(700);
     if (activeTerminalId.length() == 0) {
@@ -987,6 +1021,10 @@ void setup() {
       delay(900);
     }
   } else {
+    if (activeSsid.length() > 0) {
+      lcdShow("WiFi fout (" + String((int)WiFi.status()) + ")", activeSsid);
+      delay(1200);
+    }
     startApSetupPortal();
     delay(1200);
   }
