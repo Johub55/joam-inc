@@ -1,7 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro } from '../../services/store';
-import { Product, ProductOption, Coupon, GiftCard, PosUser } from '../../types';
+import { Product, ProductOption, Coupon, GiftCard, PosUser, ReceiptPrinterConfig } from '../../types';
+import {
+  RECEIPT_SIZE_LIST,
+  receiptPrinter,
+  ThermalPrinterConnectionInfo
+} from '../../services/receiptPrinter';
 import { DiyTerminalModal } from './DiyTerminalModal';
 import { LinkCardModal } from './LinkCardModal';
 import { UidManagerPanel } from './UidManagerPanel';
@@ -57,7 +62,11 @@ import {
   Smartphone,
   Unlock,
   Zap,
-  Tv
+  Tv,
+  Usb,
+  Bluetooth,
+  Cable,
+  Receipt
 } from 'lucide-react';
 
 const COMMON_POS_EMOJIS = ['🍔', '🍟', '🥤', '🍦', '🍩', '🧇', '🍕', '🌮', '🥩', '🍱', '☕', '🧁', '🍪', '🍎', '🥗', '🥘', '🥡', '🍴', '🍳', '🛑', '⚠️', '🚨', '🚫', '⛔', '🔧', '⚙️', '💻', '📢', '🔥', '✨', '💎', '👑', '✅', '❌'];
@@ -161,7 +170,9 @@ export const ManagerScreen: React.FC = () => {
     saveDisasterRecoverySnapshot,
     restoreDisasterRecoverySnapshot,
     auditLogs,
-    logAuditAction
+    logAuditAction,
+    receiptPrinterConfig,
+    updateReceiptPrinterConfig
   } = useApp();
 
   // Master PIN Security Modal State & 2FA Setup State
@@ -227,6 +238,18 @@ export const ManagerScreen: React.FC = () => {
       setTvStartTime(customBranding.tvStartTime);
     }
   }, [customBranding]);
+
+  // Global Receipt Printer Settings Draft (Synchronizes to Firestore pos_settings/default for everyone)
+  const [printerDraft, setPrinterDraft] = useState<ReceiptPrinterConfig>(receiptPrinterConfig);
+  const [printerConnInfo, setPrinterConnInfo] = useState<ThermalPrinterConnectionInfo>(() =>
+    receiptPrinter.getConnectionInfo()
+  );
+  const [printerHardwareBusy, setPrinterHardwareBusy] = useState<boolean>(false);
+  const [savingPrinterConfig, setSavingPrinterConfig] = useState<boolean>(false);
+
+  useEffect(() => {
+    setPrinterDraft(receiptPrinterConfig);
+  }, [receiptPrinterConfig]);
 
   // Manager Menu 2FA Security Gate State (2FA is optional unless enabled on user account)
   const [managerUnlocked, setManagerUnlocked] = useState<boolean>(() => {
@@ -1590,6 +1613,307 @@ export const ManagerScreen: React.FC = () => {
               <span className="text-[11px] text-slate-500 mt-1 block font-mono">
                 @{currentPosUser?.username || 'gast'} (Admin)
               </span>
+            </div>
+          </div>
+
+          {/* Global Receipt Printer Settings (Shared for everyone) */}
+          <div className="bg-slate-900 border border-cyan-500/30 rounded-2xl p-5 shadow space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 flex items-center justify-center">
+                  <Printer className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-sm flex items-center gap-2 flex-wrap">
+                    <span>🖨️ Globale Bonprinter &amp; Bon-instellingen</span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800 font-bold">
+                      Geldt voor iedereen
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Alle opties voor het printen van een bon worden hier centraal opgeslagen in Firebase Cloud en gelden direct op elke kassa.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={savingPrinterConfig}
+                onClick={async () => {
+                  setSavingPrinterConfig(true);
+                  const res = await updateReceiptPrinterConfig(printerDraft);
+                  setSavingPrinterConfig(false);
+                  showToast(res.message, res.success ? 'success' : 'error');
+                }}
+                className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-black text-xs shadow flex items-center gap-1.5 transition"
+              >
+                <Database className="w-4 h-4" />
+                <span>{savingPrinterConfig ? 'Opslaan...' : 'Instellingen Opslaan voor Iedereen'}</span>
+              </button>
+            </div>
+
+            {/* Paper size & format */}
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                <Receipt className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Standaard Bonformaat (voor alle kassa&apos;s)</span>
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                {RECEIPT_SIZE_LIST.map((sz) => (
+                  <button
+                    key={sz.id}
+                    type="button"
+                    onClick={() => setPrinterDraft(prev => ({ ...prev, receiptSize: sz.id }))}
+                    className={`p-2.5 rounded-xl border text-left transition ${
+                      printerDraft.receiptSize === sz.id
+                        ? 'bg-cyan-500/20 border-cyan-400 text-white shadow'
+                        : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="font-black text-xs">{sz.shortLabel}</div>
+                    <div className="text-[10px] text-slate-400 mt-0.5">{sz.description}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Print Mode, Connection Type, Baudrate, Copies */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-400">Printmethode</label>
+                <select
+                  value={printerDraft.printMode}
+                  onChange={(e) => setPrinterDraft(prev => ({ ...prev, printMode: e.target.value as any }))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-semibold"
+                >
+                  <option value="ask">Handmatig kiezen in pop-up</option>
+                  <option value="auto_escpos">Direct Thermisch (ESC/POS)</option>
+                  <option value="browser">Browser / Systeem Print (LAN/PDF)</option>
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-400">Standaard Printer Type</label>
+                <select
+                  value={printerDraft.connectionType}
+                  onChange={(e) => setPrinterDraft(prev => ({ ...prev, connectionType: e.target.value as any }))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-semibold"
+                >
+                  <option value="browser">Systeem / Netwerk / LAN</option>
+                  <option value="serial">USB-Serieel (COM Poort)</option>
+                  <option value="usb">WebUSB (Direct USB)</option>
+                  <option value="ble">Bluetooth (BLE)</option>
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-400">Serieel Baudrate</label>
+                <select
+                  value={printerDraft.baudRate}
+                  onChange={(e) => setPrinterDraft(prev => ({ ...prev, baudRate: Number(e.target.value) }))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono"
+                >
+                  <option value={9600}>9600 baud (Standaard)</option>
+                  <option value={19200}>19200 baud</option>
+                  <option value={38400}>38400 baud</option>
+                  <option value={57600}>57600 baud</option>
+                  <option value={115200}>115200 baud</option>
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-400">Aantal Bon-kopieën</label>
+                <select
+                  value={printerDraft.copies}
+                  onChange={(e) => setPrinterDraft(prev => ({ ...prev, copies: Number(e.target.value) }))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-semibold"
+                >
+                  <option value={1}>1× Kopie (Standaard)</option>
+                  <option value={2}>2× Kopie (Klant + Keuken/Kassa)</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Header / Footer text */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-400">Bon Ondertitel (Koptekst)</label>
+                <input
+                  value={printerDraft.headerSubtitle}
+                  onChange={(e) => setPrinterDraft(prev => ({ ...prev, headerSubtitle: e.target.value }))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white"
+                  placeholder="Filiaal #1 · Kassa Systeem"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-400">Bon Voettekst (Onderaan)</label>
+                <input
+                  value={printerDraft.footerText}
+                  onChange={(e) => setPrinterDraft(prev => ({ ...prev, footerText: e.target.value }))}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white"
+                  placeholder="Bedankt voor je bestelling!"
+                />
+              </div>
+            </div>
+
+            {/* Toggles */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 text-xs">
+              {[
+                { key: 'autoPrintOnOrder', label: 'Automatisch printen bij bestelling' },
+                { key: 'showReceiptPopup', label: 'Bon pop-up tonen na afrekenen' },
+                { key: 'openCashDrawer', label: 'Kassalade openen bij printen' },
+                { key: 'showCustomerInfo', label: 'Klantnaam / tafel op bon' },
+                { key: 'showPaymentDetails', label: 'Betaalmethode & saldo op bon' },
+              ].map((toggle) => {
+                const active = Boolean((printerDraft as any)[toggle.key]);
+                return (
+                  <button
+                    key={toggle.key}
+                    type="button"
+                    onClick={() =>
+                      setPrinterDraft(prev => ({
+                        ...prev,
+                        [toggle.key]: !active,
+                      }))
+                    }
+                    className={`p-2.5 rounded-xl border text-left font-bold flex items-center justify-between gap-2 transition ${
+                      active
+                        ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'
+                        : 'bg-slate-950 border-slate-800 text-slate-400'
+                    }`}
+                  >
+                    <span className="text-[11px] leading-tight">{toggle.label}</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-black ${
+                        active ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {active ? 'AAN' : 'UIT'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Hardware Printer Test & Pair Controls */}
+            <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-2">
+                <Zap className={`w-4 h-4 ${printerConnInfo.connected ? 'text-emerald-400' : 'text-slate-400'}`} />
+                <span className={printerConnInfo.connected ? 'text-emerald-300 font-bold' : 'text-slate-300 font-semibold'}>
+                  {printerConnInfo.connected
+                    ? `Hardware bonprinter verbonden: ${printerConnInfo.deviceName}`
+                    : 'Optioneel: verbind fysieke thermische printer op dit apparaat om direct te testen'}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {printerConnInfo.connected ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={printerHardwareBusy}
+                      onClick={async () => {
+                        setPrinterHardwareBusy(true);
+                        try {
+                          await receiptPrinter.printTestPage(printerDraft.receiptSize);
+                          showToast(`Testbon (${printerDraft.receiptSize}) verstuurd!`, 'success');
+                        } catch (e: any) {
+                          showToast(e?.message || 'Testbon versturen mislukt.', 'error');
+                        } finally {
+                          setPrinterHardwareBusy(false);
+                        }
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-black text-[11px]"
+                    >
+                      Testbon ({printerDraft.receiptSize})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await receiptPrinter.disconnect();
+                        setPrinterConnInfo(receiptPrinter.getConnectionInfo());
+                        showToast('Bonprinter losgekoppeld.', 'info');
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-500/30 font-bold text-[11px]"
+                    >
+                      Verbreken
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {receiptPrinter.getCapabilities().hasWebSerial && (
+                      <button
+                        type="button"
+                        disabled={printerHardwareBusy}
+                        onClick={async () => {
+                          setPrinterHardwareBusy(true);
+                          try {
+                            const info = await receiptPrinter.connectSerial(printerDraft.baudRate || 9600);
+                            setPrinterConnInfo(info);
+                            showToast(`Verbonden: ${info.deviceName}`, 'success');
+                          } catch (e: any) {
+                            if (!String(e?.message || '').toLowerCase().includes('no port selected')) {
+                              showToast(e?.message || 'Kon USB-Serieel printer niet verbinden.', 'error');
+                            }
+                          } finally {
+                            setPrinterHardwareBusy(false);
+                          }
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-[11px] flex items-center gap-1"
+                      >
+                        <Cable className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>USB-Serieel</span>
+                      </button>
+                    )}
+                    {receiptPrinter.getCapabilities().hasWebUsb && (
+                      <button
+                        type="button"
+                        disabled={printerHardwareBusy}
+                        onClick={async () => {
+                          setPrinterHardwareBusy(true);
+                          try {
+                            const info = await receiptPrinter.connectUsb();
+                            setPrinterConnInfo(info);
+                            showToast(`Verbonden: ${info.deviceName}`, 'success');
+                          } catch (e: any) {
+                            if (!String(e?.message || '').toLowerCase().includes('no device selected')) {
+                              showToast(e?.message || 'Kon WebUSB printer niet verbinden.', 'error');
+                            }
+                          } finally {
+                            setPrinterHardwareBusy(false);
+                          }
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-[11px] flex items-center gap-1"
+                      >
+                        <Usb className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>WebUSB</span>
+                      </button>
+                    )}
+                    {receiptPrinter.getCapabilities().hasWebBluetooth && (
+                      <button
+                        type="button"
+                        disabled={printerHardwareBusy}
+                        onClick={async () => {
+                          setPrinterHardwareBusy(true);
+                          try {
+                            const info = await receiptPrinter.connectBle();
+                            setPrinterConnInfo(info);
+                            showToast(`Verbonden: ${info.deviceName}`, 'success');
+                          } catch (e: any) {
+                            if (!String(e?.message || '').toLowerCase().includes('cancelled')) {
+                              showToast(e?.message || 'Kon Bluetooth printer niet verbinden.', 'error');
+                            }
+                          } finally {
+                            setPrinterHardwareBusy(false);
+                          }
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-[11px] flex items-center gap-1"
+                      >
+                        <Bluetooth className="w-3.5 h-3.5 text-blue-400" />
+                        <span>Bluetooth</span>
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           </div>
 

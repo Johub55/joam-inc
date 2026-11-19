@@ -282,7 +282,6 @@ export function mergeBankAccountsList(params: {
     const key = normKey(initAcc.username);
     if (!key || byUser.has(key)) continue;
     if (params.deletedKeys.has(key)) continue;
-    if (params.remote.length > 0 && params.knownCloudKeys.has(key)) continue;
     byUser.set(key, initAcc);
   }
 
@@ -325,7 +324,6 @@ export function mergePosUsersList(params: {
     const key = normKey(initUser.username);
     if (!key || byUser.has(key)) continue;
     if (params.deletedKeys.has(key)) continue;
-    if (params.remote.length > 0 && params.knownCloudKeys.has(key)) continue;
     byUser.set(key, initUser);
   }
 

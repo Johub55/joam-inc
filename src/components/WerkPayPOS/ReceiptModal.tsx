@@ -1,40 +1,64 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
 import { euro } from '../../services/store';
 import { showToast } from '../../services/appToast';
 import {
-  RECEIPT_SIZE_LIST,
   RECEIPT_SIZE_PRESETS,
-  ReceiptSizeId,
-  getSavedReceiptSize,
-  setSavedReceiptSize,
   receiptPrinter,
   ThermalPrinterConnectionInfo
 } from '../../services/receiptPrinter';
-import { Printer, X, CheckCircle2, Clock, Usb, Bluetooth, Cable, Receipt, Zap } from 'lucide-react';
+import { Printer, X, CheckCircle2, Clock, Usb, Bluetooth, Cable, Receipt, Zap, Lock } from 'lucide-react';
 
 export const ReceiptModal: React.FC = () => {
-  const { activeReceiptOrder, setActiveReceiptOrder, setTrackedOrderNo } = useApp();
-  const [receiptSize, setReceiptSize] = useState<ReceiptSizeId>(() => getSavedReceiptSize());
+  const { activeReceiptOrder, setActiveReceiptOrder, setTrackedOrderNo, receiptPrinterConfig } = useApp();
   const [printerInfo, setPrinterInfo] = useState<ThermalPrinterConnectionInfo>(() =>
     receiptPrinter.getConnectionInfo()
   );
-  const [baudRate, setBaudRate] = useState<number>(9600);
-  const [openCashDrawer, setOpenCashDrawer] = useState<boolean>(false);
   const [printerBusy, setPrinterBusy] = useState<boolean>(false);
+  const lastAutoPrintedOrderRef = useRef<number | null>(null);
 
-  if (!activeReceiptOrder) return null;
-
+  const receiptSize = receiptPrinterConfig.receiptSize || '80mm';
   const preset = RECEIPT_SIZE_PRESETS[receiptSize] || RECEIPT_SIZE_PRESETS['80mm'];
   const caps = receiptPrinter.getCapabilities();
   const isNarrow = receiptSize === '44mm';
   const isCompactRoll = receiptSize === '44mm' || receiptSize === '58mm';
   const isA4 = receiptSize === 'a4';
 
-  const handleChangeSize = (next: ReceiptSizeId) => {
-    setReceiptSize(next);
-    setSavedReceiptSize(next);
-  };
+  // Automatisch printen zodra bestelling in pop-up opent (indien ingeschakeld in Manager Instellingen)
+  useEffect(() => {
+    if (!activeReceiptOrder) return;
+    setPrinterInfo(receiptPrinter.getConnectionInfo());
+
+    if (!receiptPrinterConfig.autoPrintOnOrder) return;
+    if (lastAutoPrintedOrderRef.current === activeReceiptOrder.no) return;
+    lastAutoPrintedOrderRef.current = activeReceiptOrder.no;
+
+    const conn = receiptPrinter.getConnectionInfo();
+    if ((receiptPrinterConfig.printMode === 'auto_escpos' || conn.connected) && conn.connected && !isA4) {
+      receiptPrinter
+        .printOrder(activeReceiptOrder, receiptSize, {
+          openCashDrawer: receiptPrinterConfig.openCashDrawer,
+          copies: receiptPrinterConfig.copies,
+          headerSubtitle: receiptPrinterConfig.headerSubtitle,
+          footerText: receiptPrinterConfig.footerText,
+          showCustomerInfo: receiptPrinterConfig.showCustomerInfo,
+          showPaymentDetails: receiptPrinterConfig.showPaymentDetails,
+        })
+        .then(() => {
+          showToast(`Bon #${activeReceiptOrder.no} (${preset.shortLabel}) automatisch geprint!`, 'success');
+        })
+        .catch(() => {});
+    } else if (receiptPrinterConfig.printMode === 'browser') {
+      const t = window.setTimeout(() => {
+        try {
+          window.print();
+        } catch {}
+      }, 250);
+      return () => window.clearTimeout(t);
+    }
+  }, [activeReceiptOrder, receiptPrinterConfig, receiptSize, preset.shortLabel, isA4]);
+
+  if (!activeReceiptOrder) return null;
 
   const handlePrintSystem = () => {
     window.print();
@@ -43,7 +67,7 @@ export const ReceiptModal: React.FC = () => {
   const handleConnectSerial = async () => {
     setPrinterBusy(true);
     try {
-      const info = await receiptPrinter.connectSerial(baudRate);
+      const info = await receiptPrinter.connectSerial(receiptPrinterConfig.baudRate || 9600);
       setPrinterInfo(info);
       showToast(`Bonprinter verbonden (${info.deviceName})`, 'success');
     } catch (e: any) {
@@ -94,22 +118,17 @@ export const ReceiptModal: React.FC = () => {
   const handleEscPosPrint = async () => {
     setPrinterBusy(true);
     try {
-      await receiptPrinter.printOrder(activeReceiptOrder, receiptSize, { openCashDrawer });
+      await receiptPrinter.printOrder(activeReceiptOrder, receiptSize, {
+        openCashDrawer: receiptPrinterConfig.openCashDrawer,
+        copies: receiptPrinterConfig.copies,
+        headerSubtitle: receiptPrinterConfig.headerSubtitle,
+        footerText: receiptPrinterConfig.footerText,
+        showCustomerInfo: receiptPrinterConfig.showCustomerInfo,
+        showPaymentDetails: receiptPrinterConfig.showPaymentDetails,
+      });
       showToast(`Bon #${activeReceiptOrder.no} (${preset.shortLabel}) direct geprint!`, 'success');
     } catch (e: any) {
       showToast(e?.message || 'Direct ESC/POS printen mislukt.', 'error');
-    } finally {
-      setPrinterBusy(false);
-    }
-  };
-
-  const handleEscPosTest = async () => {
-    setPrinterBusy(true);
-    try {
-      await receiptPrinter.printTestPage(receiptSize);
-      showToast(`Testbon (${preset.shortLabel}) verstuurd naar printer!`, 'success');
-    } catch (e: any) {
-      showToast(e?.message || 'Testbon versturen mislukt.', 'error');
     } finally {
       setPrinterBusy(false);
     }
@@ -145,31 +164,24 @@ export const ReceiptModal: React.FC = () => {
           </button>
         </div>
 
-        {/* Receipt Format Selector Bar */}
-        <div className="no-print px-4 py-2.5 bg-slate-950/80 border-b border-slate-800 space-y-1.5">
-          <div className="flex items-center justify-between gap-2 text-[11px]">
-            <span className="font-bold text-slate-300 flex items-center gap-1.5">
-              <Receipt className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Bonformaat:</span>
-            </span>
-            <span className="text-[10px] text-slate-400 font-mono">{preset.description}</span>
-          </div>
-          <div className="grid grid-cols-5 gap-1">
-            {RECEIPT_SIZE_LIST.map((sz) => (
-              <button
-                key={sz.id}
-                type="button"
-                onClick={() => handleChangeSize(sz.id)}
-                className={`py-1.5 px-1 rounded-lg text-[11px] font-black border transition ${
-                  receiptSize === sz.id
-                    ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow'
-                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
-                }`}
-              >
-                {sz.shortLabel}
-              </button>
-            ))}
-          </div>
+        {/* Read-only Global Printer Profile Bar (Beheerd via Manager Instellingen) */}
+        <div className="no-print px-4 py-2 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between gap-2 text-[11px] flex-wrap">
+          <span className="font-bold text-slate-300 flex items-center gap-1.5">
+            <Receipt className="w-3.5 h-3.5 text-cyan-400" />
+            <span>Formaat: <strong className="text-cyan-300">{preset.shortLabel}</strong></span>
+            <span className="text-slate-600">·</span>
+            <span className="text-slate-400">{receiptPrinterConfig.copies || 1}× kopie</span>
+            {receiptPrinterConfig.openCashDrawer && (
+              <>
+                <span className="text-slate-600">·</span>
+                <span className="text-emerald-400 font-bold">Kassalade open</span>
+              </>
+            )}
+          </span>
+          <span className="text-[10px] text-slate-400 flex items-center gap-1 font-semibold">
+            <Lock className="w-3 h-3 text-amber-400" />
+            <span>Ingesteld in Manager</span>
+          </span>
         </div>
 
         {/* Live Paper Preview Container */}
@@ -202,7 +214,9 @@ export const ReceiptModal: React.FC = () => {
               <h2 className={`font-extrabold tracking-wider uppercase ${isA4 ? 'text-lg' : isNarrow ? 'text-xs' : 'text-sm'}`}>
                 {activeReceiptOrder.paymentMeta?.brandName || 'WERKDONALDS'}
               </h2>
-              <p className={`${isA4 ? 'text-xs' : 'text-[10px]'} text-slate-500`}>Filiaal #1 · Kassa Systeem</p>
+              <p className={`${isA4 ? 'text-xs' : 'text-[10px]'} text-slate-500`}>
+                {receiptPrinterConfig.headerSubtitle || 'Filiaal #1 · Kassa Systeem'}
+              </p>
               <p className={`${isA4 ? 'text-xs' : 'text-[10px]'} text-slate-500`}>
                 {activeReceiptOrder.time} · {new Date().toLocaleDateString('nl-NL')}
               </p>
@@ -221,7 +235,7 @@ export const ReceiptModal: React.FC = () => {
               </span>
             </div>
 
-            {activeReceiptOrder.identifier && (
+            {receiptPrinterConfig.showCustomerInfo !== false && activeReceiptOrder.identifier && (
               <div className="py-1 text-[11px] text-slate-600">
                 Klant/Tafel: <strong className="text-slate-950">{activeReceiptOrder.identifier}</strong>
               </div>
@@ -260,44 +274,47 @@ export const ReceiptModal: React.FC = () => {
 
             {/* Payment Method Details */}
             <div className="pt-2 border-t border-slate-200 text-[10px] text-slate-600 space-y-0.5">
-              <div className="flex justify-between gap-2">
-                <span>Betaald via:</span>
-                <strong className="uppercase text-slate-900">
-                  {activeReceiptOrder.paymentMethod === 'workpay'
-                    ? '💳 WerkPay Bank'
-                    : activeReceiptOrder.paymentMethod === 'cash'
-                    ? '💵 Contant'
-                    : '🎁 Cadeaubon'}
-                </strong>
-              </div>
-              {activeReceiptOrder.paymentMeta?.account && (
-                <div className="flex justify-between gap-2">
-                  <span>WerkPay Rekening:</span>
-                  <span>@{activeReceiptOrder.paymentMeta.account}</span>
-                </div>
-              )}
-              {activeReceiptOrder.paymentMeta?.balance_after !== undefined && (
-                <div className="flex justify-between gap-2">
-                  <span>Nieuw Saldo:</span>
-                  <span>{euro(activeReceiptOrder.paymentMeta.balance_after)}</span>
-                </div>
-              )}
-              {activeReceiptOrder.paymentMeta?.change > 0 && (
-                <div className="flex justify-between gap-2">
-                  <span>Wisselgeld:</span>
-                  <span>{euro(activeReceiptOrder.paymentMeta.change)}</span>
-                </div>
+              {receiptPrinterConfig.showPaymentDetails !== false && (
+                <>
+                  <div className="flex justify-between gap-2">
+                    <span>Betaald via:</span>
+                    <strong className="uppercase text-slate-900">
+                      {activeReceiptOrder.paymentMethod === 'workpay'
+                        ? '💳 WerkPay Bank'
+                        : activeReceiptOrder.paymentMethod === 'cash'
+                        ? '💵 Contant'
+                        : '🎁 Cadeaubon'}
+                    </strong>
+                  </div>
+                  {activeReceiptOrder.paymentMeta?.account && (
+                    <div className="flex justify-between gap-2">
+                      <span>WerkPay Rekening:</span>
+                      <span>@{activeReceiptOrder.paymentMeta.account}</span>
+                    </div>
+                  )}
+                  {activeReceiptOrder.paymentMeta?.balance_after !== undefined && (
+                    <div className="flex justify-between gap-2">
+                      <span>Nieuw Saldo:</span>
+                      <span>{euro(activeReceiptOrder.paymentMeta.balance_after)}</span>
+                    </div>
+                  )}
+                  {activeReceiptOrder.paymentMeta?.change > 0 && (
+                    <div className="flex justify-between gap-2">
+                      <span>Wisselgeld:</span>
+                      <span>{euro(activeReceiptOrder.paymentMeta.change)}</span>
+                    </div>
+                  )}
+                </>
               )}
               <div className="text-center pt-2 text-[10px] text-slate-400">
-                Bedankt bij {activeReceiptOrder.paymentMeta?.brandName || 'Werkdonalds'}! ({preset.shortLabel})
+                {receiptPrinterConfig.footerText || `Bedankt bij ${activeReceiptOrder.paymentMeta?.brandName || 'Werkdonalds'}!`} ({preset.shortLabel})
               </div>
             </div>
           </div>
         </div>
 
-        {/* Thermal ESC/POS Printer Controls + Modal Actions */}
+        {/* Printer Action Bar */}
         <div className="no-print p-3.5 sm:p-4 bg-slate-950 border-t border-slate-800 space-y-2.5 text-xs">
-          {/* Printer Bar */}
           {!isA4 && (
             <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
               <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -306,53 +323,21 @@ export const ReceiptModal: React.FC = () => {
                   <span className={printerInfo.connected ? 'text-emerald-300' : 'text-slate-300'}>
                     {printerInfo.connected
                       ? `Verbonden: ${printerInfo.deviceName}`
-                      : 'Directe Thermische Bonprinter (ESC/POS)'}
+                      : `Printer koppelen (${receiptPrinterConfig.baudRate || 9600} baud)`}
                   </span>
                 </div>
-                {!printerInfo.connected && caps.hasWebSerial && (
-                  <select
-                    value={baudRate}
-                    onChange={(e) => setBaudRate(Number(e.target.value))}
-                    className="bg-slate-950 border border-slate-700 rounded-md px-1.5 py-0.5 text-[10px] text-slate-300 font-mono"
-                    title="Baudrate voor Serieel"
+                {printerInfo.connected && (
+                  <button
+                    type="button"
+                    onClick={handleDisconnectPrinter}
+                    className="px-2 py-0.5 rounded-lg bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-500/30 font-bold text-[10px]"
                   >
-                    <option value={9600}>9600 baud</option>
-                    <option value={38400}>38400 baud</option>
-                    <option value={115200}>115200 baud</option>
-                  </select>
+                    Verbreken
+                  </button>
                 )}
               </div>
 
-              {printerInfo.connected ? (
-                <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={openCashDrawer}
-                      onChange={(e) => setOpenCashDrawer(e.target.checked)}
-                      className="rounded border-slate-700 bg-slate-950"
-                    />
-                    <span>Open kassalade</span>
-                  </label>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      disabled={printerBusy}
-                      onClick={handleEscPosTest}
-                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-[11px]"
-                    >
-                      Testbon ({preset.shortLabel})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleDisconnectPrinter}
-                      className="px-2.5 py-1 rounded-lg bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-500/30 font-bold text-[11px]"
-                    >
-                      Verbreken
-                    </button>
-                  </div>
-                </div>
-              ) : (
+              {!printerInfo.connected && (
                 <div className="flex flex-wrap gap-1.5">
                   {caps.hasWebSerial && (
                     <button
@@ -389,7 +374,7 @@ export const ReceiptModal: React.FC = () => {
                   )}
                   {!caps.hasWebSerial && !caps.hasWebUsb && !caps.hasWebBluetooth && (
                     <span className="text-[10px] text-slate-400">
-                      Gebruik Systeem Print / PDF hieronder voor printen op dit apparaat.
+                      Gebruik Systeem Print / PDF hieronder. Instellingen wijzigen kan in Manager → Instellingen.
                     </span>
                   )}
                 </div>
@@ -415,7 +400,7 @@ export const ReceiptModal: React.FC = () => {
                 className="flex-1 py-2 rounded-xl text-xs font-black bg-cyan-500 hover:bg-cyan-400 text-slate-950 flex items-center justify-center gap-1.5 transition"
               >
                 <Zap className="w-4 h-4" />
-                <span>Direct ESC/POS ({preset.shortLabel})</span>
+                <span>Direct Printen ({preset.shortLabel})</span>
               </button>
             )}
             <button

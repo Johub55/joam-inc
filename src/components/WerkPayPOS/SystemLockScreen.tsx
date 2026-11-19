@@ -246,7 +246,7 @@ export const SystemLockScreen: React.FC = () => {
           <div className="flex items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3 py-2 text-[11px]">
             <div className="flex items-center gap-1.5 text-slate-300 font-semibold">
               <Clock className="w-3.5 h-3.5 text-purple-400" />
-              <span>Auto-vergrendeling bij inactiviteit:</span>
+              <span>Manager auto-vergrendeling:</span>
             </div>
             <select
               value={autoLockMinutes}

@@ -20,7 +20,8 @@ import type {
   BrandConfig,
   OrderStopConfig,
   CustomBrandingConfig,
-  LinkedNfcTag
+  LinkedNfcTag,
+  ReceiptPrinterConfig
 } from '../types';
 import { showToast } from '../services/appToast';
 import {
@@ -55,6 +56,12 @@ import {
 import { calculateDiscount } from '../services/discountService';
 import { redeemVoucherAnyCustomer, addCoinsToCustomer, isVipSubscriberPhone, issueVoucherForCustomer, findLoyaltyCustomerByPhoneOrName } from '../services/loyalty';
 import { verifyTotpCode } from '../services/totp';
+import {
+  DEFAULT_RECEIPT_PRINTER_CONFIG,
+  normalizeReceiptPrinterConfig,
+  setSavedReceiptSize,
+  receiptPrinter
+} from '../services/receiptPrinter';
 import {
   enqueueOfflineMutation,
   flushOfflineQueue,
@@ -288,9 +295,11 @@ interface AppContextType {
   deleteBankAccount: (id: number | string) => Promise<void>;
   quickMoneyAccount: (id: number | string, delta: number) => Promise<void>;
 
-  // Receipt Modal State
+  // Receipt Modal & Global Receipt Printer Config
   activeReceiptOrder: Order | null;
   setActiveReceiptOrder: (order: Order | null) => void;
+  receiptPrinterConfig: ReceiptPrinterConfig;
+  updateReceiptPrinterConfig: (next: ReceiptPrinterConfig) => Promise<{ success: boolean; message: string }>;
 
   // Order Tracking & User Orders
   myOrderNumbers: number[];
@@ -1256,6 +1265,46 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
+  // Global Receipt Printer Settings (shared for all users/terminals via Firestore pos_settings/default)
+  const [receiptPrinterConfig, setReceiptPrinterConfigState] = useState<ReceiptPrinterConfig>(() => {
+    try {
+      const raw = localStorage.getItem('wd_receipt_printer_config');
+      if (raw) {
+        return normalizeReceiptPrinterConfig(JSON.parse(raw));
+      }
+    } catch {}
+    return DEFAULT_RECEIPT_PRINTER_CONFIG;
+  });
+
+  const updateReceiptPrinterConfig = useCallback(async (next: ReceiptPrinterConfig): Promise<{ success: boolean; message: string }> => {
+    const normalized: ReceiptPrinterConfig = {
+      ...normalizeReceiptPrinterConfig(next),
+      updatedAt: new Date().toISOString()
+    };
+    setReceiptPrinterConfigState(normalized);
+    setSavedReceiptSize(normalized.receiptSize);
+    try {
+      localStorage.setItem('wd_receipt_printer_config', JSON.stringify(normalized));
+    } catch {}
+
+    if (shouldBlockTableWrite('Globale bonprinter instellingen bijwerken')) {
+      return { success: false, message: 'Tabellen zijn vergrendeld (freeze modus).' };
+    }
+
+    try {
+      await savePosSettingsToFirestore({ receipt_printer_config: normalized });
+      logAuditAction(
+        'BONPRINTER_INSTELLINGEN_GEWIJZIGD',
+        `Globale bonprinter instellingen opgeslagen (${normalized.receiptSize}, modus: ${normalized.printMode}, auto-print: ${normalized.autoPrintOnOrder ? 'aan' : 'uit'}).`
+      );
+      return { success: true, message: 'Bonprinter instellingen opgeslagen in Firebase Cloud voor iedereen!' };
+    } catch (err: any) {
+      console.error('Firestore updateReceiptPrinterConfig error:', err);
+      const errMsg = err?.message || 'Opslaan in Firebase mislukt.';
+      return { success: false, message: `Lokaal opgeslagen, maar Firebase sync mislukte: ${errMsg}` };
+    }
+  }, []);
+
   // Offline Queue State & Handlers
   const [offlineQueueItems, setOfflineQueueItems] = useState<OfflineMutationItem[]>(() => getOfflineQueue());
   const [isFlushingOfflineQueue, setIsFlushingOfflineQueue] = useState<boolean>(false);
@@ -1664,6 +1713,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         localStorage.setItem('wd_blocked_devices', blockedSnap);
       }
     }
+
+    if (dbSettings.receipt_printer_config && typeof dbSettings.receipt_printer_config === 'object') {
+      const normalizedPrinterCfg = normalizeReceiptPrinterConfig(dbSettings.receipt_printer_config);
+      setReceiptPrinterConfigState(normalizedPrinterCfg);
+      setSavedReceiptSize(normalizedPrinterCfg.receiptSize);
+      try {
+        localStorage.setItem('wd_receipt_printer_config', JSON.stringify(normalizedPrinterCfg));
+      } catch {}
+    }
   }, []);
 
   // Unified Firebase Cloud Firestore fetch
@@ -2031,9 +2089,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     await fetchCloudData(false);
   };
 
-  // Staff Auto-Lock Idle Timer (only applies to logged-in staff, never kiosks/customers)
+  // Manager-only Auto-Lock Idle Timer (alleen actief wanneer je in het Manager scherm bent)
   useEffect(() => {
-    if (typeof window === 'undefined' || autoLockMinutes <= 0 || isSystemLocked || !currentPosUser) {
+    if (
+      typeof window === 'undefined' ||
+      autoLockMinutes <= 0 ||
+      isSystemLocked ||
+      !currentPosUser ||
+      posScreen !== 'manager' ||
+      (appMode !== 'pos' && appMode !== 'split')
+    ) {
       return;
     }
     const uname = String(currentPosUser.username || '').toLowerCase();
@@ -2054,12 +2119,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       lastReset = now;
       if (timerId !== null) window.clearTimeout(timerId);
       timerId = window.setTimeout(() => {
+        try {
+          sessionStorage.removeItem(`wd_manager_unlocked_${uname}`);
+        } catch {}
         setIsSystemLockedState(true);
         try {
           localStorage.setItem('wd_system_locked', 'true');
         } catch {}
-        logAuditAction('SYSTEEM_AUTOLOCK', `Kassa automatisch vergrendeld na ${autoLockMinutes} min inactiviteit (@${uname}).`);
-        showToast(`🔒 Kassa automatisch vergrendeld na ${autoLockMinutes} min inactiviteit.`, 'info');
+        logAuditAction('SYSTEEM_AUTOLOCK', `Manager scherm automatisch vergrendeld na ${autoLockMinutes} min inactiviteit (@${uname}).`);
+        showToast(`🔒 Manager scherm automatisch vergrendeld na ${autoLockMinutes} min inactiviteit.`, 'info');
       }, timeoutMs);
     };
 
@@ -2071,7 +2139,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       if (timerId !== null) window.clearTimeout(timerId);
       events.forEach((ev) => window.removeEventListener(ev, armTimer));
     };
-  }, [autoLockMinutes, isSystemLocked, currentPosUser]);
+  }, [autoLockMinutes, isSystemLocked, currentPosUser, appMode, posScreen]);
 
   // Multi-Terminal Live Responder for Pico W Quick Balance & Loyalty Check (KEY 'B')
   const handledCheckCardSigRef = useRef<Record<string, string>>({});
@@ -3175,9 +3243,22 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     emptyCart();
 
-    // 5. Audio chime & print receipt
+    // 5. Audio chime & print receipt (volgt globale Manager bonprinter-instellingen)
     AudioFX.bell();
-    setActiveReceiptOrder(newOrder);
+    if (receiptPrinterConfig.showReceiptPopup !== false) {
+      setActiveReceiptOrder(newOrder);
+    } else if (receiptPrinterConfig.autoPrintOnOrder && receiptPrinter.getConnectionInfo().connected) {
+      receiptPrinter
+        .printOrder(newOrder, receiptPrinterConfig.receiptSize, {
+          openCashDrawer: receiptPrinterConfig.openCashDrawer,
+          copies: receiptPrinterConfig.copies,
+          headerSubtitle: receiptPrinterConfig.headerSubtitle,
+          footerText: receiptPrinterConfig.footerText,
+          showCustomerInfo: receiptPrinterConfig.showCustomerInfo,
+          showPaymentDetails: receiptPrinterConfig.showPaymentDetails,
+        })
+        .catch(() => {});
+    }
     setTrackedOrderNo(newOrder.no);
     addMyOrderNumber(newOrder.no);
 
@@ -5618,6 +5699,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         quickMoneyAccount,
         activeReceiptOrder,
         setActiveReceiptOrder,
+        receiptPrinterConfig,
+        updateReceiptPrinterConfig,
         myOrderNumbers,
         addMyOrderNumber,
         isUserOrder,

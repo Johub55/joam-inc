@@ -328,10 +328,10 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({ onClose }) => {
               <div>
                 <h4 className="font-bold text-white flex items-center gap-2 text-xs">
                   <Clock className="w-4 h-4 text-purple-400" />
-                  <span>Kassa Auto-Lock Beveiliging</span>
+                  <span>Manager Scherm Auto-Lock</span>
                 </h4>
                 <p className="text-[11px] text-slate-400 mt-1">
-                  Vergrendelt ingelogde medewerkers automatisch na inactiviteit. Ontgrendelen kan met Wachtwoord/PIN of NFC pas (+ evt. 2FA).
+                  Vergrendelt alleen automatisch bij inactiviteit wanneer je in het Manager scherm bent. Ontgrendelen kan met Wachtwoord/PIN of NFC pas (+ evt. 2FA).
                 </p>
               </div>
               <div className="grid grid-cols-3 gap-1.5">

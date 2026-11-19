@@ -254,7 +254,7 @@
     "cash_requests/{requestId}": { "schema": "CashRequest", "description": "Collection of cash requests" },
     "loyalty_customers/{customerId}": { "schema": "LoyaltyCustomer", "description": "Collection of loyalty customers" },
     "hardware_terminals/{terminalId}": { "schema": "HardwareTerminal", "description": "Hardware pinpad terminal relay state documents" },
-    "pos_settings/{settingId}": { "description": "POS settings, order stop, branding, table freeze, and news ticker config" },
+    "pos_settings/{settingId}": { "description": "POS settings, order stop, branding, table freeze, global receipt printer config, and news ticker config" },
     "pos_sessions/{sessionId}": { "description": "Active device presence sessions" },
     "pos_audit_logs/{logId}": { "description": "Security & audit log entries" },
     "tv_presets/{presetId}": { "description": "Pickup screen TV layout presets" },

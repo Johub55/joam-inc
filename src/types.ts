@@ -280,4 +280,22 @@ export interface CashPaymentRequest {
   rejectedReason?: string;
 }
 
+export type ReceiptSizeType = '44mm' | '58mm' | '76mm' | '80mm' | 'a4';
+export type ReceiptPrintMode = 'ask' | 'auto_escpos' | 'browser';
+export type ReceiptConnectionType = 'browser' | 'serial' | 'usb' | 'ble';
 
+export interface ReceiptPrinterConfig {
+  receiptSize: ReceiptSizeType;
+  printMode: ReceiptPrintMode;
+  connectionType: ReceiptConnectionType;
+  baudRate: number;
+  autoPrintOnOrder: boolean;
+  openCashDrawer: boolean;
+  showReceiptPopup: boolean;
+  copies: number;
+  headerSubtitle: string;
+  footerText: string;
+  showCustomerInfo: boolean;
+  showPaymentDetails: boolean;
+  updatedAt?: string;
+}

@@ -295,7 +295,7 @@ service cloud.firestore {
           'news_config', 'custom_news_items', 'order_stop_active', 'order_stop_text',
           'pickup_closed', 'order_stop_config', 'branding_config', 'custom_branding',
           'active_brand', 'master_security_pin', 'master_pin', 'tables_frozen',
-          'blocked_devices', 'pos_disaster_backup', 'updated_at'
+          'blocked_devices', 'pos_disaster_backup', 'receipt_printer_config', 'updated_at'
         ])
         && isStrLen(data.updated_at, 64)
         && (!('news_config' in data) || data.news_config is map)
@@ -311,7 +311,8 @@ service cloud.firestore {
         && (!('master_pin' in data) || isStrLen(data.master_pin, 32))
         && (!('tables_frozen' in data) || data.tables_frozen is bool)
         && (!('blocked_devices' in data) || (data.blocked_devices is list && data.blocked_devices.size() <= 200 && (data.blocked_devices.size() == 0 || data.blocked_devices[0] is map)))
-        && (!('pos_disaster_backup' in data) || (isStrLen(data.pos_disaster_backup, 900000) || data.pos_disaster_backup is map));
+        && (!('pos_disaster_backup' in data) || (isStrLen(data.pos_disaster_backup, 900000) || data.pos_disaster_backup is map))
+        && (!('receipt_printer_config' in data) || data.receipt_printer_config is map);
     }
 
     function isValidPosSession(data) {
@@ -484,7 +485,7 @@ service cloud.firestore {
           'news_config', 'custom_news_items', 'order_stop_active', 'order_stop_text',
           'pickup_closed', 'order_stop_config', 'branding_config', 'custom_branding',
           'active_brand', 'master_security_pin', 'master_pin', 'tables_frozen',
-          'blocked_devices', 'pos_disaster_backup', 'updated_at'
+          'blocked_devices', 'pos_disaster_backup', 'receipt_printer_config', 'updated_at'
         ]);
       allow delete: if false;
     }

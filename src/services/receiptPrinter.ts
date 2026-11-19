@@ -1,4 +1,4 @@
-import type { Order } from '../types';
+import type { Order, ReceiptPrinterConfig } from '../types';
 
 export type ReceiptSizeId = '44mm' | '58mm' | '76mm' | '80mm' | 'a4';
 
@@ -96,6 +96,64 @@ export function setSavedReceiptSize(size: ReceiptSizeId): void {
   try {
     localStorage.setItem(RECEIPT_SIZE_STORAGE_KEY, size);
   } catch {}
+}
+
+export const DEFAULT_RECEIPT_PRINTER_CONFIG: ReceiptPrinterConfig = {
+  receiptSize: '80mm',
+  printMode: 'ask',
+  connectionType: 'browser',
+  baudRate: 9600,
+  autoPrintOnOrder: false,
+  openCashDrawer: false,
+  showReceiptPopup: true,
+  copies: 1,
+  headerSubtitle: 'Filiaal #1 · Kassa Systeem',
+  footerText: 'Bedankt voor je bestelling!',
+  showCustomerInfo: true,
+  showPaymentDetails: true,
+};
+
+export function normalizeReceiptPrinterConfig(raw: any): ReceiptPrinterConfig {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const receiptSize: ReceiptSizeId =
+    src.receiptSize && src.receiptSize in RECEIPT_SIZE_PRESETS ? src.receiptSize : DEFAULT_RECEIPT_PRINTER_CONFIG.receiptSize;
+  const printMode =
+    src.printMode === 'auto_escpos' || src.printMode === 'browser' || src.printMode === 'ask'
+      ? src.printMode
+      : DEFAULT_RECEIPT_PRINTER_CONFIG.printMode;
+  const connectionType =
+    src.connectionType === 'serial' ||
+    src.connectionType === 'usb' ||
+    src.connectionType === 'ble' ||
+    src.connectionType === 'browser'
+      ? src.connectionType
+      : DEFAULT_RECEIPT_PRINTER_CONFIG.connectionType;
+  const rawBaud = Number(src.baudRate);
+  const baudRate = [9600, 19200, 38400, 57600, 115200].includes(rawBaud) ? rawBaud : 9600;
+  const rawCopies = Number(src.copies);
+  const copies = rawCopies >= 2 ? 2 : 1;
+
+  return {
+    receiptSize,
+    printMode,
+    connectionType,
+    baudRate,
+    autoPrintOnOrder: Boolean(src.autoPrintOnOrder),
+    openCashDrawer: Boolean(src.openCashDrawer),
+    showReceiptPopup: src.showReceiptPopup !== undefined ? Boolean(src.showReceiptPopup) : true,
+    copies,
+    headerSubtitle:
+      typeof src.headerSubtitle === 'string' && src.headerSubtitle.trim()
+        ? src.headerSubtitle.trim().slice(0, 120)
+        : DEFAULT_RECEIPT_PRINTER_CONFIG.headerSubtitle,
+    footerText:
+      typeof src.footerText === 'string' && src.footerText.trim()
+        ? src.footerText.trim().slice(0, 160)
+        : DEFAULT_RECEIPT_PRINTER_CONFIG.footerText,
+    showCustomerInfo: src.showCustomerInfo !== undefined ? Boolean(src.showCustomerInfo) : true,
+    showPaymentDetails: src.showPaymentDetails !== undefined ? Boolean(src.showPaymentDetails) : true,
+    updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : undefined,
+  };
 }
 
 function sanitizeAscii(text: string): string {
@@ -204,13 +262,23 @@ class EscPosBuilder {
 export function buildEscPosReceiptBytes(
   order: Order,
   size: ReceiptSizeId = '80mm',
-  options?: { openCashDrawer?: boolean }
+  options?: {
+    openCashDrawer?: boolean;
+    headerSubtitle?: string;
+    footerText?: string;
+    showCustomerInfo?: boolean;
+    showPaymentDetails?: boolean;
+  }
 ): Uint8Array {
   const preset = RECEIPT_SIZE_PRESETS[size] || RECEIPT_SIZE_PRESETS['80mm'];
   const cols = preset.escPosCols;
   const sep = '-'.repeat(cols);
   const dblSep = '='.repeat(cols);
   const brand = sanitizeAscii(order.paymentMeta?.brandName || 'WERKDONALDS').toUpperCase();
+  const subtitle = sanitizeAscii(options?.headerSubtitle || 'Filiaal #1 · Kassa Bon');
+  const footer = sanitizeAscii(options?.footerText || `Bedankt voor je bestelling bij ${brand}!`);
+  const showCustomerInfo = options?.showCustomerInfo !== false;
+  const showPaymentDetails = options?.showPaymentDetails !== false;
 
   const b = new EscPosBuilder().init();
 
@@ -225,7 +293,7 @@ export function buildEscPosReceiptBytes(
     .line(brand)
     .size(false, false)
     .bold(false)
-    .line('Filiaal #1 · Kassa Bon')
+    .line(subtitle)
     .line(`${order.time || ''} ${new Date(order.timestamp || Date.now()).toLocaleDateString('nl-NL')}`)
     .line(dblSep);
 
@@ -241,7 +309,7 @@ export function buildEscPosReceiptBytes(
     )
     .bold(false);
 
-  if (order.identifier) {
+  if (showCustomerInfo && order.identifier) {
     for (const l of wrapTextLines(`Klant: ${order.identifier}`, cols)) {
       b.line(l);
     }
@@ -275,36 +343,37 @@ export function buildEscPosReceiptBytes(
     .line(sep);
 
   // Payment breakdown
-  const methodLabel =
-    order.paymentMethod === 'workpay'
-      ? 'WerkPay Bank'
-      : order.paymentMethod === 'cash'
-      ? 'Contant'
-      : 'Cadeaubon';
+  if (showPaymentDetails) {
+    const methodLabel =
+      order.paymentMethod === 'workpay'
+        ? 'WerkPay Bank'
+        : order.paymentMethod === 'cash'
+        ? 'Contant'
+        : 'Cadeaubon';
 
-  b.line(formatTwoColLine('Betaald via:', methodLabel, cols));
-  if (order.paymentMeta?.account) {
-    b.line(formatTwoColLine('Rekening:', `@${order.paymentMeta.account}`, cols));
-  }
-  if (order.paymentMeta?.balance_after !== undefined) {
-    b.line(formatTwoColLine('Nieuw saldo:', formatEurPlain(order.paymentMeta.balance_after), cols));
-  }
-  if (order.paymentMeta?.received > 0) {
-    b.line(formatTwoColLine('Ontvangen:', formatEurPlain(order.paymentMeta.received), cols));
-  }
-  if (order.paymentMeta?.change > 0) {
-    b.line(formatTwoColLine('Wisselgeld:', formatEurPlain(order.paymentMeta.change), cols));
-  }
-  if (order.paymentMeta?.tipAmount > 0) {
-    b.line(formatTwoColLine('Waarvan fooi:', formatEurPlain(order.paymentMeta.tipAmount), cols));
+    b.line(formatTwoColLine('Betaald via:', methodLabel, cols));
+    if (order.paymentMeta?.account) {
+      b.line(formatTwoColLine('Rekening:', `@${order.paymentMeta.account}`, cols));
+    }
+    if (order.paymentMeta?.balance_after !== undefined) {
+      b.line(formatTwoColLine('Nieuw saldo:', formatEurPlain(order.paymentMeta.balance_after), cols));
+    }
+    if (order.paymentMeta?.received > 0) {
+      b.line(formatTwoColLine('Ontvangen:', formatEurPlain(order.paymentMeta.received), cols));
+    }
+    if (order.paymentMeta?.change > 0) {
+      b.line(formatTwoColLine('Wisselgeld:', formatEurPlain(order.paymentMeta.change), cols));
+    }
+    if (order.paymentMeta?.tipAmount > 0) {
+      b.line(formatTwoColLine('Waarvan fooi:', formatEurPlain(order.paymentMeta.tipAmount), cols));
+    }
   }
 
-  b.line(dblSep)
-    .align('center')
-    .line(`Bedankt voor je bestelling`)
-    .line(`bij ${brand}!`)
-    .line(`[Formaat: ${preset.shortLabel}]`)
-    .feedAndCut(4);
+  b.line(dblSep).align('center');
+  for (const fLine of wrapTextLines(footer, cols)) {
+    b.line(fLine);
+  }
+  b.line(`[Formaat: ${preset.shortLabel}]`).feedAndCut(4);
 
   return b.toUint8Array();
 }
@@ -557,10 +626,26 @@ class ReceiptPrinterManager {
   public async printOrder(
     order: Order,
     size: ReceiptSizeId = '80mm',
-    options?: { openCashDrawer?: boolean }
+    options?: {
+      openCashDrawer?: boolean;
+      copies?: number;
+      headerSubtitle?: string;
+      footerText?: string;
+      showCustomerInfo?: boolean;
+      showPaymentDetails?: boolean;
+    }
   ): Promise<void> {
-    const bytes = buildEscPosReceiptBytes(order, size, options);
-    await this.writeRaw(bytes);
+    const copies = options?.copies && options.copies >= 2 ? 2 : 1;
+    for (let i = 0; i < copies; i++) {
+      const bytes = buildEscPosReceiptBytes(order, size, {
+        openCashDrawer: i === 0 ? options?.openCashDrawer : false,
+        headerSubtitle: options?.headerSubtitle,
+        footerText: options?.footerText,
+        showCustomerInfo: options?.showCustomerInfo,
+        showPaymentDetails: options?.showPaymentDetails,
+      });
+      await this.writeRaw(bytes);
+    }
   }
 
   public async printTestPage(size: ReceiptSizeId = '80mm'): Promise<void> {
@@ -570,3 +655,4 @@ class ReceiptPrinterManager {
 }
 
 export const receiptPrinter = new ReceiptPrinterManager();
+
