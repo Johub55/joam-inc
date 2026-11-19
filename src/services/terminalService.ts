@@ -795,8 +795,8 @@ byte colPins[COLS] = {9, 8, 7, 6};
 
 unsigned long laatsteToetsTijd = 0;
 unsigned long lastKeyActivityMs = 0;
-const unsigned long KEY_PRESS_DEBOUNCE_MS = 22;
-const unsigned long KEY_RELEASE_DEBOUNCE_MS = 35;
+const unsigned long KEY_PRESS_DEBOUNCE_MS = 14;
+const unsigned long KEY_RELEASE_DEBOUNCE_MS = 30;
 char debouncedKey = 0;
 char candidateKey = 0;
 unsigned long candidateSinceMs = 0;
@@ -804,9 +804,13 @@ unsigned long candidateSinceMs = 0;
 unsigned long buzzerOffAt = 0;
 bool buzzerActive = false;
 bool nfcReady = false;
+bool nfcScanArmed = false;
+unsigned long nfcArmedAtMs = 0;
 unsigned long lastNfcScanMs = 0;
-const unsigned long NFC_SCAN_INTERVAL_MS = 180;
-const uint16_t NFC_READ_TIMEOUT_MS = 95;
+unsigned long lastNfcReadyCheckMs = 0;
+unsigned long lastNfcRecoverMs = 0;
+byte nfcConsecutiveErrors = 0;
+const unsigned long NFC_SCAN_INTERVAL_MS = 160;
 
 enum TerminalState {
   STATE_IDLE,
@@ -859,6 +863,9 @@ void resetKeypadState();
 char readRawKeypadOnce();
 char readRawKeypadStable();
 char scanKeypad();
+void recoverI2CAndNfc();
+bool pollNfcCardNonBlocking(String& outUid);
+bool firestoreRequestEx(const String& method, const String& url, const String& body, int& outCode, String& outPayload, int maxAttempts, unsigned long timeoutMs);
 bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload);
 bool patchFirestore(const String& maskQuery, const JsonDocument& doc);
 bool patchStatusIdle(const String& reason = "");
@@ -1211,6 +1218,7 @@ void handleSerialCommands() {
 void setIdleScreen() {
   bool wasBusy = (currentState != STATE_IDLE);
   currentState = STATE_IDLE;
+  nfcScanArmed = false;
   activeUsername = "";
   pendingAmount = "0.00";
   pendingOrderNo = "0";
@@ -1316,8 +1324,106 @@ char scanKeypad() {
   return 0;
 }
 
+// Herstelt een vastgelopen I2C-bus (bijv. na PN532 RF-piek) zonder reboot
+void recoverI2CAndNfc() {
+  unsigned long now = millis();
+  if (now - lastNfcRecoverMs < 2500) return;
+  lastNfcRecoverMs = now;
+  nfcScanArmed = false;
+
+  Serial.println("[NFC] I2C & PN532 herstel uitvoeren...");
+  Wire.end();
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(10);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(10);
+  }
+  Wire.setSDA(I2C_SDA_PIN);
+  Wire.setSCL(I2C_SCL_PIN);
+  Wire.setClock(100000);
+  Wire.setTimeout(25);
+  Wire.begin();
+  delay(20);
+
+  nfc.begin();
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (versiondata) {
+    nfc.SAMConfig();
+    nfc.setPassiveActivationRetries(0x01);
+    nfcReady = true;
+    nfcConsecutiveErrors = 0;
+    Serial.println("[NFC] PN532 hersteld!");
+  } else {
+    nfcReady = false;
+    Serial.println("[NFC] PN532 reageert nog niet op I2C");
+  }
+}
+
+// Non-blocking NFC detectie: blokkeert loop() nooit zodat Annuleren (A/D) altijd direct werkt
+bool pollNfcCardNonBlocking(String& outUid) {
+  unsigned long now = millis();
+  if (!nfcReady) {
+    if (now - lastNfcRecoverMs >= 3000) {
+      recoverI2CAndNfc();
+    }
+    return false;
+  }
+
+  if (!nfcScanArmed) {
+    if (now - lastNfcScanMs < NFC_SCAN_INTERVAL_MS) {
+      return false;
+    }
+    lastNfcScanMs = now;
+    if (nfc.startPassiveTargetIDDetection(PN532_MIFARE_ISO14443A)) {
+      nfcScanArmed = true;
+      nfcArmedAtMs = now;
+      lastNfcReadyCheckMs = now;
+      nfcConsecutiveErrors = 0;
+    } else {
+      nfcConsecutiveErrors++;
+      if (nfcConsecutiveErrors >= 3) {
+        recoverI2CAndNfc();
+      }
+    }
+    return false;
+  }
+
+  if (now - lastNfcReadyCheckMs >= 20) {
+    lastNfcReadyCheckMs = now;
+    byte got = Wire.requestFrom((uint8_t)0x24, (uint8_t)1);
+    if (got == 1 && Wire.available() >= 1) {
+      uint8_t st = Wire.read();
+      if (st == 0x01) {
+        nfcScanArmed = false;
+        lastNfcScanMs = now;
+        uint8_t uid[7];
+        uint8_t uidLength = 0;
+        if (nfc.readDetectedPassiveTargetID(uid, &uidLength) && uidLength > 0) {
+          outUid = "";
+          for (uint8_t i = 0; i < uidLength; i++) {
+            if (uid[i] < 0x10) outUid += "0";
+            outUid += String(uid[i], HEX);
+          }
+          outUid.toUpperCase();
+          return true;
+        }
+        return false;
+      }
+    }
+  }
+
+  if (now - nfcArmedAtMs >= 750) {
+    nfcScanArmed = false;
+    lastNfcScanMs = now;
+  }
+  return false;
+}
+
 // Schone HTTPS-hulpfunctie: geen hangende BearSSL keep-alive sockets tussen GET en PATCH
-bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload) {
+bool firestoreRequestEx(const String& method, const String& url, const String& body, int& outCode, String& outPayload, int maxAttempts, unsigned long timeoutMs) {
   static bool wifiLostLogged = false;
   if (WiFi.status() != WL_CONNECTED) {
     if (!wifiLostLogged) {
@@ -1335,8 +1441,8 @@ bool firestoreRequest(const String& method, const String& url, const String& bod
       WiFi.begin(activeSsid.c_str(), activePass.c_str());
     }
     unsigned long startWait = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startWait < 3000) {
-      delay(50);
+    while (WiFi.status() != WL_CONNECTED && millis() - startWait < 2500) {
+      delay(40);
       yield();
     }
     if (WiFi.status() != WL_CONNECTED) {
@@ -1347,22 +1453,21 @@ bool firestoreRequest(const String& method, const String& url, const String& bod
   }
   wifiLostLogged = false;
 
-  for (int attempt = 0; attempt < 2; attempt++) {
+  for (int attempt = 0; attempt < maxAttempts; attempt++) {
     secureClient.stop();
     yield();
 
     HTTPClient http;
-    unsigned long httpTimeout = (currentState == STATE_WAITING_PIN) ? 2200 : 3800;
     secureClient.setInsecure();
-    secureClient.setTimeout(httpTimeout);
+    secureClient.setTimeout(timeoutMs);
     http.setReuse(false);
-    http.setTimeout(httpTimeout);
+    http.setTimeout(timeoutMs);
 
     if (!http.begin(secureClient, url)) {
       http.end();
       secureClient.stop();
       outCode = -100;
-      delay(35);
+      delay(25);
       yield();
       continue;
     }
@@ -1387,10 +1492,15 @@ bool firestoreRequest(const String& method, const String& url, const String& bod
     Serial.println(outCode);
     http.end();
     secureClient.stop();
-    delay(40);
+    delay(30);
     yield();
   }
   return false;
+}
+
+bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload) {
+  unsigned long t = (currentState == STATE_WAITING_PIN) ? 2000 : 3200;
+  return firestoreRequestEx(method, url, body, outCode, outPayload, 2, t);
 }
 
 bool patchFirestore(const String& maskQuery, const JsonDocument& doc) {
@@ -1468,6 +1578,7 @@ bool patchPaymentSubmitted(const String& uid, const String& pin) {
 
 void annuleerDirect() {
   Serial.println("[STATE] Geannuleerd op keypad");
+  nfcScanArmed = false;
   beep(800, 120);
   lcdShow("Geannuleerd!", "Terug naar start");
   patchStatusIdle("Geannuleerd door gebruiker");
@@ -1494,7 +1605,10 @@ void simuleerBonPrinten() {
 
 void startBalanceCheckState() {
   currentState = STATE_CHECK_CARD;
+  nfcScanArmed = false;
+  lastNfcScanMs = millis();
   stateTimer = millis();
+  resetKeypadState();
   beep(2200, 75);
   Serial.println("[STATE] Saldo checken");
   lcdShow("Scan pas: Saldo", "Houd pas  A=Stop");
@@ -1511,7 +1625,10 @@ void startLinkingState(const String& user) {
     lowUser == "werkpay"
   );
   currentState = STATE_LINKING;
+  nfcScanArmed = false;
+  lastNfcScanMs = millis();
   stateTimer = millis();
+  resetKeypadState();
   beep(2400, 90);
   Serial.println(isLoginSession ? "[STATE] Snelle pas-login gestart" : ("[STATE] Pas koppelen: " + activeUsername));
   lcdShow(isLoginSession ? "WerkPay Login" : ("Koppel: " + activeUsername), "Houd pas  A=Stop");
@@ -1522,7 +1639,10 @@ void startPayState(double amt, const String& ordNo, const String& payUser) {
   pendingOrderNo = ordNo;
   isLoginSession = (amt <= 0.001);
   currentState = STATE_WAITING_CARD;
+  nfcScanArmed = false;
+  lastNfcScanMs = millis();
   stateTimer = millis();
+  resetKeypadState();
   beep(2400, 90);
 
   String topLine;
@@ -1544,7 +1664,7 @@ void pollFirestore() {
   static int lastHttpErr = 0;
   int code = 0;
   String payload;
-  if (!firestoreRequest("GET", getFirestoreDocUrl(), "", code, payload)) {
+  if (!firestoreRequestEx("GET", getFirestoreDocUrl(), "", code, payload, 1, 1600)) {
     return;
   }
 
@@ -1714,7 +1834,7 @@ void setup() {
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
   Wire.setClock(100000);
-  Wire.setTimeout(50);
+  Wire.setTimeout(25);
   Wire.begin();
   delay(100);
 
@@ -1793,39 +1913,32 @@ void loop() {
     }
   } else if (currentState == STATE_CHECK_CARD) {
     if (key == 'A' || key == 'D') {
+      Serial.println("[KEY] Annuleren ingedrukt: " + String(key));
+      nfcScanArmed = false;
       beepAsync(800, 100);
       setIdleScreen();
       return;
     }
 
-    if (nfcReady && now - lastNfcScanMs >= NFC_SCAN_INTERVAL_MS) {
-      lastNfcScanMs = now;
-      uint8_t uid[7];
-      uint8_t uidLength = 0;
-      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, NFC_READ_TIMEOUT_MS) && uidLength > 0) {
-        scannedUid = "";
-        for (uint8_t i = 0; i < uidLength; i++) {
-          if (uid[i] < 0x10) scannedUid += "0";
-          scannedUid += String(uid[i], HEX);
-        }
-        scannedUid.toUpperCase();
-        Serial.println("[NFC] Pas check: " + scannedUid);
-        beep(2500, 100);
+    String foundUid;
+    if (pollNfcCardNonBlocking(foundUid)) {
+      scannedUid = foundUid;
+      Serial.println("[NFC] Pas check: " + scannedUid);
+      beep(2500, 100);
 
-        lcdShow("Pas checken...", "Even geduld...");
-        if (patchCheckCard(scannedUid)) {
-          currentState = STATE_WAITING_RESULT;
-          stateTimer = millis();
-        } else {
-          Serial.println("[ERR] PATCH check card mislukt");
-          beep(600, 220);
-          lcdShow("Verbindingsfout", "Probeer opnieuw");
-          currentState = STATE_SHOW_RESULT;
-          stateTimer = millis();
-          resultDurationMs = 1800;
-        }
-        return;
+      lcdShow("Pas checken...", "Even geduld...");
+      if (patchCheckCard(scannedUid)) {
+        currentState = STATE_WAITING_RESULT;
+        stateTimer = millis();
+      } else {
+        Serial.println("[ERR] PATCH check card mislukt");
+        beep(600, 220);
+        lcdShow("Verbindingsfout", "Probeer opnieuw");
+        currentState = STATE_SHOW_RESULT;
+        stateTimer = millis();
+        resultDurationMs = 1800;
       }
+      return;
     }
 
     if (now - stateTimer > 25000) {
@@ -1834,47 +1947,39 @@ void loop() {
     }
   } else if (currentState == STATE_LINKING || currentState == STATE_WAITING_CARD) {
     if (key == 'A' || key == 'D') {
+      Serial.println("[KEY] Annuleren ingedrukt: " + String(key));
       annuleerDirect();
       return;
     }
 
-    if (nfcReady && now - lastNfcScanMs >= NFC_SCAN_INTERVAL_MS) {
-      lastNfcScanMs = now;
-      uint8_t uid[7];
-      uint8_t uidLength = 0;
-      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, NFC_READ_TIMEOUT_MS) && uidLength > 0) {
-        scannedUid = "";
-        for (uint8_t i = 0; i < uidLength; i++) {
-          if (uid[i] < 0x10) scannedUid += "0";
-          scannedUid += String(uid[i], HEX);
-        }
-        scannedUid.toUpperCase();
-        Serial.println("[NFC] Pas: " + scannedUid);
-        beep(2500, 100);
+    String foundUid;
+    if (pollNfcCardNonBlocking(foundUid)) {
+      scannedUid = foundUid;
+      Serial.println("[NFC] Pas: " + scannedUid);
+      beep(2500, 100);
 
-        if (currentState == STATE_LINKING) {
-          lcdShow("Pas gescand!", isLoginSession ? "Inloggen..." : "Koppelen...");
-          if (patchCardScanned(scannedUid)) {
-            currentState = STATE_WAITING_RESULT;
-            stateTimer = millis();
-          } else {
-            Serial.println("[ERR] PATCH card scanned mislukt");
-            beep(600, 220);
-            lcdShow("Verbindingsfout", "Probeer opnieuw");
-            currentState = STATE_SHOW_RESULT;
-            stateTimer = millis();
-            resultDurationMs = 1800;
-          }
-        } else {
-          currentState = STATE_WAITING_PIN;
-          enteredPin = "";
+      if (currentState == STATE_LINKING) {
+        lcdShow("Pas gescand!", isLoginSession ? "Inloggen..." : "Koppelen...");
+        if (patchCardScanned(scannedUid)) {
+          currentState = STATE_WAITING_RESULT;
           stateTimer = millis();
-          resetKeypadState();
-          Serial.println("[PIN] Wacht op pincode...");
-          toonPincodeScherm();
+        } else {
+          Serial.println("[ERR] PATCH card scanned mislukt");
+          beep(600, 220);
+          lcdShow("Verbindingsfout", "Probeer opnieuw");
+          currentState = STATE_SHOW_RESULT;
+          stateTimer = millis();
+          resultDurationMs = 1800;
         }
-        return;
+      } else {
+        currentState = STATE_WAITING_PIN;
+        enteredPin = "";
+        stateTimer = millis();
+        resetKeypadState();
+        Serial.println("[PIN] Wacht op pincode...");
+        toonPincodeScherm();
       }
+      return;
     }
 
     if (now - stateTimer > 90000) {
@@ -1890,6 +1995,7 @@ void loop() {
     if (key) {
       stateTimer = now;
       if (key == 'A' || key == 'D') {
+        Serial.println("[KEY] Annuleren ingedrukt: " + String(key));
         annuleerDirect();
         return;
       } else if (key == '*' || key == 'C') {
@@ -1939,6 +2045,7 @@ void loop() {
     }
   } else if (currentState == STATE_WAITING_RESULT) {
     if (key == 'A' || key == 'D') {
+      Serial.println("[KEY] Annuleren ingedrukt: " + String(key));
       annuleerDirect();
       return;
     }
@@ -1953,14 +2060,21 @@ void loop() {
     }
   }
 
-  // 2. Slimme polling (tijdens PIN-invoer alleen als er 2s geen toetsactiviteit is)
-  unsigned long pollInterval = (currentState == STATE_WAITING_PIN) ? 2000 : 550;
-  bool magPollen = (currentState != STATE_WAITING_PIN) || (now - lastKeyActivityMs > 2000);
+  // 2. Slimme polling (tijdens wachten op pas/PIN minder vaak, zodat NFC & keypad voorrang krijgen)
+  unsigned long pollInterval = 650;
+  if (currentState == STATE_LINKING || currentState == STATE_WAITING_CARD || currentState == STATE_CHECK_CARD) {
+    pollInterval = 2400;
+  } else if (currentState == STATE_WAITING_PIN || currentState == STATE_WAITING_RESULT) {
+    pollInterval = 1800;
+  }
+  unsigned long keyQuietMs = (currentState == STATE_WAITING_PIN) ? 2000 : 450;
+  bool magPollen = (now - lastKeyActivityMs > keyQuietMs);
   if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0 && magPollen && (now - lastPollMs >= pollInterval)) {
     lastPollMs = now;
     pollFirestore();
   }
 }
+
 `;
 
 class TerminalManager {
