@@ -29,6 +29,7 @@ import { DigitalPhone } from './components/DigitalPhone/DigitalPhone';
 
 const MainLayout: React.FC = () => {
   const { 
+    isEmbedMode,
     appMode, 
     setAppMode, 
     posScreen, 
@@ -80,6 +81,9 @@ const MainLayout: React.FC = () => {
 
   // Auth-gate & automatic small-screen WerkPin mode activation for logged-in staff
   React.useEffect(() => {
+    if (isEmbedMode || posScreen === 'afhaal' || posScreen === 'keuken' || posScreen === 'volgscherm') {
+      return;
+    }
     if (!isLoggedInStaff) {
       setPreferFullPosOnMobile(false);
       if (posScreen === 'sumup_terminal') {
@@ -91,9 +95,13 @@ const MainLayout: React.FC = () => {
     if (isSmallScreen && appMode === 'pos' && !preferFullPosOnMobile && posScreen !== 'sumup_terminal') {
       setPosScreen('sumup_terminal');
     }
-  }, [isLoggedInStaff, isSmallScreen, appMode, preferFullPosOnMobile, posScreen, setPosScreen]);
+  }, [isEmbedMode, isLoggedInStaff, isSmallScreen, appMode, preferFullPosOnMobile, posScreen, setPosScreen]);
 
   const showMobilePreLoginShell = Boolean(
+    !isEmbedMode &&
+    posScreen !== 'afhaal' &&
+    posScreen !== 'keuken' &&
+    posScreen !== 'volgscherm' &&
     isSmallScreen &&
     !isLoggedInStaff &&
     appMode === 'pos' &&
@@ -101,6 +109,7 @@ const MainLayout: React.FC = () => {
   );
 
   const isCompactSumUpMobileShell = Boolean(
+    !isEmbedMode &&
     isSmallScreen &&
     isLoggedInStaff &&
     appMode === 'pos' &&
@@ -108,7 +117,7 @@ const MainLayout: React.FC = () => {
     !preferFullPosOnMobile
   );
 
-  const hideMainHeader = showMobilePreLoginShell || isCompactSumUpMobileShell;
+  const hideMainHeader = isEmbedMode || showMobilePreLoginShell || isCompactSumUpMobileShell;
 
   const [managerSessionUnlocked, setManagerSessionUnlocked] = useState<boolean>(() => {
     if (!currentPosUser) return false;
@@ -297,8 +306,8 @@ const MainLayout: React.FC = () => {
 
       {/* Global Modals & Notifications */}
       <AppToast />
-      <StaffCashRequestNotifier />
-      <StaffPaalPairingNotifier />
+      {!isEmbedMode && <StaffCashRequestNotifier />}
+      {!isEmbedMode && <StaffPaalPairingNotifier />}
       <ReceiptModal />
       {showPaymentModal && (
         <PaymentModal onClose={() => setShowPaymentModal(false)} />
@@ -309,7 +318,7 @@ const MainLayout: React.FC = () => {
       {showGithubModal && (
         <GitHubExportModal isOpen={showGithubModal} onClose={() => setShowGithubModal(false)} />
       )}
-      <DigitalPhone />
+      {!isEmbedMode && <DigitalPhone />}
       {showSetup2FA && currentPosUser && (
         <TwoFactorSetupModal
           username={currentPosUser.username}
@@ -327,7 +336,7 @@ const MainLayout: React.FC = () => {
           onCancel={() => setPending2FALogin(null)}
         />
       )}
-      <SystemLockScreen />
+      {!isEmbedMode && <SystemLockScreen />}
     </div>
   );
 };

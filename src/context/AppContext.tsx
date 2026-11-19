@@ -148,6 +148,7 @@ export interface PosSession {
 
 interface AppContextType {
   // Navigation & Brand
+  isEmbedMode: boolean;
   appMode: AppMode;
   setAppMode: (mode: AppMode) => void;
   posScreen: PosScreenType;
@@ -347,10 +348,58 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
+const parseLaunchParams = (): { posScreen: PosScreenType; isEmbedMode: boolean } => {
+  if (typeof window === 'undefined') {
+    return { posScreen: 'kassa', isEmbedMode: false };
+  }
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const rawHash = (window.location.hash || '').replace(/^#/, '').toLowerCase();
+    const screenParam = (params.get('screen') || params.get('view') || '').toLowerCase().trim();
+    const embedParam = (params.get('embed') || params.get('widget') || '').toLowerCase().trim();
+    const tvParam = (params.get('tv') || params.get('mode') || '').toLowerCase().trim();
+
+    const isEmbedMode =
+      embedParam === '1' ||
+      embedParam === 'true' ||
+      embedParam === 'yes' ||
+      embedParam === 'afhaal' ||
+      embedParam === 'tv' ||
+      params.get('kiosk') === '1';
+
+    let posScreen: PosScreenType = 'kassa';
+    if (
+      screenParam === 'afhaal' ||
+      screenParam === 'pickup' ||
+      screenParam === 'tv' ||
+      embedParam === 'afhaal' ||
+      embedParam === 'tv' ||
+      tvParam === '1' ||
+      tvParam === 'true' ||
+      tvParam === 'tv' ||
+      rawHash === 'afhaal' ||
+      rawHash === 'tv'
+    ) {
+      posScreen = 'afhaal';
+    } else if (screenParam === 'keuken' || screenParam === 'kds') {
+      posScreen = 'keuken';
+    } else if (screenParam === 'volgscherm' || screenParam === 'tracking') {
+      posScreen = 'volgscherm';
+    }
+
+    return { posScreen, isEmbedMode };
+  } catch {
+    return { posScreen: 'kassa', isEmbedMode: false };
+  }
+};
+
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+  const initialLaunch = React.useMemo(() => parseLaunchParams(), []);
+  const isEmbedMode = initialLaunch.isEmbedMode;
+
   // Navigation State
   const [appMode, setAppMode] = useState<AppMode>('pos');
-  const [posScreen, setPosScreen] = useState<PosScreenType>('kassa');
+  const [posScreen, setPosScreen] = useState<PosScreenType>(initialLaunch.posScreen);
   const [werkpayScreen, setWerkpayScreen] = useState<WerkPayScreenType>('wallet');
 
   // Master Security Shield & Tamper-Proof Safeguards State
@@ -5588,6 +5637,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   return (
     <AppContext.Provider
       value={{
+        isEmbedMode,
         appMode,
         setAppMode,
         posScreen,

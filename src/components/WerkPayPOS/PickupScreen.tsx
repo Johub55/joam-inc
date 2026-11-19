@@ -189,9 +189,30 @@ const AutoScrollContainer: React.FC<AutoScrollContainerProps> = ({ children, cla
   );
 };
 
+const getPickupEmbedOptions = (): { startTv: boolean; initialView: 'pickup' | 'menu' | 'split' } => {
+  if (typeof window === 'undefined') return { startTv: false, initialView: 'split' };
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const tv = (params.get('tv') || params.get('mode') || '').toLowerCase().trim();
+    const embed = (params.get('embed') || '').toLowerCase().trim();
+    const viewParam = (params.get('tvview') || params.get('tv_view') || '').toLowerCase().trim();
+    const startTv = tv === '1' || tv === 'true' || tv === 'tv' || embed === 'tv';
+    const initialView: 'pickup' | 'menu' | 'split' =
+      viewParam === 'pickup' || viewParam === 'afhaal'
+        ? 'pickup'
+        : viewParam === 'menu'
+        ? 'menu'
+        : 'split';
+    return { startTv, initialView };
+  } catch {
+    return { startTv: false, initialView: 'split' };
+  }
+};
+
 export const PickupScreen: React.FC = () => {
-  const { orders, pickupClosed, orderStopActive, orderStopText, orderStopConfig, setTrackedOrderNo, activeBrand, brandProducts, products, customBranding } = useApp();
-  const [isTvMode, setIsTvMode] = useState<boolean>(false);
+  const { isEmbedMode, orders, pickupClosed, orderStopActive, orderStopText, orderStopConfig, setTrackedOrderNo, activeBrand, brandProducts, products, customBranding } = useApp();
+  const embedOptions = React.useMemo(() => getPickupEmbedOptions(), []);
+  const [isTvMode, setIsTvMode] = useState<boolean>(embedOptions.startTv);
 
   useEffect(() => {
     if (typeof document !== 'undefined') {
@@ -207,7 +228,7 @@ export const PickupScreen: React.FC = () => {
       }
     };
   }, [isTvMode]);
-  const [tvView, setTvView] = useState<'pickup' | 'menu' | 'split'>('split');
+  const [tvView, setTvView] = useState<'pickup' | 'menu' | 'split'>(embedOptions.initialView);
   const [autoRotate, setAutoRotate] = useState<boolean>(true);
   const [timeStr, setTimeStr] = useState<string>('');
   const [dateStr, setDateStr] = useState<string>('');
@@ -746,13 +767,15 @@ export const PickupScreen: React.FC = () => {
             </div>
           </div>
 
-          {/* Quick exit button for admin/staff */}
-          <button
-            onClick={() => setIsTvMode(false)}
-            className="absolute bottom-24 right-8 px-4 py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 rounded-xl text-xs font-black transition z-30"
-          >
-            Sluit TV Modus (Esc)
-          </button>
+          {/* Quick exit button for admin/staff (verborgen in widget embed) */}
+          {!isEmbedMode && (
+            <button
+              onClick={() => setIsTvMode(false)}
+              className="absolute bottom-24 right-8 px-4 py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 rounded-xl text-xs font-black transition z-30"
+            >
+              Sluit TV Modus (Esc)
+            </button>
+          )}
 
           {/* TV Bottom Marquee Bar is STILL active and running on the blocked screen! */}
           {activeWidgets.ticker && (
@@ -957,20 +980,22 @@ export const PickupScreen: React.FC = () => {
               </span>
             )}
 
-            {/* Exit TV mode button */}
-            <button
-              onClick={() => {
-                setIsTvMode(false);
-                if (document.fullscreenElement) {
-                  document.exitFullscreen().catch(() => {});
-                }
-              }}
-              className="p-2.5 text-slate-400 hover:text-rose-400 hover:bg-slate-900 rounded-2xl transition border border-slate-800 flex items-center gap-1.5 font-bold text-xs"
-              title="Sluit TV Volledig Scherm"
-            >
-              <Minimize2 className="w-4 h-4" />
-              <span>Sluit TV</span>
-            </button>
+            {/* Exit TV mode button (verborgen in widget embed) */}
+            {!isEmbedMode && (
+              <button
+                onClick={() => {
+                  setIsTvMode(false);
+                  if (document.fullscreenElement) {
+                    document.exitFullscreen().catch(() => {});
+                  }
+                }}
+                className="p-2.5 text-slate-400 hover:text-rose-400 hover:bg-slate-900 rounded-2xl transition border border-slate-800 flex items-center gap-1.5 font-bold text-xs"
+                title="Sluit TV Volledig Scherm"
+              >
+                <Minimize2 className="w-4 h-4" />
+                <span>Sluit TV</span>
+              </button>
+            )}
           </div>
         </header>
 
@@ -1792,21 +1817,30 @@ export const PickupScreen: React.FC = () => {
           setIsAudioUnlocked(true);
         }
       }}
-      className="flex-1 flex flex-col overflow-hidden select-none relative h-[calc(100vh-108px)] bg-slate-950 p-3 sm:p-5"
+      className={`flex-1 flex flex-col overflow-hidden select-none relative bg-slate-950 p-3 sm:p-5 ${
+        isEmbedMode ? 'h-screen' : 'h-[calc(100vh-108px)]'
+      }`}
     >
       {/* Control Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 pb-3.5 border-b border-slate-800">
+      <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
         <div>
-          <h1 className="text-xl font-black text-white flex items-center gap-2">
-            <Tv className={`w-6 h-6 ${isKoekploeg ? 'text-amber-400' : 'text-blue-400'}`} />
-            <span>{brandTitle} Afhaalscherm (Klantenscherm &amp; TV)</span>
+          <h1 className="text-lg sm:text-xl font-black text-white flex items-center gap-2">
+            <Tv className={`w-5 h-5 sm:w-6 sm:h-6 ${isKoekploeg ? 'text-amber-400' : 'text-blue-400'}`} />
+            <span>{brandTitle} Afhaalscherm</span>
+            {isEmbedMode && (
+              <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-black uppercase tracking-wider">
+                Live Widget
+              </span>
+            )}
           </h1>
-          <p className="text-xs text-slate-400">
-            Live omroep en afhaalscherm · Bezorgingen worden automatisch gefilterd en niet omgeroepen.
-          </p>
+          {!isEmbedMode && (
+            <p className="text-xs text-slate-400">
+              Live omroep en afhaalscherm · Bezorgingen worden automatisch gefilterd en niet omgeroepen.
+            </p>
+          )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* Audio Unlock / Status Button */}
           <button
             onClick={() => handleUnlockAndTest(1002, 'Tafel 4')}
@@ -1821,15 +1855,37 @@ export const PickupScreen: React.FC = () => {
             <span>{isAudioUnlocked ? '🔊 Geluid Actief' : '⚡ Klik: Activeer Geluid'}</span>
           </button>
 
-          {/* Test Voice Button */}
-          <button
-            onClick={() => handleUnlockAndTest(1001, 'Jan')}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
-            title="Test TTS omroep direct"
-          >
-            <Play className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
-            <span>Test Omroep</span>
-          </button>
+          {!isEmbedMode && (
+            <>
+              {/* Test Voice Button */}
+              <button
+                onClick={() => handleUnlockAndTest(1001, 'Jan')}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+                title="Test TTS omroep direct"
+              >
+                <Play className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
+                <span>Test Omroep</span>
+              </button>
+
+              {/* Copy Home-Screens Web Embed URL */}
+              <button
+                type="button"
+                onClick={() => {
+                  const baseUrl = `${window.location.origin}${window.location.pathname}`;
+                  const tvEmbedUrl = `${baseUrl}?screen=afhaal&tv=1&embed=1`;
+                  navigator.clipboard?.writeText(tvEmbedUrl).then(
+                    () => showToast(`TV Embed URL gekopieerd: ${tvEmbedUrl}`, 'success'),
+                    () => showToast(`Gebruik deze URL: ${tvEmbedUrl}`, 'info')
+                  );
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-500/30 transition"
+                title="Kopieer directe Web Embed URL voor Linux Home-Screens of kiosk"
+              >
+                <Link className="w-3.5 h-3.5" />
+                <span>Widget URL</span>
+              </button>
+            </>
+          )}
 
           {/* Fullscreen TV Mode */}
           <button
@@ -1841,7 +1897,7 @@ export const PickupScreen: React.FC = () => {
             }`}
           >
             <Maximize2 className="w-4 h-4" />
-            <span>Start TV Modus</span>
+            <span>{isEmbedMode ? 'TV Bord' : 'Start TV Modus'}</span>
           </button>
         </div>
       </div>
@@ -2513,6 +2569,49 @@ export const PickupScreen: React.FC = () => {
                   className="px-4 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 font-black text-xs transition flex items-center gap-1.5 shrink-0"
                 >
                   <span>💾 Opslaan in Firebase</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Section 5: Linux / Home-Screens Web Embed URLs */}
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <label className="text-xs font-black uppercase tracking-wider text-cyan-400 block">
+                5. Web Embed URL voor Linux Home-Screens / Widgets
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const url = `${window.location.origin}${window.location.pathname}?screen=afhaal&tv=1&embed=1`;
+                    navigator.clipboard?.writeText(url).then(
+                      () => showToast('TV Bord Embed URL gekopieerd!', 'success'),
+                      () => showToast(url, 'info')
+                    );
+                  }}
+                  className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-cyan-500/40 text-left transition flex items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <div className="text-xs font-black text-cyan-300">📺 Volledig TV Bord (Embed)</div>
+                    <div className="text-[10px] font-mono text-slate-400 truncate">?screen=afhaal&amp;tv=1&amp;embed=1</div>
+                  </div>
+                  <Link className="w-4 h-4 text-cyan-400 shrink-0" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const url = `${window.location.origin}${window.location.pathname}?screen=afhaal&embed=1`;
+                    navigator.clipboard?.writeText(url).then(
+                      () => showToast('Compact Afhaal Embed URL gekopieerd!', 'success'),
+                      () => showToast(url, 'info')
+                    );
+                  }}
+                  className="p-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-emerald-500/40 text-left transition flex items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <div className="text-xs font-black text-emerald-300">📋 Compacte Afhaal-Widget</div>
+                    <div className="text-[10px] font-mono text-slate-400 truncate">?screen=afhaal&amp;embed=1</div>
+                  </div>
+                  <Link className="w-4 h-4 text-emerald-400 shrink-0" />
                 </button>
               </div>
             </div>
