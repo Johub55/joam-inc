@@ -57,9 +57,9 @@ export const ManagerAccountsScreen: React.FC = () => {
     const q = search.toLowerCase();
     if (!q) return true;
     return (
-      a.username.toLowerCase().includes(q) ||
-      a.account_holder.toLowerCase().includes(q) ||
-      a.card_uid.replace(/\s+/g, '').toLowerCase().includes(q.replace(/\s+/g, '')) ||
+      String(a.username || '').toLowerCase().includes(q) ||
+      String(a.account_holder || '').toLowerCase().includes(q) ||
+      String(a.card_uid || '').replace(/\s+/g, '').toLowerCase().includes(q.replace(/\s+/g, '')) ||
       accountMatchesUid(a, search) ||
       parseLinkedUids(a.linked_uids || []).some(t => (t.label || '').toLowerCase().includes(q))
     );
@@ -67,7 +67,7 @@ export const ManagerAccountsScreen: React.FC = () => {
 
   const totalAccounts = bankAccounts.length;
   const adminCount = bankAccounts.filter(a => a.is_admin).length;
-  const totalBalances = bankAccounts.filter(a => !a.is_admin).reduce((s, a) => s + a.balance, 0);
+  const totalBalances = bankAccounts.filter(a => !a.is_admin).reduce((s, a) => s + Number(a.balance || 0), 0);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -224,9 +224,9 @@ export const ManagerAccountsScreen: React.FC = () => {
                 <tr key={acc.id} className="hover:bg-slate-800/40 transition">
                   <td className="p-3.5 font-bold text-white flex items-center gap-2">
                     <div className="w-7 h-7 rounded-lg bg-cyan-500/20 text-cyan-400 flex items-center justify-center font-black text-xs">
-                      {acc.account_holder[0]}
+                      {(acc.account_holder || acc.username || '?').charAt(0).toUpperCase()}
                     </div>
-                    <span>{acc.account_holder}</span>
+                    <span>{acc.account_holder || acc.username}</span>
                   </td>
                   <td className="p-3.5 font-mono text-cyan-300">@{acc.username}</td>
                   <td className="p-3.5 font-mono text-slate-300">
@@ -455,7 +455,7 @@ export const ManagerAccountsScreen: React.FC = () => {
                 <input
                   type="text"
                   required
-                  value={editingAcc.account_holder}
+                  value={editingAcc.account_holder || ''}
                   onChange={e => setEditingAcc({ ...editingAcc, account_holder: e.target.value })}
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white text-sm focus:outline-none focus:border-cyan-400"
                 />
@@ -467,7 +467,7 @@ export const ManagerAccountsScreen: React.FC = () => {
                   <input
                     type="text"
                     required
-                    value={editingAcc.username}
+                    value={editingAcc.username || ''}
                     onChange={e => setEditingAcc({ ...editingAcc, username: e.target.value })}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-cyan-400"
                   />
@@ -477,7 +477,7 @@ export const ManagerAccountsScreen: React.FC = () => {
                   <input
                     type="number"
                     step="0.01"
-                    value={editingAcc.balance}
+                    value={editingAcc.balance ?? 0}
                     onChange={e => setEditingAcc({ ...editingAcc, balance: parseFloat(e.target.value) || 0 })}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-bold focus:outline-none focus:border-cyan-400"
                   />
@@ -488,7 +488,7 @@ export const ManagerAccountsScreen: React.FC = () => {
                 <label className="text-slate-400 font-bold block mb-1">Kaart-UID</label>
                 <input
                   type="text"
-                  value={editingAcc.card_uid}
+                  value={editingAcc.card_uid || ''}
                   onChange={e => setEditingAcc({ ...editingAcc, card_uid: e.target.value })}
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono focus:outline-none focus:border-cyan-400"
                 />

@@ -25,7 +25,7 @@ import {
   sanitizeForFirestore
 } from './firebase';
 import { doc, writeBatch } from 'firebase/firestore';
-import { formatCardUid, parseLinkedUids } from './store';
+import { formatCardUid, isVirtualCardNumber, normalizeCardUid, parseLinkedUids } from './store';
 
 // Document ID builders matching firestore.rules isValidId regex ^[a-zA-Z0-9_\-]+$
 export const productDocId = (id: number | string) => `prod_${sanitizeDocId(String(id))}`;
@@ -238,10 +238,17 @@ export function toFirestoreBankAccount(acc: BankAccount): Record<string, any> {
     ? acc.card_uids.slice(0, 50).map((x) => String(x).slice(0, 64))
     : undefined;
 
+  const cleanUsername = clampStr(String(acc.username || '').trim().toLowerCase(), 64, 'user') || 'user';
+  const cleanCard = String(acc.card_uid || '').trim()
+    ? isVirtualCardNumber(acc.card_uid)
+      ? formatCardUid(acc.card_uid)
+      : normalizeCardUid(acc.card_uid)
+    : '';
+
   const docData: Record<string, any> = {
-    id: acc.id,
-    username: clampStr(acc.username.trim().toLowerCase(), 64, 'user'),
-    account_holder: clampStr(acc.account_holder, 120, acc.username),
+    id: acc.id ?? Date.now(),
+    username: cleanUsername,
+    account_holder: clampStr(acc.account_holder, 120, cleanUsername) || cleanUsername,
     balance: clampNum(acc.balance, 0, 100000000, 0),
     is_admin: Boolean(acc.is_admin),
     is_banned: Boolean(acc.is_banned),
@@ -252,10 +259,10 @@ export function toFirestoreBankAccount(acc: BankAccount): Record<string, any> {
     updated_at: new Date().toISOString()
   };
 
-  if (acc.password) docData.password = clampStr(acc.password, 128);
-  if (acc.card_uid) docData.card_uid = clampStr(acc.card_uid, 64);
+  if (acc.password !== undefined && acc.password !== '') docData.password = clampStr(acc.password, 128);
+  if (cleanCard) docData.card_uid = clampStr(cleanCard, 64);
   if (cardUids && cardUids.length > 0) docData.card_uids = cardUids;
-  if (acc.pin_code) docData.pin_code = clampStr(acc.pin_code, 32);
+  if (acc.pin_code !== undefined && acc.pin_code !== '') docData.pin_code = clampStr(String(acc.pin_code).trim(), 32);
   if (acc.totp_secret) docData.totp_secret = clampStr(acc.totp_secret, 128);
   if (Array.isArray(acc.backup_codes)) {
     docData.backup_codes = acc.backup_codes.slice(0, 20).map((c) => clampStr(c, 32));
@@ -266,16 +273,19 @@ export function toFirestoreBankAccount(acc: BankAccount): Record<string, any> {
 }
 
 export function fromFirestoreBankAccount(raw: any): BankAccount {
+  const cleanUsername = String(raw.username || '').trim() || String(raw.id || 'user');
+  const rawCard = String(raw.card_uid || '').trim();
+  const numericBalance = Number(raw.balance ?? 0);
   return {
-    id: raw.id,
-    username: String(raw.username || ''),
-    password: raw.password ? String(raw.password) : undefined,
-    account_holder: String(raw.account_holder || raw.username || ''),
-    card_uid: raw.card_uid ? formatCardUid(raw.card_uid) : undefined,
+    id: raw.id ?? cleanUsername,
+    username: cleanUsername,
+    password: raw.password !== undefined && raw.password !== null ? String(raw.password) : undefined,
+    account_holder: String(raw.account_holder || cleanUsername),
+    card_uid: rawCard ? formatCardUid(rawCard) : '',
     linked_uids: parseLinkedUids(raw.linked_uids),
     card_uids: Array.isArray(raw.card_uids) ? raw.card_uids : undefined,
-    pin_code: raw.pin_code ? String(raw.pin_code) : undefined,
-    balance: Number(raw.balance ?? 0),
+    pin_code: raw.pin_code !== undefined && raw.pin_code !== null ? String(raw.pin_code).trim() : undefined,
+    balance: Number.isFinite(numericBalance) ? numericBalance : 0,
     is_admin: Boolean(raw.is_admin),
     is_banned: Boolean(raw.is_banned),
     is_suspended: Boolean(raw.is_suspended),
@@ -288,11 +298,15 @@ export function fromFirestoreBankAccount(raw: any): BankAccount {
 }
 
 export async function saveBankAccountToFirestore(acc: BankAccount): Promise<void> {
-  await fsSetDoc('bank_accounts', bankAccountDocId(acc.username), toFirestoreBankAccount(acc));
+  const cleanUsername = String(acc.username || '').trim();
+  if (!cleanUsername) throw new Error('Gebruikersnaam van WerkPay account ontbreekt.');
+  await fsSetDoc('bank_accounts', bankAccountDocId(cleanUsername), toFirestoreBankAccount(acc));
 }
 
 export async function deleteBankAccountFromFirestore(username: string): Promise<void> {
-  await fsDeleteDoc('bank_accounts', bankAccountDocId(username));
+  const cleanUsername = String(username || '').trim();
+  if (!cleanUsername) return;
+  await fsDeleteDoc('bank_accounts', bankAccountDocId(cleanUsername));
 }
 
 export function toFirestoreBankTransaction(tx: BankTransaction): Record<string, any> {

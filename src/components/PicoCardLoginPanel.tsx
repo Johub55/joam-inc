@@ -30,6 +30,7 @@ import {
 interface PicoCardLoginPanelProps {
   mode: 'pos' | 'werkpay' | 'unlock';
   compact?: boolean;
+  forcePinOnly?: boolean;
   onSuccess?: () => void;
   onCustomCardAuth?: (
     uid: string,
@@ -41,6 +42,7 @@ interface PicoCardLoginPanelProps {
 export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
   mode,
   compact = false,
+  forcePinOnly = false,
   onSuccess,
   onCustomCardAuth,
 }) => {
@@ -55,56 +57,102 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
   const [statusNote, setStatusNote] = useState<string>('');
   const [busyWarning, setBusyWarning] = useState<string>('');
 
+  const effectiveAuthStyle: 'pin' | 'quick' = forcePinOnly ? 'pin' : authStyle;
+
+  const isMountedRef = useRef<boolean>(true);
   const terminalIdRef = useRef<string>(terminalId);
   terminalIdRef.current = terminalId;
   const activeClaimTokenRef = useRef<string>('');
   const waitingRef = useRef<boolean>(false);
-  waitingRef.current = waiting;
-  const authStyleRef = useRef<'pin' | 'quick'>(authStyle);
-  authStyleRef.current = authStyle;
+  const sawActiveForClaimRef = useRef<boolean>(false);
+  const authStyleRef = useRef<'pin' | 'quick'>(effectiveAuthStyle);
+  authStyleRef.current = effectiveAuthStyle;
   const handledSigRef = useRef<string>('');
   const onCustomCardAuthRef = useRef(onCustomCardAuth);
   onCustomCardAuthRef.current = onCustomCardAuth;
+
+  type CardAuthResult = { success: boolean; message: string; requires2FA?: boolean };
+
+  const withTimeout = function <T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+      promise.then(
+        (val) => {
+          clearTimeout(timer);
+          resolve(val);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  };
 
   const performLoginRef = useRef<
     (uid: string, pin: string | undefined, style: 'pin' | 'quick') => Promise<void>
   >(async () => {});
 
   performLoginRef.current = async (uid, pin, style) => {
-    setVerifying(true);
-    setErrorMsg('');
+    // Synchronously release local waiting/claim state BEFORE running login so an unmount
+    // triggered by setting the logged-in user never calls releaseHardwareTerminalIfOwned.
+    waitingRef.current = false;
+    activeClaimTokenRef.current = '';
+    if (isMountedRef.current) {
+      setWaiting(false);
+      setVerifying(true);
+      setErrorMsg('');
+    }
     const currentTermId = terminalIdRef.current;
     try {
-      const res = onCustomCardAuthRef.current
-        ? await onCustomCardAuthRef.current(uid, pin, style)
-        : await (mode === 'pos' ? loginPosWithCard : loginWerkPayWithCard)(uid, pin, style === 'pin');
+      const authPromise: Promise<CardAuthResult> = onCustomCardAuthRef.current
+        ? onCustomCardAuthRef.current(uid, pin, style)
+        : (mode === 'pos' ? loginPosWithCard : loginWerkPayWithCard)(uid, pin, style === 'pin');
+
+      const res: CardAuthResult = await withTimeout<CardAuthResult>(
+        authPromise,
+        12000,
+        'Time-out bij controleren van pas/pincode. Probeer opnieuw.'
+      );
 
       if (res.success) {
-        if (style === 'quick') {
-          await setHardwareTerminalLinked('Ingelogd', uid, currentTermId).catch(() => {});
-        } else {
-          await setHardwareTerminalResult('APPROVED', 'Welkom!', currentTermId).catch(() => {});
+        await withTimeout<void>(
+          style === 'quick'
+            ? setHardwareTerminalLinked('Ingelogd', uid, currentTermId)
+            : setHardwareTerminalResult('APPROVED', 'Welkom!', currentTermId),
+          5000,
+          'Terminal feedback time-out'
+        ).catch(() => {});
+
+        if (isMountedRef.current) {
+          setStatusNote(res.message);
         }
-        setWaiting(false);
-        activeClaimTokenRef.current = '';
-        setStatusNote(res.message);
         showToast(res.message, 'success');
         if (onSuccess) onSuccess();
       } else {
         await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16), currentTermId).catch(() => {});
-        setWaiting(false);
-        activeClaimTokenRef.current = '';
-        setErrorMsg(res.message);
+        if (isMountedRef.current) {
+          setErrorMsg(res.message);
+        }
       }
     } catch (err: any) {
       await setHardwareTerminalResult('DECLINED', 'Inlogfout', currentTermId).catch(() => {});
-      setWaiting(false);
-      activeClaimTokenRef.current = '';
-      setErrorMsg(err?.message || 'Inloggen via pinapparaat mislukt.');
+      if (isMountedRef.current) {
+        setErrorMsg(err?.message || 'Inloggen via pinapparaat mislukt.');
+      }
     } finally {
-      setVerifying(false);
+      if (isMountedRef.current) {
+        setVerifying(false);
+      }
     }
   };
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     const syncTerm = () => {
@@ -118,10 +166,11 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
 
   // Live subscribe to terminal state (busy indicator + active login listener)
   useEffect(() => {
-    let sawActiveForClaim = false;
+    sawActiveForClaimRef.current = false;
 
     const unsub = subscribeHardwareTerminal(
       async (st) => {
+        if (!isMountedRef.current) return;
         setLiveState(st);
 
         if (!waitingRef.current) {
@@ -138,7 +187,7 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
           st.status !== 'IDLE' &&
           (!lockOwner || lockOwner === activeClaimTokenRef.current)
         ) {
-          sawActiveForClaim = true;
+          sawActiveForClaimRef.current = true;
         }
 
         if (
@@ -150,6 +199,8 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
           const sig = `pin:${st.scannedUid}:${st.enteredPin}:${st.updatedAt}`;
           if (handledSigRef.current === sig) return;
           handledSigRef.current = sig;
+          waitingRef.current = false;
+          activeClaimTokenRef.current = '';
           setWaiting(false);
           await performLoginRef.current(st.scannedUid, st.enteredPin, 'pin');
         } else if (
@@ -160,22 +211,27 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
           const sig = `quick:${st.scannedUid}:${st.updatedAt}`;
           if (handledSigRef.current === sig) return;
           handledSigRef.current = sig;
+          waitingRef.current = false;
+          activeClaimTokenRef.current = '';
           setWaiting(false);
           await performLoginRef.current(st.scannedUid, undefined, 'quick');
         } else if (
           st.status === 'IDLE' &&
-          (sawActiveForClaim ||
+          (sawActiveForClaimRef.current ||
             st.updatedAt?.startsWith('pico-') ||
             st.reason?.toLowerCase().includes('geannuleerd') ||
             st.reason?.toLowerCase().includes('timeout'))
         ) {
-          setWaiting(false);
+          waitingRef.current = false;
           activeClaimTokenRef.current = '';
+          setWaiting(false);
           setErrorMsg(st.reason || 'Inloggen geannuleerd op het pinapparaat.');
         }
       },
       () => {
-        if (waitingRef.current) {
+        if (waitingRef.current && isMountedRef.current) {
+          waitingRef.current = false;
+          activeClaimTokenRef.current = '';
           setWaiting(false);
           setErrorMsg('Verbinding met Firebase terminal relay onderbroken.');
         }
@@ -188,11 +244,14 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
     };
   }, [terminalId]);
 
-  // Release own lock cleanly when component unmounts
+  // Release own lock cleanly when component unmounts while still waiting for scan
   useEffect(() => {
     return () => {
       if (waitingRef.current && activeClaimTokenRef.current) {
-        releaseHardwareTerminalIfOwned(activeClaimTokenRef.current, terminalIdRef.current).catch(() => {});
+        const token = activeClaimTokenRef.current;
+        waitingRef.current = false;
+        activeClaimTokenRef.current = '';
+        releaseHardwareTerminalIfOwned(token, terminalIdRef.current).catch(() => {});
       }
     };
   }, []);
@@ -202,6 +261,7 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
     setStatusNote('');
     setBusyWarning('');
     handledSigRef.current = '';
+    sawActiveForClaimRef.current = false;
 
     const targetTermId = terminalIdRef.current;
     if (!targetTermId) {
@@ -213,32 +273,49 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
     activeClaimTokenRef.current = token;
 
     try {
-      const label = mode === 'unlock' ? 'Ontgrendel' : mode === 'pos' ? 'POS Login' : 'WerkPay';
+      const label = forcePinOnly
+        ? 'Inloggen: 2FA'
+        : mode === 'unlock'
+        ? 'Inloggen: Slot'
+        : mode === 'pos'
+        ? 'Inloggen: POS'
+        : 'Inloggen';
       const claimRes =
-        authStyle === 'pin'
+        effectiveAuthStyle === 'pin'
           ? await claimHardwareTerminalPayMode(0, 0, token, label, targetTermId)
           : await claimHardwareTerminalLinkMode(label, token, targetTermId);
 
       if (!claimRes.acquired) {
         activeClaimTokenRef.current = '';
-        setErrorMsg(
-          claimRes.busyMessage ||
-            'Het pinapparaat is momenteel bezig met een betaling of andere sessie.'
-        );
+        if (isMountedRef.current) {
+          setErrorMsg(
+            claimRes.busyMessage ||
+              'Het pinapparaat is momenteel bezig met een betaling of andere sessie.'
+          );
+        }
         return;
       }
 
-      setWaiting(true);
+      if (isMountedRef.current) {
+        waitingRef.current = true;
+        setWaiting(true);
+      } else {
+        activeClaimTokenRef.current = '';
+        releaseHardwareTerminalIfOwned(token, targetTermId).catch(() => {});
+      }
     } catch (err: any) {
       activeClaimTokenRef.current = '';
-      setErrorMsg(err?.message || 'Kon pinapparaat niet activeren.');
+      if (isMountedRef.current) {
+        setErrorMsg(err?.message || 'Kon pinapparaat niet activeren.');
+      }
     }
   };
 
   const handleCancel = async () => {
     const token = activeClaimTokenRef.current;
-    setWaiting(false);
+    waitingRef.current = false;
     activeClaimTokenRef.current = '';
+    setWaiting(false);
     if (token) {
       await releaseHardwareTerminalIfOwned(token, terminalIdRef.current).catch(() => {});
     }
@@ -260,41 +337,48 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
         onChange={setTerminalId}
       />
 
-      {/* Mode selector */}
-      <div className="grid grid-cols-2 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
-        <button
-          type="button"
-          disabled={waiting || verifying}
-          onClick={() => {
-            setAuthStyle('pin');
-            setErrorMsg('');
-          }}
-          className={`py-2 px-2 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
-            authStyle === 'pin'
-              ? 'bg-cyan-500 text-slate-950 font-black shadow'
-              : 'text-slate-400 hover:text-white'
-          }`}
-        >
-          <KeyRound className="w-3.5 h-3.5" />
-          <span>Pas + Pincode</span>
-        </button>
-        <button
-          type="button"
-          disabled={waiting || verifying}
-          onClick={() => {
-            setAuthStyle('quick');
-            setErrorMsg('');
-          }}
-          className={`py-2 px-2 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
-            authStyle === 'quick'
-              ? 'bg-cyan-500 text-slate-950 font-black shadow'
-              : 'text-slate-400 hover:text-white'
-          }`}
-        >
-          <Zap className="w-3.5 h-3.5" />
-          <span>Snelle Pas-Scan</span>
-        </button>
-      </div>
+      {/* Mode selector (locked to PIN only when forcePinOnly is enabled for 2FA) */}
+      {forcePinOnly ? (
+        <div className="px-3 py-2 rounded-xl bg-purple-950/50 border border-purple-500/40 text-purple-200 text-[11px] font-bold flex items-center justify-center gap-1.5">
+          <KeyRound className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+          <span>2FA Beveiliging: Pincode op keypad is verplicht</span>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
+          <button
+            type="button"
+            disabled={waiting || verifying}
+            onClick={() => {
+              setAuthStyle('pin');
+              setErrorMsg('');
+            }}
+            className={`py-2 px-2 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+              effectiveAuthStyle === 'pin'
+                ? 'bg-cyan-500 text-slate-950 font-black shadow'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <KeyRound className="w-3.5 h-3.5" />
+            <span>Pas + Pincode</span>
+          </button>
+          <button
+            type="button"
+            disabled={waiting || verifying}
+            onClick={() => {
+              setAuthStyle('quick');
+              setErrorMsg('');
+            }}
+            className={`py-2 px-2 rounded-lg font-bold flex items-center justify-center gap-1.5 transition ${
+              effectiveAuthStyle === 'quick'
+                ? 'bg-cyan-500 text-slate-950 font-black shadow'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5" />
+            <span>Snelle Pas-Scan</span>
+          </button>
+        </div>
+      )}
 
       {/* Busy indicator if another checkout/terminal owns Pico */}
       {busyWarning && !waiting && (
@@ -323,12 +407,12 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
             </div>
             <div className="space-y-0.5">
               <div className="font-black text-white">
-                {authStyle === 'pin'
+                {effectiveAuthStyle === 'pin'
                   ? 'Inloggen met NFC Pas + Pincode'
                   : 'Direct inloggen door pas te scannen'}
               </div>
               <p className="text-[11px] text-slate-400 leading-relaxed">
-                {authStyle === 'pin'
+                {effectiveAuthStyle === 'pin'
                   ? 'Houd je gekoppelde NFC pas tegen het Pico W pinapparaat en toets je 4-cijferige pincode in op het keypad.'
                   : 'Houd je gekoppelde NFC pas 1 seconde tegen het pinapparaat om zonder typen direct in te loggen.'}
               </p>
@@ -348,7 +432,7 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
             className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-45 text-slate-950 font-black text-sm flex items-center justify-center gap-2 transition shadow-lg shadow-cyan-500/20"
           >
             <Radio className="w-4 h-4" />
-            <span>Activeer Pinapparaat voor Login</span>
+            <span>{forcePinOnly ? 'Start 2FA Scan (Pas + Pincode)' : 'Activeer Pinapparaat voor Login'}</span>
           </button>
         </div>
       ) : (
@@ -358,7 +442,7 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
             <div className="font-black text-sm text-cyan-200">
               {verifying
                 ? 'Pas & gegevens controleren...'
-                : authStyle === 'pin'
+                : effectiveAuthStyle === 'pin'
                 ? 'Houd je pas bij het pinapparaat & toets PIN in...'
                 : 'Houd nu je NFC pas tegen het pinapparaat...'}
             </div>

@@ -46,7 +46,11 @@ import {
   broadcastSync,
   recordLocalOrderMutation,
   recordDeletedOrder,
-  pendingOrderMutations
+  pendingOrderMutations,
+  mergeBankAccountsList,
+  mergePosUsersList,
+  mergeByIdWithCloud,
+  PendingBankWrite
 } from '../services/syncHelpers';
 import { calculateDiscount } from '../services/discountService';
 import { redeemVoucherAnyCustomer, addCoinsToCustomer, isVipSubscriberPhone, issueVoucherForCustomer, findLoyaltyCustomerByPhoneOrName } from '../services/loyalty';
@@ -319,9 +323,11 @@ interface AppContextType {
   enable2FAForUser: (username: string, secret: string, code: string, backupCodes: string[]) => Promise<{ success: boolean; message: string }>;
   disable2FAForUser: (username: string) => Promise<{ success: boolean; message: string }>;
   verify2FACodeForUser: (username: string, code: string) => Promise<boolean>;
+  verify2FACardForUser: (username: string, cardUid: string, pin: string) => Promise<{ success: boolean; message: string }>;
   pending2FALogin: { user: PosUser | BankAccount; loginType: 'pos' | 'werkpay' } | null;
   setPending2FALogin: (val: { user: PosUser | BankAccount; loginType: 'pos' | 'werkpay' } | null) => void;
   confirm2FALogin: (code: string) => Promise<{ success: boolean; message: string }>;
+  confirm2FALoginWithCard: (cardUid: string, pin: string) => Promise<{ success: boolean; message: string }>;
   tablesFrozen: boolean;
   toggleTablesFrozen: (freeze?: boolean) => Promise<{ success: boolean; message: string }>;
   saveDisasterRecoverySnapshot: () => void;
@@ -395,7 +401,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }).catch(() => {});
   };
 
-  // Helper: Encode security & theme flags inside existing JSONB `perms` array so Supabase sync works 100% WITHOUT needing new SQL columns!
+  // Helper: Encode security & theme flags inside perms array for Firebase Firestore pos_users sync.
   const buildDbPermsForUser = (u: PosUser, overrideFreeze?: boolean): string[] => {
     const cleanPerms = (u.perms || ['pos', 'pickup']).filter(p => !p.startsWith('__'));
     const out = [...cleanPerms];
@@ -858,6 +864,60 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return await verifyTotpCode(targetSecret, code, targetBackups);
   };
 
+  const verify2FACardForUser = async (
+    username: string,
+    cardUid: string,
+    pin: string
+  ): Promise<{ success: boolean; message: string }> => {
+    const cleanU = username.trim().replace(/^@+/, '').toLowerCase();
+    const normUid = normalizeCardUid(cardUid);
+    const cleanPin = (pin || '').trim();
+
+    if (!normUid) {
+      return { success: false, message: 'Ongeldige of lege pas-UID ontvangen.' };
+    }
+    if (!cleanPin) {
+      return { success: false, message: 'Bij 2FA is je pincode verplicht!' };
+    }
+
+    let matchedAcc: BankAccount | undefined;
+    try {
+      const dbBanks = await getAllBankAccountsFromFirestore();
+      matchedAcc = dbBanks.find(a => accountMatchesUid(a, normUid));
+    } catch {}
+    if (!matchedAcc) {
+      matchedAcc = bankAccountsRef.current.find(a => accountMatchesUid(a, normUid));
+    }
+    if (!matchedAcc) {
+      return { success: false, message: `Pas (${normUid}) is onbekend.` };
+    }
+
+    if (matchedAcc.username.trim().replace(/^@+/, '').toLowerCase() !== cleanU) {
+      logAuditAction(
+        '2FA_PAS_WEIGERING',
+        `Pas van @${matchedAcc.username} gebruikt voor 2FA van @${cleanU}.`
+      );
+      return {
+        success: false,
+        message: `Deze pas hoort bij @${matchedAcc.username}, niet bij @${username}.`
+      };
+    }
+
+    if (matchedAcc.is_banned || matchedAcc.is_suspended) {
+      return { success: false, message: 'Dit account is geblokkeerd.' };
+    }
+
+    const storedPin = String(matchedAcc.pin_code ?? '').trim();
+    const storedPass = String(matchedAcc.password ?? '').trim();
+    if ((storedPin !== cleanPin) && (storedPass !== cleanPin)) {
+      logAuditAction('2FA_PAS_FOUTE_PIN', `Foute pincode bij 2FA NFC pas voor @${cleanU}.`);
+      return { success: false, message: 'Onjuiste pincode voor deze NFC pas!' };
+    }
+
+    logAuditAction('2FA_PAS_VERIFICATIE', `🔐 2FA geverifieerd via NFC pas + pincode voor @${cleanU} (${normUid}).`);
+    return { success: true, message: `🔐 2FA geverifieerd met NFC pas voor @${username}!` };
+  };
+
   const confirm2FALogin = async (code: string): Promise<{ success: boolean; message: string }> => {
     if (!pending2FALogin) return { success: false, message: 'Geen inlogverzoek in behandeling.' };
 
@@ -885,6 +945,39 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     setPending2FALogin(null);
     logAuditAction('2FA_LOGIN_GESLAAGD', `🔐 Succesvol ingelogd met 2FA als @${user.username}`);
+    return { success: true, message: `Welkom, ${'name' in user ? user.name : user.account_holder}!` };
+  };
+
+  const confirm2FALoginWithCard = async (
+    cardUid: string,
+    pin: string
+  ): Promise<{ success: boolean; message: string }> => {
+    if (!pending2FALogin) return { success: false, message: 'Geen inlogverzoek in behandeling.' };
+
+    const { user, loginType } = pending2FALogin;
+    const cleanU = user.username.trim().toLowerCase();
+    const verifyRes = await verify2FACardForUser(cleanU, cardUid, pin);
+
+    if (!verifyRes.success) {
+      logAuditAction('2FA_LOGIN_MISLUKT', `Mislukte 2FA pas-poging voor @${user.username}: ${verifyRes.message}`);
+      return { success: false, message: verifyRes.message };
+    }
+
+    try {
+      sessionStorage.removeItem(`wd_manager_unlocked_${cleanU}`);
+    } catch {}
+
+    if (loginType === 'pos') {
+      const posUser = user as PosUser;
+      setCurrentPosUser(posUser);
+      setPosUsers(prev => [posUser, ...prev.filter(u => u.username.toLowerCase() !== cleanU)]);
+      setPosScreen(prev => (prev === 'pickup_control' ? 'pickup_control' : 'kassa'));
+    } else {
+      setCurrentBankAccount(user as BankAccount);
+    }
+
+    setPending2FALogin(null);
+    logAuditAction('2FA_LOGIN_GESLAAGD', `🔐 Succesvol ingelogd met 2FA (NFC Pas + Pincode) als @${user.username}`);
     return { success: true, message: `Welkom, ${'name' in user ? user.name : user.account_holder}!` };
   };
 
@@ -1224,13 +1317,33 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return [];
   });
 
-  // WerkPay State
+  // WerkPay State (restores any missing seed accounts unless explicitly deleted)
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>(() => {
+    let localParsed: BankAccount[] = [];
     const saved = localStorage.getItem('wd_bank_accounts');
     if (saved) {
-      try { return JSON.parse(saved); } catch {}
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) localParsed = parsed;
+      } catch {}
     }
-    return INITIAL_BANK_ACCOUNTS;
+    let deletedSet = new Set<string>();
+    try {
+      const delRaw = localStorage.getItem('wd_deleted_bank_usernames');
+      if (delRaw) {
+        const arr = JSON.parse(delRaw);
+        if (Array.isArray(arr)) deletedSet = new Set(arr.map((x: any) => String(x || '').trim().toLowerCase()));
+      }
+    } catch {}
+    if (localParsed.length === 0) return INITIAL_BANK_ACCOUNTS;
+    const { merged } = mergeBankAccountsList({
+      local: localParsed,
+      remote: [],
+      initial: INITIAL_BANK_ACCOUNTS,
+      knownCloudKeys: new Set(),
+      deletedKeys: deletedSet
+    });
+    return merged;
   });
 
   // User requirement: "je begint bij allebei op het inlog scherm zonder bijvoorbeeld!"
@@ -1415,9 +1528,36 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   ordersRef.current = orders;
   const bankAccountsRef = useRef(bankAccounts);
   bankAccountsRef.current = bankAccounts;
+  const posUsersRef = useRef(posUsers);
+  posUsersRef.current = posUsers;
+  const couponsRef = useRef(coupons);
+  couponsRef.current = coupons;
+  const giftCardsRef = useRef(giftCards);
+  giftCardsRef.current = giftCards;
   const tablesFrozenRef = useRef(tablesFrozen);
   tablesFrozenRef.current = tablesFrozen;
   const lastHandledAudioTsRef = useRef<number>(Date.now());
+
+  const loadStringSet = (storageKey: string): Set<string> => {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return new Set(parsed.map((x: any) => String(x || '').trim().toLowerCase()).filter(Boolean));
+        }
+      }
+    } catch {}
+    return new Set();
+  };
+
+  const cloudKnownBankKeysRef = useRef<Set<string>>(loadStringSet('wd_cloud_known_banks'));
+  const deletedBankKeysRef = useRef<Set<string>>(loadStringSet('wd_deleted_bank_usernames'));
+  const pendingBankWritesRef = useRef<Map<string, PendingBankWrite>>(new Map());
+  const cloudKnownPosKeysRef = useRef<Set<string>>(loadStringSet('wd_cloud_known_pos_users'));
+  const deletedPosKeysRef = useRef<Set<string>>(loadStringSet('wd_deleted_pos_usernames'));
+  const cloudKnownCouponIdsRef = useRef<Set<number>>(new Set());
+  const cloudKnownGiftCardIdsRef = useRef<Set<number>>(new Set());
 
   const cloudSnapshotsRef = useRef<{
     bank: string;
@@ -1586,10 +1726,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
       }
 
-      // 2. Bank accounts
+      // 2. Bank accounts (safe merge so partial Firestore collections never wipe local/seed accounts)
       let mergedDbAccounts: BankAccount[] | null = null;
       if (Array.isArray(dbAccounts) && dbAccounts.length > 0 && !isShadowbanned) {
-        mergedDbAccounts = dbAccounts;
+        const { merged, nextKnownCloudKeys } = mergeBankAccountsList({
+          local: bankAccountsRef.current,
+          remote: dbAccounts,
+          initial: INITIAL_BANK_ACCOUNTS,
+          knownCloudKeys: cloudKnownBankKeysRef.current,
+          deletedKeys: deletedBankKeysRef.current,
+          pendingWrites: pendingBankWritesRef.current
+        });
+        cloudKnownBankKeysRef.current = nextKnownCloudKeys;
+        try {
+          localStorage.setItem('wd_cloud_known_banks', JSON.stringify(Array.from(nextKnownCloudKeys)));
+        } catch {}
+
+        mergedDbAccounts = merged;
         const bankSnap = JSON.stringify(mergedDbAccounts);
         if (bankSnap !== cloudSnapshotsRef.current.bank) {
           cloudSnapshotsRef.current.bank = bankSnap;
@@ -1597,14 +1750,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           localStorage.setItem('wd_bank_accounts', bankSnap);
         }
         if (activeBankAcc) {
+          const activeUserLower = String(activeBankAcc.username || '').trim().toLowerCase();
           const found = mergedDbAccounts.find(
-            a => a.id === activeBankAcc.id || a.username.toLowerCase() === activeBankAcc.username.toLowerCase()
+            a => a.id === activeBankAcc.id || String(a.username || '').trim().toLowerCase() === activeUserLower
           );
           if (
             found &&
             (found.balance !== activeBankAcc.balance ||
               found.is_2fa_enabled !== activeBankAcc.is_2fa_enabled ||
               found.card_uid !== activeBankAcc.card_uid ||
+              found.pin_code !== activeBankAcc.pin_code ||
               JSON.stringify(found.linked_uids || []) !== JSON.stringify(activeBankAcc.linked_uids || []))
           ) {
             setCurrentBankAccount(found);
@@ -1631,13 +1786,25 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         setBankTransactions(parsedTxs);
       }
 
-      // 3. POS users
+      // 3. POS users (safe merge so partial Firestore collections never wipe local/seed POS users)
       if (Array.isArray(dbUsers) && dbUsers.length > 0) {
         const remoteFreezeFromPerms = dbUsers.some((u: any) => {
           const rawP = Array.isArray(u.perms) ? u.perms : [];
           return rawP.includes('__tables_frozen__');
         });
-        const parsedUsers: PosUser[] = dbUsers.map(u => parsePosUserFromDb(u));
+        const remoteParsedUsers: PosUser[] = dbUsers.map(u => parsePosUserFromDb(u));
+        const { merged: parsedUsers, nextKnownCloudKeys: nextPosKnown } = mergePosUsersList({
+          local: posUsersRef.current,
+          remote: remoteParsedUsers,
+          initial: INITIAL_POS_USERS,
+          knownCloudKeys: cloudKnownPosKeysRef.current,
+          deletedKeys: deletedPosKeysRef.current
+        });
+        cloudKnownPosKeysRef.current = nextPosKnown;
+        try {
+          localStorage.setItem('wd_cloud_known_pos_users', JSON.stringify(Array.from(nextPosKnown)));
+        } catch {}
+
         const usersSnap = JSON.stringify(parsedUsers);
         if (usersSnap !== cloudSnapshotsRef.current.users) {
           cloudSnapshotsRef.current.users = usersSnap;
@@ -1706,7 +1873,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
       // 5. Coupons
       if (Array.isArray(dbCoupons) && dbCoupons.length > 0 && !isShadowbanned) {
-        const parsedCoupons: Coupon[] = dbCoupons.map((c: any) => ({
+        const remoteCoupons: Coupon[] = dbCoupons.map((c: any) => ({
           id: Number(c.id),
           code: String(c.code || ''),
           discount_type: c.discount_type as any,
@@ -1717,6 +1884,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           description: c.description || undefined,
           is_active: Boolean(c.is_active)
         }));
+        const { merged: parsedCoupons, nextKnownCloudIds } = mergeByIdWithCloud({
+          local: couponsRef.current,
+          remote: remoteCoupons,
+          knownCloudIds: cloudKnownCouponIdsRef.current
+        });
+        cloudKnownCouponIdsRef.current = nextKnownCloudIds;
         const couponsSnap = JSON.stringify(parsedCoupons);
         if (couponsSnap !== cloudSnapshotsRef.current.coupons) {
           cloudSnapshotsRef.current.coupons = couponsSnap;
@@ -1727,7 +1900,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
       // 6. Gift cards
       if (Array.isArray(dbGiftCards) && dbGiftCards.length > 0 && !isShadowbanned) {
-        const parsedGiftCards: GiftCard[] = dbGiftCards.map((g: any) => ({
+        const remoteGiftCards: GiftCard[] = dbGiftCards.map((g: any) => ({
           id: Number(g.id),
           code: String(g.code || ''),
           initial_balance: Number(g.initial_balance || 0),
@@ -1741,6 +1914,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           notes: g.notes || undefined,
           created_at: g.created_at || undefined
         }));
+        const { merged: parsedGiftCards, nextKnownCloudIds } = mergeByIdWithCloud({
+          local: giftCardsRef.current,
+          remote: remoteGiftCards,
+          knownCloudIds: cloudKnownGiftCardIdsRef.current
+        });
+        cloudKnownGiftCardIdsRef.current = nextKnownCloudIds;
         const gcSnap = JSON.stringify(parsedGiftCards);
         if (gcSnap !== cloudSnapshotsRef.current.giftCards) {
           cloudSnapshotsRef.current.giftCards = gcSnap;
@@ -2088,12 +2267,25 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       }, (err) => console.warn('Orders listener error:', err))
     );
 
-    // 2. Bank Accounts Realtime
+    // 2. Bank Accounts Realtime (safe merge)
     unsubs.push(
       fsSubscribeCollection('bank_accounts', (rawAccs) => {
         if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
         if (!rawAccs || rawAccs.length === 0) return;
-        const parsedAccs = rawAccs.map(fromFirestoreBankAccount);
+        const remoteAccs = rawAccs.map(fromFirestoreBankAccount);
+        const { merged: parsedAccs, nextKnownCloudKeys } = mergeBankAccountsList({
+          local: bankAccountsRef.current,
+          remote: remoteAccs,
+          initial: INITIAL_BANK_ACCOUNTS,
+          knownCloudKeys: cloudKnownBankKeysRef.current,
+          deletedKeys: deletedBankKeysRef.current,
+          pendingWrites: pendingBankWritesRef.current
+        });
+        cloudKnownBankKeysRef.current = nextKnownCloudKeys;
+        try {
+          localStorage.setItem('wd_cloud_known_banks', JSON.stringify(Array.from(nextKnownCloudKeys)));
+        } catch {}
+
         const bankSnap = JSON.stringify(parsedAccs);
         if (bankSnap !== cloudSnapshotsRef.current.bank) {
           cloudSnapshotsRef.current.bank = bankSnap;
@@ -2102,8 +2294,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
         const curBank = currentBankAccountRef.current;
         if (curBank) {
+          const curUserLower = String(curBank.username || '').trim().toLowerCase();
           const updatedMe = parsedAccs.find(
-            a => a.id === curBank.id || a.username.toLowerCase() === curBank.username.toLowerCase()
+            a => a.id === curBank.id || String(a.username || '').trim().toLowerCase() === curUserLower
           );
           if (updatedMe) {
             setCurrentBankAccount(updatedMe);
@@ -2154,12 +2347,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       }, (err) => console.warn('Products listener error:', err))
     );
 
-    // 4. Coupons Realtime
+    // 4. Coupons Realtime (safe merge)
     unsubs.push(
       fsSubscribeCollection('coupons', (rawCoupons) => {
         if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
         if (!rawCoupons || rawCoupons.length === 0) return;
-        const parsed: Coupon[] = rawCoupons.map((c: any) => ({
+        const remoteCoupons: Coupon[] = rawCoupons.map((c: any) => ({
           id: Number(c.id),
           code: String(c.code || ''),
           discount_type: c.discount_type as any,
@@ -2170,6 +2363,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           description: c.description || undefined,
           is_active: Boolean(c.is_active)
         }));
+        const { merged: parsed, nextKnownCloudIds } = mergeByIdWithCloud({
+          local: couponsRef.current,
+          remote: remoteCoupons,
+          knownCloudIds: cloudKnownCouponIdsRef.current
+        });
+        cloudKnownCouponIdsRef.current = nextKnownCloudIds;
         const snap = JSON.stringify(parsed);
         if (snap !== cloudSnapshotsRef.current.coupons) {
           cloudSnapshotsRef.current.coupons = snap;
@@ -2179,12 +2378,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       }, (err) => console.warn('Coupons listener error:', err))
     );
 
-    // 5. Gift Cards Realtime
+    // 5. Gift Cards Realtime (safe merge)
     unsubs.push(
       fsSubscribeCollection('gift_cards', (rawGc) => {
         if (!isMounted || currentPosUserRef.current?.is_shadowbanned) return;
         if (!rawGc || rawGc.length === 0) return;
-        const parsed: GiftCard[] = rawGc.map((g: any) => ({
+        const remoteGc: GiftCard[] = rawGc.map((g: any) => ({
           id: Number(g.id),
           code: String(g.code || ''),
           initial_balance: Number(g.initial_balance || 0),
@@ -2198,6 +2397,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           notes: g.notes || undefined,
           created_at: g.created_at || undefined
         }));
+        const { merged: parsed, nextKnownCloudIds } = mergeByIdWithCloud({
+          local: giftCardsRef.current,
+          remote: remoteGc,
+          knownCloudIds: cloudKnownGiftCardIdsRef.current
+        });
+        cloudKnownGiftCardIdsRef.current = nextKnownCloudIds;
         const snap = JSON.stringify(parsed);
         if (snap !== cloudSnapshotsRef.current.giftCards) {
           cloudSnapshotsRef.current.giftCards = snap;
@@ -2238,11 +2443,23 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       }, (err) => console.warn('Cash requests listener error:', err))
     );
 
-    // 7. POS Users Realtime
+    // 7. POS Users Realtime (safe merge)
     unsubs.push(
       fsSubscribeCollection('pos_users', (rawUsers) => {
         if (!isMounted || !rawUsers || rawUsers.length === 0) return;
-        const parsedUsers: PosUser[] = rawUsers.map(u => parsePosUserFromDb(u));
+        const remoteParsedUsers: PosUser[] = rawUsers.map(u => parsePosUserFromDb(u));
+        const { merged: parsedUsers, nextKnownCloudKeys: nextPosKnown } = mergePosUsersList({
+          local: posUsersRef.current,
+          remote: remoteParsedUsers,
+          initial: INITIAL_POS_USERS,
+          knownCloudKeys: cloudKnownPosKeysRef.current,
+          deletedKeys: deletedPosKeysRef.current
+        });
+        cloudKnownPosKeysRef.current = nextPosKnown;
+        try {
+          localStorage.setItem('wd_cloud_known_pos_users', JSON.stringify(Array.from(nextPosKnown)));
+        } catch {}
+
         const usersSnap = JSON.stringify(parsedUsers);
         if (usersSnap !== cloudSnapshotsRef.current.users) {
           cloudSnapshotsRef.current.users = usersSnap;
@@ -2682,30 +2899,30 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (!pin) {
           return { success: false, message: 'Voer uw 4-cijferige pincode in om de betaling te autoriseren.' };
         }
-        const validPin = (currentBankAccount.pin_code && currentBankAccount.pin_code === pin) ||
-                         (currentBankAccount.password && currentBankAccount.password === pin);
+        const validPin = (String(currentBankAccount.pin_code ?? '').trim() === pin && pin.length > 0) ||
+                         (String(currentBankAccount.password ?? '').trim() === pin && pin.length > 0);
         if (!validPin) {
           return { success: false, message: 'Onjuiste pincode! Betaling op deze rekening is geweigerd.' };
         }
         chargedAccount = currentBankAccount;
       } else if (mode === 'login') {
-        const username = paymentMeta.username?.trim().toLowerCase();
+        const username = paymentMeta.username?.trim().replace(/^@+/, '').toLowerCase();
         const password = paymentMeta.password?.trim();
         if (!username || !password) {
           return { success: false, message: 'Voer zowel gebruikersnaam als wachtwoord/pin in!' };
         }
 
-        chargedAccount = bankAccountsRef.current.find(
-          a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
-        ) || null;
+        const matchesBankLogin = (a: BankAccount) =>
+          String(a.username || '').trim().replace(/^@+/, '').toLowerCase() === username &&
+          (String(a.password ?? '').trim() === password || String(a.pin_code ?? '').trim() === password);
+
+        chargedAccount = bankAccountsRef.current.find(matchesBankLogin) || null;
 
         // Try live Firestore if not found locally
         if (!chargedAccount) {
           try {
             const allDbAccs = await getAllBankAccountsFromFirestore();
-            chargedAccount = allDbAccs.find(
-              a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
-            ) || null;
+            chargedAccount = allDbAccs.find(matchesBankLogin) || null;
           } catch {}
         }
       } else if (mode === 'card' || mode === 'terminal') {
@@ -2718,20 +2935,19 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           return { success: false, message: 'Voer de 4-cijferige pincode van de bankpas in.' };
         }
 
-        chargedAccount = bankAccountsRef.current.find(a => {
+        const matchesCardPin = (a: BankAccount) => {
           const matchUid = accountMatchesUid(a, cleanUid);
-          const matchPin = (a.pin_code === pin || a.password === pin);
+          const matchPin = String(a.pin_code ?? '').trim() === pin || String(a.password ?? '').trim() === pin;
           return matchUid && matchPin;
-        }) || null;
+        };
+
+        chargedAccount = bankAccountsRef.current.find(matchesCardPin) || null;
 
         // Try live Firestore if not found locally (supports spaces, casing & linked_uids)
         if (!chargedAccount) {
           try {
             const allDbAccs = await getAllBankAccountsFromFirestore();
-            chargedAccount = allDbAccs.find(candidate => {
-              const matchPin = candidate.pin_code === pin || candidate.password === pin;
-              return matchPin && accountMatchesUid(candidate, cleanUid);
-            }) || null;
+            chargedAccount = allDbAccs.find(matchesCardPin) || null;
           } catch {}
         }
       }
@@ -3071,25 +3287,24 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         }
         const pin = String(meta.pin || '').trim();
         if (!pin) return { success: false, message: 'Voer de 4-cijferige pincode in.' };
-        const validPin = (currentBankAccount.pin_code && currentBankAccount.pin_code === pin) ||
-                         (currentBankAccount.password && currentBankAccount.password === pin);
+        const validPin = (String(currentBankAccount.pin_code ?? '').trim() === pin && pin.length > 0) ||
+                         (String(currentBankAccount.password ?? '').trim() === pin && pin.length > 0);
         if (!validPin) return { success: false, message: 'Onjuiste pincode!' };
         chargedAccount = currentBankAccount;
       } else if (mode === 'login') {
-        const username = String(meta.username || '').trim().toLowerCase();
+        const username = String(meta.username || '').trim().replace(/^@+/, '').toLowerCase();
         const password = String(meta.password || '').trim();
         if (!username || !password) {
           return { success: false, message: 'Vul gebruikersnaam en wachtwoord/PIN in.' };
         }
-        chargedAccount = bankAccountsRef.current.find(
-          a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
-        ) || null;
+        const matchesLogin = (a: BankAccount) =>
+          String(a.username || '').trim().replace(/^@+/, '').toLowerCase() === username &&
+          (String(a.password ?? '').trim() === password || String(a.pin_code ?? '').trim() === password);
+        chargedAccount = bankAccountsRef.current.find(matchesLogin) || null;
         if (!chargedAccount) {
           try {
             const allDbAccs = await getAllBankAccountsFromFirestore();
-            chargedAccount = allDbAccs.find(
-              a => a.username.toLowerCase() === username && (a.password === password || a.pin_code === password)
-            ) || null;
+            chargedAccount = allDbAccs.find(matchesLogin) || null;
           } catch {}
         }
       } else {
@@ -3098,16 +3313,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (!cleanUid) return { success: false, message: 'Geen pasnummer of NFC kaart gescand!' };
         if (!pin) return { success: false, message: 'Voer de 4-cijferige pincode in.' };
 
-        chargedAccount = bankAccountsRef.current.find(a =>
-          accountMatchesUid(a, cleanUid) && (a.pin_code === pin || a.password === pin)
-        ) || null;
+        const matchesCard = (a: BankAccount) =>
+          accountMatchesUid(a, cleanUid) &&
+          (String(a.pin_code ?? '').trim() === pin || String(a.password ?? '').trim() === pin);
+
+        chargedAccount = bankAccountsRef.current.find(matchesCard) || null;
 
         if (!chargedAccount) {
           try {
             const allDbAccs = await getAllBankAccountsFromFirestore();
-            chargedAccount = allDbAccs.find(candidate =>
-              (candidate.pin_code === pin || candidate.password === pin) && accountMatchesUid(candidate, cleanUid)
-            ) || null;
+            chargedAccount = allDbAccs.find(matchesCard) || null;
           } catch {}
         }
       }
@@ -3824,20 +4039,67 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     secret: string,
     mode: 'password' | 'pin'
   ): Promise<{ success: boolean; message: string }> => {
-    const cleanUser = username.trim().toLowerCase();
-    const acc = bankAccounts.find(a => {
-      if (a.username.toLowerCase() !== cleanUser) return false;
-      return mode === 'pin' ? a.pin_code === secret : a.password === secret;
-    });
+    const cleanUser = username.trim().replace(/^@+/, '').toLowerCase();
+    const cleanSecret = secret.trim();
+    if (!cleanUser || !cleanSecret) {
+      return { success: false, message: 'Vul gebruikersnaam en wachtwoord/pincode in.' };
+    }
+
+    const secretMatchesAccount = (a: BankAccount) => {
+      const storedPin = String(a.pin_code ?? '').trim();
+      const storedPass = String(a.password ?? '');
+      const storedPassTrim = storedPass.trim();
+      if (mode === 'pin') {
+        return storedPin.length > 0 && storedPin === cleanSecret;
+      }
+      return (
+        (storedPass.length > 0 && (storedPass === secret || storedPassTrim === cleanSecret)) ||
+        (storedPin.length > 0 && storedPin === cleanSecret)
+      );
+    };
+
+    const findMatchingBankAccount = (list: BankAccount[]): BankAccount | undefined => {
+      const byUsername = list.find(
+        (a) =>
+          String(a.username || '').trim().replace(/^@+/, '').toLowerCase() === cleanUser &&
+          secretMatchesAccount(a)
+      );
+      if (byUsername) return byUsername;
+
+      const byHolder = list.filter(
+        (a) => String(a.account_holder || '').trim().toLowerCase() === cleanUser
+      );
+      if (byHolder.length === 1 && secretMatchesAccount(byHolder[0])) {
+        return byHolder[0];
+      }
+      return undefined;
+    };
+
+    let acc: BankAccount | undefined;
+    try {
+      const dbBanks = await getAllBankAccountsFromFirestore();
+      acc = findMatchingBankAccount(dbBanks);
+    } catch (err) {
+      console.warn('Firestore loginWerkPay fetch error:', err);
+    }
+    if (!acc) {
+      acc = findMatchingBankAccount(bankAccountsRef.current);
+    }
 
     if (!acc) {
       return { success: false, message: `Ongeldige gebruikersnaam of ${mode === 'pin' ? 'pincode' : 'wachtwoord'}.` };
     }
 
+    const cleanU = String(acc.username || '').trim().toLowerCase();
+    if (acc.is_banned || acc.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
+      logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd WerkPay account @${cleanU} probeerde in te loggen.`);
+      return { success: false, message: 'Dit account is geblokkeerd door de beheerder.' };
+    }
+
     // Normale WerkPay login vraagt geen 2FA; 2FA wordt alleen gevraagd bij toegang tot het Manager Menu.
     setPending2FALogin(null);
     setCurrentBankAccount(acc);
-    return { success: true, message: `Welkom terug, ${acc.account_holder}!` };
+    return { success: true, message: `Welkom terug, ${acc.account_holder || acc.username}!` };
   };
 
   const loginWerkPayWithCard = async (
@@ -3854,11 +4116,11 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       const dbBanks = await getAllBankAccountsFromFirestore();
       matchedAcc = dbBanks.find(a => accountMatchesUid(a, normUid));
-    } catch {
-      // fallback to local
+    } catch (err) {
+      console.warn('Firestore loginWerkPayWithCard fetch error:', err);
     }
     if (!matchedAcc) {
-      matchedAcc = bankAccounts.find(a => accountMatchesUid(a, normUid));
+      matchedAcc = bankAccountsRef.current.find(a => accountMatchesUid(a, normUid));
     }
     if (!matchedAcc) {
       return { success: false, message: `Pas (${normUid}) is nog niet gekoppeld aan een WerkPay rekening.` };
@@ -3872,7 +4134,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (requirePin) {
       const cleanPin = (pin || '').trim();
-      if (!cleanPin || (matchedAcc.pin_code !== cleanPin && matchedAcc.password !== cleanPin)) {
+      const storedPin = String(matchedAcc.pin_code ?? '').trim();
+      const storedPass = String(matchedAcc.password ?? '').trim();
+      if (!cleanPin || (storedPin !== cleanPin && storedPass !== cleanPin)) {
         return { success: false, message: 'Onjuiste pincode voor deze pas.' };
       }
     }
@@ -4153,26 +4417,79 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
   const changeWerkPayPin = async (newPin: string): Promise<{ success: boolean; message: string }> => {
     if (!currentBankAccount) return { success: false, message: 'Niet ingelogd.' };
-    if (newPin.trim().length < 4) return { success: false, message: 'Pincode moet minstens 4 tekens lang zijn.' };
+    const cleanPin = newPin.trim();
+    if (cleanPin.length < 4) return { success: false, message: 'Pincode moet minstens 4 tekens lang zijn.' };
 
-    const updated = { ...currentBankAccount, pin_code: newPin.trim() };
+    const userKey = String(currentBankAccount.username || '').trim().toLowerCase();
+    if (shouldBlockTableWrite(`WerkPay pincode wijzigen (@${userKey})`)) {
+      return { success: false, message: 'Tabellen zijn vergrendeld (freeze modus).' };
+    }
+
+    const updated: BankAccount = { ...currentBankAccount, pin_code: cleanPin };
+    const nextAccounts = bankAccountsRef.current.map(a =>
+      a.id === updated.id || String(a.username || '').trim().toLowerCase() === userKey ? updated : a
+    );
+
+    if (userKey) {
+      pendingBankWritesRef.current.set(userKey, { acc: updated, timestamp: Date.now() });
+      if (deletedBankKeysRef.current.has(userKey)) {
+        deletedBankKeysRef.current.delete(userKey);
+        try {
+          localStorage.setItem('wd_deleted_bank_usernames', JSON.stringify(Array.from(deletedBankKeysRef.current)));
+        } catch {}
+      }
+    }
+
     setCurrentBankAccount(updated);
-    setBankAccounts(prev => prev.map(a => a.id === updated.id ? updated : a));
+    setBankAccounts(nextAccounts);
+    try {
+      const snap = JSON.stringify(nextAccounts);
+      cloudSnapshotsRef.current.bank = snap;
+      localStorage.setItem('wd_bank_accounts', snap);
+    } catch {}
+    broadcastSync('SYNC_BANK_ACCOUNTS', nextAccounts);
 
     try {
       await saveBankAccountToFirestore(updated);
-    } catch {}
-
-    return { success: true, message: 'Pincode succesvol gewijzigd!' };
+      if (userKey) {
+        cloudKnownBankKeysRef.current.add(userKey);
+        try {
+          localStorage.setItem('wd_cloud_known_banks', JSON.stringify(Array.from(cloudKnownBankKeysRef.current)));
+        } catch {}
+      }
+      return { success: true, message: 'Pincode succesvol opgeslagen in Firebase Cloud!' };
+    } catch (err: any) {
+      console.error('Firestore changeWerkPayPin error:', err);
+      const errMsg = err?.message || 'Opslaan van pincode in Firebase mislukt.';
+      showToast(`Kon pincode niet opslaan in Firebase: ${errMsg}`, 'error');
+      return { success: false, message: `Fout bij opslaan in Firebase: ${errMsg}` };
+    }
   };
 
   const saveBankAccount = async (
     acc: Partial<BankAccount> & { id?: number | string }
   ): Promise<{ success: boolean; message?: string }> => {
     const cleanTargetUsername = acc.username ? acc.username.trim().toLowerCase() : '';
-    const existingAcc = bankAccountsRef.current.find(
-      a => (acc.id !== undefined && a.id === acc.id) || (cleanTargetUsername && a.username.toLowerCase() === cleanTargetUsername)
+    let existingAcc = bankAccountsRef.current.find(
+      a =>
+        (acc.id !== undefined && a.id === acc.id) ||
+        (cleanTargetUsername && String(a.username || '').trim().toLowerCase() === cleanTargetUsername)
     );
+
+    // Voorkom dat een nog niet lokaal gesynchroniseerd Firestore account per ongeluk wordt overschreven met defaults (€0 / PIN 1234)
+    let workingAccounts = [...bankAccountsRef.current];
+    if (!existingAcc && cleanTargetUsername) {
+      try {
+        const dbBanks = await getAllBankAccountsFromFirestore();
+        const remoteMatch = dbBanks.find(
+          a => String(a.username || '').trim().toLowerCase() === cleanTargetUsername
+        );
+        if (remoteMatch) {
+          existingAcc = remoteMatch;
+          workingAccounts = [...workingAccounts, remoteMatch];
+        }
+      } catch {}
+    }
 
     const normalizeAccountUidField = (raw?: string): string => {
       const trimmed = String(raw || '').trim();
@@ -4182,12 +4499,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         : normalizeCardUid(trimmed);
     };
 
-    let nextAccounts: BankAccount[] = [...bankAccountsRef.current];
+    let nextAccounts: BankAccount[] = workingAccounts;
     let savedRecord: BankAccount;
 
     if (existingAcc) {
       const mergedCardUid =
-        acc.card_uid !== undefined ? normalizeAccountUidField(acc.card_uid) : existingAcc.card_uid;
+        acc.card_uid !== undefined ? normalizeAccountUidField(acc.card_uid) : (existingAcc.card_uid || generateVirtualCardUid());
       const mergedLinkedUids: LinkedNfcTag[] =
         acc.linked_uids !== undefined
           ? parseLinkedUids(acc.linked_uids)
@@ -4197,17 +4514,20 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         ...existingAcc,
         ...acc,
         id: existingAcc.id,
+        username: (acc.username || existingAcc.username).trim().toLowerCase(),
+        account_holder: (acc.account_holder ?? existingAcc.account_holder ?? existingAcc.username).trim(),
         card_uid: mergedCardUid,
         linked_uids: mergedLinkedUids,
       };
     } else {
       const newCardUid = normalizeAccountUidField(acc.card_uid);
       const newLinkedUids = parseLinkedUids(acc.linked_uids || []);
+      const resolvedUsername = cleanTargetUsername || `klant_${Date.now()}`;
       savedRecord = {
         id: Date.now(),
-        username: acc.username?.trim().toLowerCase() || `klant_${Date.now()}`,
+        username: resolvedUsername,
         password: acc.password || '1234',
-        account_holder: acc.account_holder?.trim() || 'Nieuwe Klant',
+        account_holder: acc.account_holder?.trim() || resolvedUsername,
         card_uid: newCardUid,
         linked_uids: newLinkedUids,
         pin_code: acc.pin_code || '1234',
@@ -4215,6 +4535,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         is_admin: Boolean(acc.is_admin),
       };
     }
+
+    const savedUserLower = String(savedRecord.username || '').trim().toLowerCase();
 
     // Verzamel alle UID's van dit account om eventuele dubbele koppelingen bij andere accounts netjes over te zetten
     const claimedPhysicalUids = new Set<string>();
@@ -4226,11 +4548,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     const displacedAccounts: BankAccount[] = [];
     nextAccounts = nextAccounts.map((other) => {
-      if (other.id === savedRecord.id || other.username.toLowerCase() === savedRecord.username.toLowerCase()) {
+      const otherUserLower = String(other.username || '').trim().toLowerCase();
+      if (other.id === savedRecord.id || (otherUserLower && otherUserLower === savedUserLower)) {
         return other;
       }
       let changed = false;
-      let nextOtherCard = other.card_uid;
+      let nextOtherCard = other.card_uid || '';
       if (claimedPhysicalUids.has(normalizeCardUid(other.card_uid))) {
         nextOtherCard = generateVirtualCardUid();
         changed = true;
@@ -4248,7 +4571,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (existingAcc) {
       nextAccounts = nextAccounts.map((a) =>
-        a.id === savedRecord.id || a.username.toLowerCase() === savedRecord.username.toLowerCase()
+        a.id === savedRecord.id || String(a.username || '').trim().toLowerCase() === savedUserLower
           ? savedRecord
           : a
       );
@@ -4256,12 +4579,26 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       nextAccounts = [...nextAccounts, savedRecord];
     }
 
+    // Pending write locks & deletion list bijwerken vóór Firestore writes zodat onSnapshot tussentijds niets terugdraait
+    const writeNow = Date.now();
+    pendingBankWritesRef.current.set(savedUserLower, { acc: savedRecord, timestamp: writeNow });
+    for (const oldAcc of displacedAccounts) {
+      const k = String(oldAcc.username || '').trim().toLowerCase();
+      if (k) pendingBankWritesRef.current.set(k, { acc: oldAcc, timestamp: writeNow });
+    }
+    if (deletedBankKeysRef.current.has(savedUserLower)) {
+      deletedBankKeysRef.current.delete(savedUserLower);
+      try {
+        localStorage.setItem('wd_deleted_bank_usernames', JSON.stringify(Array.from(deletedBankKeysRef.current)));
+      } catch {}
+    }
+
     // Direct React state + localStorage + cross-tab bijwerken
     setBankAccounts(nextAccounts);
     if (
       currentBankAccount &&
       (currentBankAccount.id === savedRecord.id ||
-        currentBankAccount.username.toLowerCase() === savedRecord.username.toLowerCase())
+        String(currentBankAccount.username || '').trim().toLowerCase() === savedUserLower)
     ) {
       setCurrentBankAccount(savedRecord);
     }
@@ -4283,9 +4620,15 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       // 1. Eerst oude houders van dezelfde fysieke UID vrijmaken in Firestore
       for (const oldAcc of displacedAccounts) {
         await saveBankAccountToFirestore(oldAcc);
+        const k = String(oldAcc.username || '').trim().toLowerCase();
+        if (k) cloudKnownBankKeysRef.current.add(k);
       }
       // 2. Daarna het doelaccount opslaan in Firestore
       await saveBankAccountToFirestore(savedRecord);
+      cloudKnownBankKeysRef.current.add(savedUserLower);
+      try {
+        localStorage.setItem('wd_cloud_known_banks', JSON.stringify(Array.from(cloudKnownBankKeysRef.current)));
+      } catch {}
       return { success: true, message: 'Opgeslagen in Firebase Cloud & lokaal.' };
     } catch (err: any) {
       console.error('Unexpected saveBankAccount Firestore error:', err);
@@ -4297,6 +4640,17 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   const deleteBankAccount = async (id: number | string) => {
     const accountToDelete = bankAccountsRef.current.find(a => a.id === id);
     if (!accountToDelete) return;
+
+    const delKey = String(accountToDelete.username || '').trim().toLowerCase();
+    if (delKey) {
+      deletedBankKeysRef.current.add(delKey);
+      cloudKnownBankKeysRef.current.delete(delKey);
+      pendingBankWritesRef.current.delete(delKey);
+      try {
+        localStorage.setItem('wd_deleted_bank_usernames', JSON.stringify(Array.from(deletedBankKeysRef.current)));
+        localStorage.setItem('wd_cloud_known_banks', JSON.stringify(Array.from(cloudKnownBankKeysRef.current)));
+      } catch {}
+    }
 
     const remainingAccounts = bankAccountsRef.current.filter(a => a.id !== id);
     setBankAccounts(remainingAccounts);
@@ -4387,12 +4741,12 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   };
 
   const loginPos = async (username: string, pass: string): Promise<{ success: boolean; message: string }> => {
-    const cleanU = username.trim().toLowerCase();
+    const cleanU = username.trim().replace(/^@+/, '').toLowerCase();
     const cleanPass = pass.trim();
 
     // 0. Quick customer / bestel account login
     if (cleanU === 'bestel_kassa' || cleanU === 'klant' || cleanU === 'gast' || cleanU === 'bestellen') {
-      const custUser = posUsers.find(u => u.username === 'klant') || ORDER_KIOSK_USER;
+      const custUser = posUsersRef.current.find(u => u.username === 'klant') || ORDER_KIOSK_USER;
       setCurrentPosUser(custUser);
       setPosScreen('kassa');
       return { success: true, message: 'Ingelogd als Klant (Bestel Account)!' };
@@ -4406,17 +4760,65 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       return { success: true, message: 'Ingelogd op Raspberry Pi Spaarpaal Kiosk (Vergrendeld)!' };
     }
 
+    const findPosRowMatch = (list: Record<string, any>[]): Record<string, any> | undefined => {
+      const byUsername = list.find(
+        (u) => String(u.username || '').trim().replace(/^@+/, '').toLowerCase() === cleanU
+      );
+      if (byUsername) return byUsername;
+      const byName = list.filter((u) => String(u.name || '').trim().toLowerCase() === cleanU);
+      return byName.length === 1 ? byName[0] : undefined;
+    };
+
+    const findLocalPosMatch = (list: PosUser[]): PosUser | undefined => {
+      const byUsername = list.find(
+        (u) => String(u.username || '').trim().replace(/^@+/, '').toLowerCase() === cleanU
+      );
+      if (byUsername) return byUsername;
+      const byName = list.filter((u) => String(u.name || '').trim().toLowerCase() === cleanU);
+      return byName.length === 1 ? byName[0] : undefined;
+    };
+
+    const findBankMatch = (list: BankAccount[]): BankAccount | undefined => {
+      const byUsername = list.find(
+        (a) => String(a.username || '').trim().replace(/^@+/, '').toLowerCase() === cleanU
+      );
+      if (byUsername) return byUsername;
+      const byHolder = list.filter((a) => String(a.account_holder || '').trim().toLowerCase() === cleanU);
+      return byHolder.length === 1 ? byHolder[0] : undefined;
+    };
+
+    const secretMatchesPosRow = (row: any): boolean => {
+      const storedPass = String(row?.password ?? '');
+      const storedPassTrim = storedPass.trim();
+      const storedPin = String(row?.pin_code ?? '').trim();
+      return (
+        (storedPass.length > 0 && (storedPass === pass || storedPassTrim === cleanPass)) ||
+        (storedPin.length > 0 && storedPin === cleanPass)
+      );
+    };
+
+    const secretMatchesBankRow = (acc: BankAccount): boolean => {
+      const bankPin = String(acc.pin_code ?? '').trim();
+      const bankPass = String(acc.password ?? '');
+      const bankPassTrim = bankPass.trim();
+      return (
+        (bankPass.length > 0 && (bankPass === pass || bankPassTrim === cleanPass)) ||
+        (bankPin.length > 0 && bankPin === cleanPass)
+      );
+    };
+
     // 1. Check live in Firestore pos_users collection first
     try {
       const dbUsers = await fsGetCollection('pos_users');
-      const matchedRow = dbUsers.find((u: any) => String(u.username || '').trim().toLowerCase() === cleanU);
+      const matchedRow = findPosRowMatch(dbUsers);
       if (matchedRow) {
         const parsedDbUser = parsePosUserFromDb(matchedRow);
-        if (parsedDbUser.is_banned || parsedDbUser.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
-          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
+        const matchedCleanU = String(parsedDbUser.username || '').trim().replace(/^@+/, '').toLowerCase();
+        if (parsedDbUser.is_banned || parsedDbUser.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === matchedCleanU)) {
+          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${matchedCleanU} probeerde in te loggen.`);
           return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
         }
-        if (matchedRow.password === cleanPass || matchedRow.password === pass) {
+        if (secretMatchesPosRow(matchedRow)) {
           return await finalizeOrChallengePosLogin(parsedDbUser);
         }
       }
@@ -4427,20 +4829,21 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     // 2. Check live in Firestore bank_accounts
     try {
       const dbBanks = await getAllBankAccountsFromFirestore();
-      const bankData = dbBanks.find(a => a.username.trim().toLowerCase() === cleanU);
+      const bankData = findBankMatch(dbBanks);
       if (bankData) {
-        const matchingPosRecord = posUsers.find(u => u.username.toLowerCase() === cleanU);
+        const matchedCleanU = String(bankData.username || '').trim().replace(/^@+/, '').toLowerCase();
+        const matchingPosRecord = posUsersRef.current.find(u => u.username.toLowerCase() === matchedCleanU);
         if (
           bankData.is_banned ||
           bankData.is_suspended ||
           matchingPosRecord?.is_banned ||
           matchingPosRecord?.is_suspended ||
-          blockedDevices.some(b => b.value.toLowerCase() === cleanU)
+          blockedDevices.some(b => b.value.toLowerCase() === matchedCleanU)
         ) {
-          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
+          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${matchedCleanU} probeerde in te loggen.`);
           return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
         }
-        if (bankData.password === cleanPass || bankData.pin_code === cleanPass || bankData.password === pass) {
+        if (secretMatchesBankRow(bankData)) {
           const bankUser: PosUser = {
             id: typeof bankData.id === 'number' ? bankData.id : Date.now(),
             name: bankData.account_holder,
@@ -4463,25 +4866,33 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
       console.warn('Firestore bank_accounts login error:', err);
     }
 
-    // 3. Try local cached users (fallback if offline)
-    const user = posUsers.find(u => 
-      u.username.toLowerCase() === cleanU && 
-      (!u.password || u.password === cleanPass || cleanPass === '1234' || cleanPass === 'admin123')
-    );
-    if (user) {
-      if (user.is_banned || user.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === cleanU)) {
-        logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${cleanU} probeerde in te loggen.`);
-        return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
+    // 3. Try local cached users (fallback if offline or not yet synced)
+    const localUser = findLocalPosMatch(posUsersRef.current);
+    if (localUser) {
+      const localPassTrim = String(localUser.password ?? '').trim();
+      const localPinTrim = String((localUser as any).pin_code ?? '').trim();
+      const passOk =
+        !localPassTrim ||
+        localUser.password === pass ||
+        localPassTrim === cleanPass ||
+        (localPinTrim.length > 0 && localPinTrim === cleanPass) ||
+        cleanPass === '1234' ||
+        cleanPass === 'admin123';
+      if (passOk) {
+        const matchedCleanU = String(localUser.username || '').trim().replace(/^@+/, '').toLowerCase();
+        if (localUser.is_banned || localUser.is_suspended || blockedDevices.some(b => b.value.toLowerCase() === matchedCleanU)) {
+          logAuditAction('GEBLOKKEERDE_LOGIN_POGING', `Geblokkeerd account @${matchedCleanU} probeerde in te loggen.`);
+          return { success: false, message: '⛔ Dit account is geblokkeerd door de beheerder. Toegang geweigerd.' };
+        }
+        return await finalizeOrChallengePosLogin(localUser);
       }
-      return await finalizeOrChallengePosLogin(user);
     }
 
     // 4. Try local Bank Accounts
-    const bankAcc = bankAccounts.find(
-      a => a.username.toLowerCase() === cleanU && (a.password === cleanPass || a.pin_code === cleanPass)
-    );
-    if (bankAcc) {
-      const matchingPosRecord = posUsers.find(u => u.username.toLowerCase() === cleanU);
+    const bankAcc = findBankMatch(bankAccountsRef.current);
+    if (bankAcc && secretMatchesBankRow(bankAcc)) {
+      const matchedCleanU = String(bankAcc.username || '').trim().replace(/^@+/, '').toLowerCase();
+      const matchingPosRecord = posUsersRef.current.find(u => u.username.toLowerCase() === matchedCleanU);
       const bankUser: PosUser = {
         id: typeof bankAcc.id === 'number' ? bankAcc.id : Date.now(),
         name: bankAcc.account_holder,
@@ -4501,8 +4912,8 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     // 5. Manager / Joas PIN fallback
     if ((cleanU === 'manager' || cleanU === 'admin' || cleanU === 'joas') && (cleanPass === '1234' || cleanPass === 'admin123' || cleanPass === '0000')) {
-      const matchedLocal = posUsers.find(u => u.username.toLowerCase() === 'joas');
-      const matchedBank = bankAccounts.find(a => a.username.toLowerCase() === 'joas');
+      const matchedLocal = posUsersRef.current.find(u => u.username.toLowerCase() === 'joas');
+      const matchedBank = bankAccountsRef.current.find(a => a.username.toLowerCase() === 'joas');
       const managerUser: PosUser = {
         id: matchedLocal?.id || 1,
         name: matchedLocal?.name || 'Joas Thorig',
@@ -4535,11 +4946,11 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     try {
       const dbBanks = await getAllBankAccountsFromFirestore();
       matchedAcc = dbBanks.find(a => accountMatchesUid(a, normUid));
-    } catch {
-      // fallback to local
+    } catch (err) {
+      console.warn('Firestore loginPosWithCard fetch error:', err);
     }
     if (!matchedAcc) {
-      matchedAcc = bankAccounts.find(a => accountMatchesUid(a, normUid));
+      matchedAcc = bankAccountsRef.current.find(a => accountMatchesUid(a, normUid));
     }
     if (!matchedAcc) {
       return { success: false, message: `Pas (${normUid}) is niet bekend. Koppel deze pas eerst via Medewerkers of WerkPin.` };
@@ -4553,7 +4964,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (requirePin) {
       const cleanPin = (pin || '').trim();
-      if (!cleanPin || (matchedAcc.pin_code !== cleanPin && matchedAcc.password !== cleanPin)) {
+      const storedPin = String(matchedAcc.pin_code ?? '').trim();
+      const storedPass = String(matchedAcc.password ?? '').trim();
+      if (!cleanPin || (storedPin !== cleanPin && storedPass !== cleanPin)) {
         return { success: false, message: 'Onjuiste pincode voor deze pas.' };
       }
     }
@@ -4638,7 +5051,9 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     if (requirePin) {
       const cleanPin = (pin || '').trim();
-      if (!cleanPin || (matchedAcc.pin_code !== cleanPin && matchedAcc.password !== cleanPin)) {
+      const storedPin = String(matchedAcc.pin_code ?? '').trim();
+      const storedPass = String(matchedAcc.password ?? '').trim();
+      if (!cleanPin || (storedPin !== cleanPin && storedPass !== cleanPin)) {
         return { success: false, message: 'Onjuiste pincode voor deze pas.' };
       }
     }
@@ -4690,12 +5105,13 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
   };
 
   const updatePosUser = async (u: PosUser): Promise<{ success: boolean; message: string }> => {
+    const userKey = String(u.username || '').trim().toLowerCase();
     // Joas can only be edited by Joas
-    if (u.username.toLowerCase() === 'joas' && currentPosUser?.username.toLowerCase() !== 'joas') {
+    if (userKey === 'joas' && currentPosUser?.username.toLowerCase() !== 'joas') {
       return { success: false, message: 'Joas kan alleen worden aangepast wanneer je als Joas bent ingelogd!' };
     }
 
-    const existing = posUsers.find(x => x.id === u.id);
+    const existing = posUsersRef.current.find(x => x.id === u.id || String(x.username || '').trim().toLowerCase() === userKey);
     const resolvedPassword = u.password && u.password.trim().length > 0
       ? u.password.trim()
       : (existing?.password || '1234');
@@ -4703,14 +5119,27 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     const finalUser: PosUser = {
       ...existing,
       ...u,
+      username: (u.username || existing?.username || '').trim().toLowerCase(),
       password: resolvedPassword
     };
 
-    const updated = posUsers.map(x => x.id === u.id ? finalUser : x);
+    const updated = posUsersRef.current.some(x => x.id === finalUser.id)
+      ? posUsersRef.current.map(x => x.id === finalUser.id ? finalUser : x)
+      : [...posUsersRef.current, finalUser];
     setPosUsers(updated);
-    localStorage.setItem('wd_pos_users', JSON.stringify(updated));
+    try {
+      const snap = JSON.stringify(updated);
+      cloudSnapshotsRef.current.users = snap;
+      localStorage.setItem('wd_pos_users', snap);
+    } catch {}
+    if (userKey && deletedPosKeysRef.current.has(userKey)) {
+      deletedPosKeysRef.current.delete(userKey);
+      try {
+        localStorage.setItem('wd_deleted_pos_usernames', JSON.stringify(Array.from(deletedPosKeysRef.current)));
+      } catch {}
+    }
 
-    if (currentPosUser && currentPosUser.id === u.id) {
+    if (currentPosUser && currentPosUser.id === finalUser.id) {
       setCurrentPosUser(finalUser);
     }
 
@@ -4720,27 +5149,58 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     try {
       await savePosUserToFirestore(finalUser, buildDbPermsForUser(finalUser));
-    } catch {}
-
-    return { success: true, message: `Gebruiker ${finalUser.name} succesvol opgeslagen!` };
+      if (userKey) {
+        cloudKnownPosKeysRef.current.add(userKey);
+        try {
+          localStorage.setItem('wd_cloud_known_pos_users', JSON.stringify(Array.from(cloudKnownPosKeysRef.current)));
+        } catch {}
+      }
+      return { success: true, message: `Gebruiker ${finalUser.name} succesvol opgeslagen in Firebase Cloud!` };
+    } catch (err: any) {
+      console.error('Firestore updatePosUser error:', err);
+      const errMsg = err?.message || 'Kon medewerker niet opslaan in Firebase.';
+      showToast(`Opslaan in Firebase mislukt: ${errMsg}`, 'error');
+      return { success: false, message: `Fout bij opslaan in Firebase: ${errMsg}` };
+    }
   };
 
   const createPosUser = async (u: Omit<PosUser, 'id'>): Promise<{ success: boolean; message: string }> => {
+    const cleanUsername = String(u.username || '').trim().toLowerCase();
     const newId = Date.now();
-    const newUser: PosUser = { ...u, id: newId };
-    const updated = [...posUsers, newUser];
+    const newUser: PosUser = { ...u, username: cleanUsername, id: newId };
+    const updated = [...posUsersRef.current, newUser];
     setPosUsers(updated);
-    localStorage.setItem('wd_pos_users', JSON.stringify(updated));
+    try {
+      const snap = JSON.stringify(updated);
+      cloudSnapshotsRef.current.users = snap;
+      localStorage.setItem('wd_pos_users', snap);
+    } catch {}
+    if (cleanUsername && deletedPosKeysRef.current.has(cleanUsername)) {
+      deletedPosKeysRef.current.delete(cleanUsername);
+      try {
+        localStorage.setItem('wd_deleted_pos_usernames', JSON.stringify(Array.from(deletedPosKeysRef.current)));
+      } catch {}
+    }
 
-    if (shouldBlockTableWrite(`Nieuwe medewerker @${u.username} aanmaken`)) {
+    if (shouldBlockTableWrite(`Nieuwe medewerker @${cleanUsername} aanmaken`)) {
       return { success: true, message: `Nieuwe medewerker ${u.name} aangemaakt!` };
     }
 
     try {
       await savePosUserToFirestore(newUser, buildDbPermsForUser(newUser));
-    } catch {}
-
-    return { success: true, message: `Nieuwe medewerker ${u.name} aangemaakt!` };
+      if (cleanUsername) {
+        cloudKnownPosKeysRef.current.add(cleanUsername);
+        try {
+          localStorage.setItem('wd_cloud_known_pos_users', JSON.stringify(Array.from(cloudKnownPosKeysRef.current)));
+        } catch {}
+      }
+      return { success: true, message: `Nieuwe medewerker ${u.name} aangemaakt & gesynchroniseerd!` };
+    } catch (err: any) {
+      console.error('Firestore createPosUser error:', err);
+      const errMsg = err?.message || 'Kon medewerker niet opslaan in Firebase.';
+      showToast(`Opslaan in Firebase mislukt: ${errMsg}`, 'error');
+      return { success: false, message: `Lokaal aangemaakt, maar Firebase opslaan mislukte: ${errMsg}` };
+    }
   };
 
   const deletePosUser = async (userId: number): Promise<{ success: boolean; message: string }> => {
@@ -4752,6 +5212,16 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     }
     if (target.username === 'bestel_kassa') {
       return { success: false, message: 'Het standaard bestelaccount kan niet worden verwijderd.' };
+    }
+
+    const delKey = String(target.username || '').trim().toLowerCase();
+    if (delKey) {
+      deletedPosKeysRef.current.add(delKey);
+      cloudKnownPosKeysRef.current.delete(delKey);
+      try {
+        localStorage.setItem('wd_deleted_pos_usernames', JSON.stringify(Array.from(deletedPosKeysRef.current)));
+        localStorage.setItem('wd_cloud_known_pos_users', JSON.stringify(Array.from(cloudKnownPosKeysRef.current)));
+      } catch {}
     }
 
     const updated = posUsers.filter(x => x.id !== userId);
@@ -4984,24 +5454,24 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
 
     // 2. Check against logged-in WerkPay bank account
     if (currentBankAccount) {
-      const accUser = currentBankAccount.username.toLowerCase();
-      const accHolder = currentBankAccount.account_holder.toLowerCase();
+      const accUser = String(currentBankAccount.username || '').toLowerCase();
+      const accHolder = String(currentBankAccount.account_holder || currentBankAccount.username || '').toLowerCase();
 
-      if (order.paymentMeta?.account && order.paymentMeta.account.toLowerCase() === accUser) {
+      if (order.paymentMeta?.account && String(order.paymentMeta.account).toLowerCase() === accUser) {
         return true;
       }
-      if (order.paymentMeta?.cardUid && order.paymentMeta.cardUid === currentBankAccount.card_uid) {
+      if (order.paymentMeta?.cardUid && accountMatchesUid(currentBankAccount, String(order.paymentMeta.cardUid))) {
         return true;
       }
       if (order.identifier) {
         const idLower = order.identifier.toLowerCase();
-        if (idLower === accUser || idLower === accHolder || idLower.includes(accUser) || idLower.includes(accHolder)) {
+        if ((accUser && (idLower === accUser || idLower.includes(accUser))) || (accHolder && (idLower === accHolder || idLower.includes(accHolder)))) {
           return true;
         }
       }
       // Check transactions linked to order
       if (bankTransactions.some(tx => tx.order_no === order.no && (
-        tx.from_account.toLowerCase() === accUser || tx.to_account.toLowerCase() === accUser
+        String(tx.from_account || '').toLowerCase() === accUser || String(tx.to_account || '').toLowerCase() === accUser
       ))) {
         return true;
       }
@@ -5172,9 +5642,11 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         enable2FAForUser,
         disable2FAForUser,
         verify2FACodeForUser,
+        verify2FACardForUser,
         pending2FALogin,
         setPending2FALogin,
         confirm2FALogin,
+        confirm2FALoginWithCard,
         tablesFrozen,
         toggleTablesFrozen,
         saveDisasterRecoverySnapshot,

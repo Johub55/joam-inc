@@ -101,9 +101,12 @@ export function euro(amount: number | string | undefined | null): string {
 }
 
 export function formatCardUid(uid?: string): string {
-  const raw = String(uid || '').replace(/\s+/g, '');
-  if (!raw) return '•••• •••• •••• ••••';
-  return raw.replace(/(.{4})/g, '$1 ').trim();
+  const clean = normalizeCardUid(uid);
+  if (!clean) return '•••• •••• •••• ••••';
+  if (isVirtualCardNumber(clean)) {
+    return clean.replace(/(.{4})/g, '$1 ').trim();
+  }
+  return clean;
 }
 
 export function normalizeCardUid(uid?: string | null): string {
@@ -177,7 +180,7 @@ export function accountMatchesUid(
 ): boolean {
   const cleanQuery = normalizeCardUid(query);
   if (!cleanQuery) return false;
-  if (acc.username.trim().toUpperCase() === cleanQuery) return true;
+  if (String(acc.username || '').trim().toUpperCase() === cleanQuery) return true;
   return getAccountAllUids(acc).includes(cleanQuery);
 }
 

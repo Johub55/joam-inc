@@ -11,6 +11,7 @@ import {
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
 } from '../../services/firebase';
+import { getAllBankAccountsFromFirestore } from '../../services/firestoreSync';
 import { TerminalSelector } from './TerminalSelector';
 import {
   normalizeCardUid,
@@ -68,74 +69,88 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
     setSaveError(null);
     setStatus(`Pas gezien (${uid}) — opslaan naar database...`);
 
-    const accounts = bankAccountsRef.current;
-    const cleanUser = username.trim().toLowerCase();
-    const targetAcc = accounts.find((a) => a.username.toLowerCase() === cleanUser);
-    const matchingPosUser = posUsersRef.current.find((u) => u.username.toLowerCase() === cleanUser);
+    try {
+      const accounts = bankAccountsRef.current;
+      const cleanUser = username.trim().toLowerCase();
+      let targetAcc = accounts.find((a) => String(a.username || '').trim().toLowerCase() === cleanUser);
+      if (!targetAcc && cleanUser) {
+        try {
+          const remoteAccs = await getAllBankAccountsFromFirestore();
+          targetAcc = remoteAccs.find((a) => String(a.username || '').trim().toLowerCase() === cleanUser);
+        } catch {}
+      }
+      const matchingPosUser = posUsersRef.current.find(
+        (u) => String(u.username || '').trim().toLowerCase() === cleanUser
+      );
 
-    const previousOwner = accounts.find((a) => {
-      if (a.username.toLowerCase() === cleanUser) return false;
-      const prim = normalizeCardUid(a.card_uid);
-      const extras = parseLinkedUids(a.linked_uids).map((t) => t.uid);
-      return prim === uid || extras.includes(uid);
-    });
+      const previousOwner = accounts.find((a) => {
+        if (String(a.username || '').trim().toLowerCase() === cleanUser) return false;
+        const prim = normalizeCardUid(a.card_uid);
+        const extras = parseLinkedUids(a.linked_uids).map((t) => t.uid);
+        return prim === uid || extras.includes(uid);
+      });
 
-    const mode = linkModeRef.current;
-    const label = tagLabelRef.current.trim();
-    const nowIso = new Date().toISOString();
+      const mode = linkModeRef.current;
+      const label = tagLabelRef.current.trim();
+      const nowIso = new Date().toISOString();
 
-    let res: { success: boolean; message?: string };
+      let res: { success: boolean; message?: string };
 
-    if (targetAcc) {
-      const existingExtras = parseLinkedUids(targetAcc.linked_uids || []);
-      if (mode === 'extra') {
-        const nextExtras = [
-          ...existingExtras.filter((t) => t.uid !== uid),
-          { uid, label: label || 'Extra NFC Tag', linkedAt: nowIso },
-        ];
-        res = await saveBankAccountRef.current({
-          ...targetAcc,
-          linked_uids: nextExtras,
-        });
+      if (targetAcc) {
+        const existingExtras = parseLinkedUids(targetAcc.linked_uids || []);
+        if (mode === 'extra') {
+          const nextExtras = [
+            ...existingExtras.filter((t) => t.uid !== uid),
+            { uid, label: label || 'Extra NFC Tag', linkedAt: nowIso },
+          ];
+          res = await saveBankAccountRef.current({
+            ...targetAcc,
+            linked_uids: nextExtras,
+          });
+        } else {
+          const nextExtras = existingExtras.filter((t) => t.uid !== uid);
+          res = await saveBankAccountRef.current({
+            ...targetAcc,
+            card_uid: uid,
+            linked_uids: nextExtras,
+          });
+        }
       } else {
-        const nextExtras = existingExtras.filter((t) => t.uid !== uid);
+        const holderName = matchingPosUser?.name || username.trim();
         res = await saveBankAccountRef.current({
-          ...targetAcc,
+          username: cleanUser,
+          account_holder: holderName,
           card_uid: uid,
-          linked_uids: nextExtras,
+          linked_uids: mode === 'extra' && label ? [{ uid, label, linkedAt: nowIso }] : [],
+          pin_code: '1234',
+          balance: 0,
+          is_admin: Boolean(matchingPosUser?.is_admin),
         });
       }
-    } else {
-      const holderName = matchingPosUser?.name || username.trim();
-      res = await saveBankAccountRef.current({
-        username: cleanUser,
-        account_holder: holderName,
-        card_uid: uid,
-        linked_uids: mode === 'extra' && label ? [{ uid, label, linkedAt: nowIso }] : [],
-        pin_code: '1234',
-        balance: 0,
-        is_admin: Boolean(matchingPosUser?.is_admin),
-      });
-    }
 
-    setSaving(false);
+      if (!res.success) {
+        setSaveError(res.message || 'Opslaan naar database mislukt.');
+        setStatus(`Fout bij opslaan van UID ${uid}.`);
+        return;
+      }
 
-    if (!res.success) {
-      setSaveError(res.message || 'Opslaan naar database mislukt.');
+      if (fromPico) {
+        lockAcquiredRef.current = false;
+        await setHardwareTerminalLinked(username, uid, terminalIdRef.current).catch(() => {});
+      }
+
+      setLinkedUid(uid);
+      const transferNote = previousOwner ? ` (overgezet van @${previousOwner.username})` : '';
+      const modeLabel = mode === 'extra' ? 'als extra tag toegevoegd aan' : 'gekoppeld als hoofdpas aan';
+      setStatus(`✅ Pas ${uid} succesvol ${modeLabel} @${username}${transferNote}!`);
+      showToast(`NFC Pas ${uid} opgeslagen voor @${username}${transferNote}!`, 'success');
+    } catch (err: any) {
+      console.error('commitScannedUid error:', err);
+      setSaveError(err?.message || 'Onverwachte fout bij opslaan van NFC pas.');
       setStatus(`Fout bij opslaan van UID ${uid}.`);
-      return;
+    } finally {
+      setSaving(false);
     }
-
-    if (fromPico) {
-      lockAcquiredRef.current = false;
-      await setHardwareTerminalLinked(username, uid, terminalIdRef.current).catch(() => {});
-    }
-
-    setLinkedUid(uid);
-    const transferNote = previousOwner ? ` (overgezet van @${previousOwner.username})` : '';
-    const modeLabel = mode === 'extra' ? 'als extra tag toegevoegd aan' : 'gekoppeld als hoofdpas aan';
-    setStatus(`✅ Pas ${uid} succesvol ${modeLabel} @${username}${transferNote}!`);
-    showToast(`NFC Pas ${uid} opgeslagen voor @${username}${transferNote}!`, 'success');
   };
 
   useEffect(() => {
@@ -246,9 +261,9 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
   };
 
   const targetAcc = bankAccounts.find(
-    (a) => a.username.toLowerCase() === username.trim().toLowerCase()
+    (a) => String(a.username || '').trim().toLowerCase() === username.trim().toLowerCase()
   );
-  const currentHasPhysical = targetAcc && !isVirtualCardNumber(targetAcc.card_uid);
+  const currentHasPhysical = Boolean(targetAcc && normalizeCardUid(targetAcc.card_uid) && !isVirtualCardNumber(targetAcc.card_uid));
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">

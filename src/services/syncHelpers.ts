@@ -1,4 +1,4 @@
-import type { Order, OrderStatus } from '../types';
+import type { BankAccount, Coupon, GiftCard, Order, OrderStatus, PosUser } from '../types';
 
 /**
  * Optimistic mutation lock tracker.
@@ -213,3 +213,152 @@ export const broadcastSync = (type: string, payload: any) => {
     console.debug('BroadcastChannel post error:', err);
   }
 };
+
+export interface PendingBankWrite {
+  acc: BankAccount;
+  timestamp: number;
+}
+
+/**
+ * Safely merge Firestore bank accounts with local & seed accounts.
+ * Prevents a partial Firestore collection (e.g. 1 newly linked card) from wiping
+ * other local/seed WerkPay accounts, while still propagating genuine cloud deletions
+ * of accounts that were previously known to exist in Firestore.
+ */
+export function mergeBankAccountsList(params: {
+  local: BankAccount[];
+  remote: BankAccount[];
+  initial?: BankAccount[];
+  knownCloudKeys: Set<string>;
+  deletedKeys: Set<string>;
+  pendingWrites?: Map<string, PendingBankWrite>;
+}): { merged: BankAccount[]; nextKnownCloudKeys: Set<string> } {
+  const now = Date.now();
+  const nextKnownCloudKeys = new Set(params.knownCloudKeys);
+  const byUser = new Map<string, BankAccount>();
+
+  const normKey = (u?: string) => String(u || '').trim().toLowerCase();
+
+  // 1. Remote accounts are authoritative for anything present in Firestore
+  for (const rAcc of params.remote) {
+    const key = normKey(rAcc.username);
+    if (!key) continue;
+    nextKnownCloudKeys.add(key);
+
+    // Protect freshly written local account for 15s against intermediate snapshots
+    const pending = params.pendingWrites?.get(key);
+    if (pending && now - pending.timestamp < 15000) {
+      byUser.set(key, pending.acc);
+    } else {
+      byUser.set(key, rAcc);
+    }
+  }
+
+  // 2. Keep un-uploaded local accounts (or pending writes) not in remote yet
+  for (const lAcc of params.local) {
+    const key = normKey(lAcc.username);
+    if (!key || byUser.has(key)) continue;
+
+    const pending = params.pendingWrites?.get(key);
+    if (pending && now - pending.timestamp < 15000) {
+      byUser.set(key, pending.acc);
+      continue;
+    }
+
+    if (params.deletedKeys.has(key)) continue;
+
+    // If this account previously existed in Firestore and is now missing remotely,
+    // another device intentionally deleted it from the cloud.
+    if (params.remote.length > 0 && params.knownCloudKeys.has(key)) {
+      nextKnownCloudKeys.delete(key);
+      continue;
+    }
+
+    byUser.set(key, lAcc);
+  }
+
+  // 3. Restore seed accounts (e.g. @joas) if never uploaded to cloud and never deleted
+  for (const initAcc of params.initial || []) {
+    const key = normKey(initAcc.username);
+    if (!key || byUser.has(key)) continue;
+    if (params.deletedKeys.has(key)) continue;
+    if (params.remote.length > 0 && params.knownCloudKeys.has(key)) continue;
+    byUser.set(key, initAcc);
+  }
+
+  return { merged: Array.from(byUser.values()), nextKnownCloudKeys };
+}
+
+/**
+ * Safely merge Firestore POS users with local & seed POS users.
+ */
+export function mergePosUsersList(params: {
+  local: PosUser[];
+  remote: PosUser[];
+  initial?: PosUser[];
+  knownCloudKeys: Set<string>;
+  deletedKeys: Set<string>;
+}): { merged: PosUser[]; nextKnownCloudKeys: Set<string> } {
+  const nextKnownCloudKeys = new Set(params.knownCloudKeys);
+  const byUser = new Map<string, PosUser>();
+  const normKey = (u?: string) => String(u || '').trim().toLowerCase();
+
+  for (const rUser of params.remote) {
+    const key = normKey(rUser.username);
+    if (!key) continue;
+    nextKnownCloudKeys.add(key);
+    byUser.set(key, rUser);
+  }
+
+  for (const lUser of params.local) {
+    const key = normKey(lUser.username);
+    if (!key || byUser.has(key)) continue;
+    if (params.deletedKeys.has(key)) continue;
+    if (params.remote.length > 0 && params.knownCloudKeys.has(key)) {
+      nextKnownCloudKeys.delete(key);
+      continue;
+    }
+    byUser.set(key, lUser);
+  }
+
+  for (const initUser of params.initial || []) {
+    const key = normKey(initUser.username);
+    if (!key || byUser.has(key)) continue;
+    if (params.deletedKeys.has(key)) continue;
+    if (params.remote.length > 0 && params.knownCloudKeys.has(key)) continue;
+    byUser.set(key, initUser);
+  }
+
+  return { merged: Array.from(byUser.values()), nextKnownCloudKeys };
+}
+
+/**
+ * Safely merge numeric-id collections (coupons, gift cards) with local un-synced items.
+ */
+export function mergeByIdWithCloud<T extends { id: number }>(params: {
+  local: T[];
+  remote: T[];
+  knownCloudIds: Set<number>;
+}): { merged: T[]; nextKnownCloudIds: Set<number> } {
+  const nextKnownCloudIds = new Set(params.knownCloudIds);
+  const byId = new Map<number, T>();
+
+  for (const rItem of params.remote) {
+    nextKnownCloudIds.add(Number(rItem.id));
+    byId.set(Number(rItem.id), rItem);
+  }
+
+  for (const lItem of params.local) {
+    const id = Number(lItem.id);
+    if (byId.has(id)) continue;
+    if (params.remote.length > 0 && params.knownCloudIds.has(id)) {
+      nextKnownCloudIds.delete(id);
+      continue;
+    }
+    byId.set(id, lItem);
+  }
+
+  return { merged: Array.from(byId.values()), nextKnownCloudIds };
+}
+
+export type MergedCouponOrGiftCard = Coupon | GiftCard;

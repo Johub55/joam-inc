@@ -734,7 +734,7 @@ export const DigitalPhone: React.FC = () => {
     localStorage.setItem('wd_phone_sms_history', JSON.stringify(updatedContacts));
   };
 
-  // Synchronous Cross-Tab & Supabase Real-Time Phone Signals Protocol (SMS + Calling)
+  // Synchronous Cross-Tab & Firebase Firestore Real-Time Phone Signals Protocol (SMS + Calling)
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -1176,7 +1176,8 @@ export const DigitalPhone: React.FC = () => {
   const handleWdEmpLogin = () => {
     playClick();
     setWdEmpError(null);
-    const cleanU = wdEmpUsername.trim().toLowerCase();
+    const cleanU = wdEmpUsername.trim().replace(/^@+/, '').toLowerCase();
+    const rawP = wdEmpPassword;
     const cleanP = wdEmpPassword.trim();
 
     if (!cleanU || !cleanP) {
@@ -1184,8 +1185,50 @@ export const DigitalPhone: React.FC = () => {
       return;
     }
 
-    // Verify against registered posUsers
-    const match = posUsers.find(u => u.username.toLowerCase() === cleanU && u.password === cleanP);
+    const matchesSecret = (candidate: any) => {
+      if (candidate === undefined || candidate === null) return false;
+      const str = String(candidate);
+      return str === rawP || str.trim() === cleanP;
+    };
+
+    // 1. Verify against registered posUsers (username first, unique name fallback)
+    const posByUsername = posUsers.find(u => u.username.trim().toLowerCase() === cleanU);
+    const posByNameMatches = posByUsername ? [] : posUsers.filter(u => (u.name || '').trim().toLowerCase() === cleanU);
+    const candidatePos = posByUsername || (posByNameMatches.length === 1 ? posByNameMatches[0] : undefined);
+
+    let match: PosUser | undefined =
+      candidatePos && (matchesSecret(candidatePos.password) || matchesSecret((candidatePos as any).pin_code))
+        ? candidatePos
+        : undefined;
+
+    // 2. Fallback: allow synced bankAccounts credentials if not yet mirrored into posUsers
+    if (!match) {
+      const bankByUsername = bankAccounts.find(a => a.username.trim().toLowerCase() === cleanU);
+      const bankByHolderMatches = bankByUsername
+        ? []
+        : bankAccounts.filter(a => (a.account_holder || '').trim().toLowerCase() === cleanU);
+      const candidateBank = bankByUsername || (bankByHolderMatches.length === 1 ? bankByHolderMatches[0] : undefined);
+
+      if (candidateBank && (matchesSecret(candidateBank.password) || matchesSecret(candidateBank.pin_code))) {
+        match = {
+          id: candidateBank.id,
+          name: candidateBank.account_holder,
+          username: candidateBank.username,
+          password: String(candidateBank.password ?? ''),
+          perms: candidateBank.is_admin
+            ? ['pos', 'pickup', 'kitchen', 'admin', 'kiosk']
+            : ['pos', 'pickup', 'kitchen', 'kiosk'],
+          is_admin: Boolean(candidateBank.is_admin),
+          is_banned: Boolean(candidateBank.is_banned),
+          is_suspended: Boolean(candidateBank.is_suspended),
+          is_shadowbanned: Boolean(candidateBank.is_shadowbanned),
+          is_2fa_enabled: Boolean(candidateBank.is_2fa_enabled),
+          totp_secret: candidateBank.totp_secret,
+          backup_codes: candidateBank.backup_codes
+        };
+      }
+    }
+
     if (match) {
       setWdEmpUser(match);
       setWdEmpUsername('');
@@ -1488,7 +1531,7 @@ export const DigitalPhone: React.FC = () => {
                             className="w-full p-2.5 rounded-xl border bg-slate-900 border-slate-800 hover:bg-slate-850 text-slate-300 flex items-center justify-between transition"
                           >
                             <div className="min-w-0">
-                              <div className="font-bold text-[11px] truncate text-white">{acc.account_holder}</div>
+                              <div className="font-bold text-[11px] truncate text-white">{acc.account_holder || acc.username}</div>
                               <div className="text-[9px] text-slate-500 font-mono">@{acc.username}</div>
                             </div>
                             <span className="text-[10px] bg-cyan-500/10 text-cyan-400 px-1.5 py-0.5 rounded font-black font-mono">
@@ -1561,7 +1604,7 @@ export const DigitalPhone: React.FC = () => {
                           <div>
                             <span className="text-[8px] font-black uppercase tracking-widest text-cyan-200">WerkPay Debit</span>
                             <div className="font-black text-[13px] tracking-tight mt-1 truncate max-w-[150px]">
-                              {wpAccount.account_holder}
+                              {wpAccount.account_holder || wpAccount.username}
                             </div>
                           </div>
                           <span className="text-lg font-black text-cyan-200">WP</span>
@@ -1645,13 +1688,21 @@ export const DigitalPhone: React.FC = () => {
                                 return;
                               }
 
-                              // Simulate transfer
-                              wpAccount.balance -= amt;
-                              targetAcc.balance += amt;
-                              
-                              // Trigger database saves if possible
-                              saveBankAccount(wpAccount);
-                              saveBankAccount(targetAcc);
+                              const updatedSender = {
+                                ...wpAccount,
+                                balance: wpAccount.is_admin
+                                  ? wpAccount.balance
+                                  : Math.max(0, Math.round((Number(wpAccount.balance || 0) - amt) * 100) / 100)
+                              };
+                              const updatedTarget = {
+                                ...targetAcc,
+                                balance: targetAcc.is_admin
+                                  ? targetAcc.balance
+                                  : Math.round((Number(targetAcc.balance || 0) + amt) * 100) / 100
+                              };
+
+                              await saveBankAccount(updatedSender);
+                              await saveBankAccount(updatedTarget);
 
                               setWpTransferSuccess(true);
                               setWpTransferAmount('');

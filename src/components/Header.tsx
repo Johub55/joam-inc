@@ -391,7 +391,7 @@ export const Header: React.FC<HeaderProps> = ({ onOpenGithub, hideHeader = false
               title="WerkPay kaarthouder & saldo"
             >
               <CreditCard className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="font-bold">{currentBankAccount.account_holder.split(' ')[0]}</span>
+              <span className="font-bold">{(currentBankAccount.account_holder || currentBankAccount.username || 'WerkPay').split(' ')[0]}</span>
               <span className="font-extrabold text-cyan-200 bg-cyan-500/20 px-1.5 py-0.5 rounded text-[11px]">
                 {currentBankAccount.is_admin ? '€ ∞' : euro(currentBankAccount.balance)}
               </span>

@@ -137,8 +137,11 @@ export const WalletScreen: React.FC = () => {
   // Filter transactions for current user
   const userTransactions = bankTransactions.filter(tx => {
     if (!currentBankAccount) return false;
-    const me = currentBankAccount.username.toLowerCase();
-    return tx.from_account.toLowerCase() === me || tx.to_account.toLowerCase() === me;
+    const me = String(currentBankAccount.username || '').toLowerCase();
+    return (
+      String(tx.from_account || '').toLowerCase() === me ||
+      String(tx.to_account || '').toLowerCase() === me
+    );
   });
 
   // Filter orders belonging to this user or placed in this session
@@ -243,21 +246,22 @@ export const WalletScreen: React.FC = () => {
                   required
                   value={loginUser}
                   onChange={e => setLoginUser(e.target.value)}
-                  placeholder="Gebruikersnaam invoeren..."
+                  placeholder="Gebruikersnaam (bijv. niek)"
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-cyan-400"
                 />
               </div>
 
               <div>
                 <label className="text-slate-400 font-bold block mb-1">
-                  {loginMode === 'pin' ? 'Pincode' : 'Wachtwoord'}
+                  {loginMode === 'pin' ? 'Pincode' : 'Wachtwoord of Pincode'}
                 </label>
                 <input
                   type="password"
+                  inputMode={loginMode === 'pin' ? 'numeric' : 'text'}
                   required
                   value={loginSecret}
                   onChange={e => setLoginSecret(e.target.value)}
-                  placeholder={loginMode === 'pin' ? '1234' : '••••••••'}
+                  placeholder={loginMode === 'pin' ? 'Bijv. 1345' : '•••••••• of pincode'}
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-cyan-400"
                 />
               </div>
@@ -366,7 +370,7 @@ export const WalletScreen: React.FC = () => {
                     Kaarthouder
                   </span>
                   <span className="font-bold text-sm sm:text-base text-white tracking-wide">
-                    {currentBankAccount.account_holder}
+                    {currentBankAccount.account_holder || currentBankAccount.username}
                   </span>
                   <span className="text-[11px] text-cyan-400 block font-mono">
                     @{currentBankAccount.username}
@@ -560,9 +564,9 @@ export const WalletScreen: React.FC = () => {
                   </p>
                 ) : (
                   userTransactions.map(tx => {
-                    const isCredit = tx.to_account.toLowerCase() === currentBankAccount.username.toLowerCase();
-                    const isKoekploegOrder = tx.to_account.includes('Koekploeg') || tx.label.includes('Koekploeg') || (tx.note && tx.note.includes('Koekploeg'));
-                    const isWerkdonaldsOrder = tx.to_account.includes('Werkdonalds') || tx.label.includes('Werkdonalds');
+                    const isCredit = String(tx.to_account || '').toLowerCase() === String(currentBankAccount.username || '').toLowerCase();
+                    const isKoekploegOrder = String(tx.to_account || '').includes('Koekploeg') || String(tx.label || '').includes('Koekploeg') || (tx.note && tx.note.includes('Koekploeg'));
+                    const isWerkdonaldsOrder = String(tx.to_account || '').includes('Werkdonalds') || String(tx.label || '').includes('Werkdonalds');
                     const isFoodOrder = isKoekploegOrder || isWerkdonaldsOrder;
                     const linkedOrder = orders.find(o => 
                       (tx.order_no && o.no === tx.order_no) || 

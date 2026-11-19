@@ -714,7 +714,7 @@ export const PICO_W_I2C_NFC_SKETCH_CODE = `/*
  *  WERKPAY - DIY PINAPPARAAT (RASPBERRY PI PICO W + FIREBASE CLOUD RELAY)
  * ==============================================================================
  *  - Multi-Terminal support (eigen Terminal-ID zelf instellen via code / AP / USB)
- *  - Werkt voor Betalingen, NFC Pas-Login, Vergrendelen & Snelle Saldo Check (B)
+ *  - Werkt voor Betalingen, NFC Pas-Login & Vergrendelen
  *  - Slaat WiFi & Terminal-ID op in EEPROM: vul ze direct in bovenaan de .INO
  *    of stel ze draadloos in via de hotspot WerkPay-Setup (192.168.4.1)
  *  - Vereiste Arduino Libraries (Library Manager):
@@ -794,8 +794,19 @@ byte rowPins[ROWS] = {13, 12, 11, 10};
 byte colPins[COLS] = {9, 8, 7, 6};
 
 unsigned long laatsteToetsTijd = 0;
-const unsigned long DEBOUNCE_DELAY = 300;
-bool toetsIngedruktVorigeKeer = false;
+unsigned long lastKeyActivityMs = 0;
+const unsigned long KEY_PRESS_DEBOUNCE_MS = 22;
+const unsigned long KEY_RELEASE_DEBOUNCE_MS = 35;
+char debouncedKey = 0;
+char candidateKey = 0;
+unsigned long candidateSinceMs = 0;
+
+unsigned long buzzerOffAt = 0;
+bool buzzerActive = false;
+bool nfcReady = false;
+unsigned long lastNfcScanMs = 0;
+const unsigned long NFC_SCAN_INTERVAL_MS = 180;
+const uint16_t NFC_READ_TIMEOUT_MS = 95;
 
 enum TerminalState {
   STATE_IDLE,
@@ -829,6 +840,8 @@ String getFirestoreDocUrl();
 String sanitizeTerminalId(const String& raw);
 String escapeHtmlAttr(const String& raw);
 void beep(int freq, int ms);
+void beepAsync(int freq, int ms);
+void updateBuzzer();
 String pad16(const String& s);
 void lcdShow(const String& line1, const String& line2);
 String formatShortReason(const String& rawReason);
@@ -842,13 +855,16 @@ void handleSerialCommands();
 void setIdleScreen();
 void toonPincodeScherm();
 void updatePinDisplay();
+void resetKeypadState();
+char readRawKeypadOnce();
+char readRawKeypadStable();
 char scanKeypad();
 bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload);
 bool patchFirestore(const String& maskQuery, const JsonDocument& doc);
-void patchStatusIdle(const String& reason = "");
-void patchCardScanned(const String& uid);
-void patchCheckCard(const String& uid);
-void patchPaymentSubmitted(const String& uid, const String& pin);
+bool patchStatusIdle(const String& reason = "");
+bool patchCardScanned(const String& uid);
+bool patchCheckCard(const String& uid);
+bool patchPaymentSubmitted(const String& uid, const String& pin);
 void annuleerDirect();
 void simuleerBonPrinten();
 void startBalanceCheckState();
@@ -885,9 +901,23 @@ String escapeHtmlAttr(const String& raw) {
 }
 
 void beep(int freq, int ms) {
+  buzzerActive = false;
   tone(BUZZER_PIN, freq, ms);
   delay(ms);
   noTone(BUZZER_PIN);
+}
+
+void beepAsync(int freq, int ms) {
+  tone(BUZZER_PIN, freq);
+  buzzerOffAt = millis() + (unsigned long)ms;
+  buzzerActive = true;
+}
+
+void updateBuzzer() {
+  if (buzzerActive && (long)(millis() - buzzerOffAt) >= 0) {
+    noTone(BUZZER_PIN);
+    buzzerActive = false;
+  }
 }
 
 String pad16(const String& s) {
@@ -976,7 +1006,10 @@ void loadWifiConfig() {
     activeSsid = compiledSsid;
     activePass = String(password);
     Serial.println("[WIFI] Inladen uit sketch: " + activeSsid + " | Terminal=" + activeTerminalId);
+    return;
   }
+
+  Serial.println("[CONFIG] Geen WiFi opgeslagen");
 }
 
 void handlePortalRoot() {
@@ -1020,6 +1053,7 @@ void handlePortalSave() {
     return;
   }
   saveConfigToEeprom(s, p, nextTid);
+  Serial.println("[SETUP] Opgeslagen: SSID=" + s + " Terminal=" + nextTid);
   setupPortalServer.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#020617;color:#10b981;padding:24px'><h2>Opgeslagen!</h2><p>Terminal <b>" + escapeHtmlAttr(nextTid) + "</b> herstart nu en verbindt met " + escapeHtmlAttr(s) + "...</p></body></html>");
   lcdShow("WiFi Opgeslagen", nextTid);
   delay(800);
@@ -1034,7 +1068,7 @@ void startApSetupPortal() {
   setupPortalServer.on("/", HTTP_GET, handlePortalRoot);
   setupPortalServer.on("/save", HTTP_POST, handlePortalSave);
   setupPortalServer.begin();
-  Serial.println("[SETUP] Hotspot actief: 'WerkPay-Setup' -> open http://192.168.4.1");
+  Serial.println("[SETUP] Hotspot actief: 'WerkPay-Setup' -> http://192.168.4.1");
   if (activeTerminalId.length() == 0 && WiFi.status() == WL_CONNECTED) {
     lcdShow("Geen Terminal-ID", "AP:192.168.4.1");
   } else {
@@ -1044,6 +1078,7 @@ void startApSetupPortal() {
 
 bool connectWifiBlocking(int maxTries) {
   if (activeSsid.length() == 0) return false;
+  Serial.println("[WIFI] Verbinden met " + activeSsid + "...");
   WiFi.mode(WIFI_STA);
   if (activePass.length() == 0) {
     WiFi.begin(activeSsid.c_str());
@@ -1051,10 +1086,18 @@ bool connectWifiBlocking(int maxTries) {
     WiFi.begin(activeSsid.c_str(), activePass.c_str());
   }
   for (int i = 0; i < maxTries; i++) {
-    if (WiFi.status() == WL_CONNECTED) return true;
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WIFI] Verbonden! IP=" + WiFi.localIP().toString());
+      return true;
+    }
     delay(350);
   }
-  return (WiFi.status() == WL_CONNECTED);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WIFI] Verbonden! IP=" + WiFi.localIP().toString());
+    return true;
+  }
+  Serial.println("[WIFI] Verbinden mislukt");
+  return false;
 }
 
 void handleSerialCommands() {
@@ -1132,6 +1175,7 @@ void handleSerialCommands() {
 }
 
 void setIdleScreen() {
+  bool wasBusy = (currentState != STATE_IDLE);
   currentState = STATE_IDLE;
   activeUsername = "";
   pendingAmount = "0.00";
@@ -1143,10 +1187,11 @@ void setIdleScreen() {
     lcdShow("WiFi:WerkPay-Set", "IP: 192.168.4.1");
   } else if (activeTerminalId.length() == 0) {
     lcdShow("Geen Terminal-ID", apPortalActive ? "AP:192.168.4.1" : "Stel in USB / AP");
-  } else if (betalingGeslaagd) {
-    lcdShow("WerkPay Terminal", "D=Bon  B=Saldo");
   } else {
-    lcdShow("WerkPay [" + activeTerminalId.substring(0, 6) + "]", "B=Saldo/PasCheck");
+    lcdShow("WerkPay Terminal", "");
+  }
+  if (wasBusy) {
+    Serial.println("[STATE] Klaar (IDLE)");
   }
 }
 
@@ -1166,48 +1211,85 @@ void updatePinDisplay() {
   lcd.print(stars);
 }
 
-// Ghost-toets vrije scanner: dubbele verificatie (200us) + key-release detectie + debounce
-char scanKeypad() {
-  char gevondenToets = 0;
+void resetKeypadState() {
+  debouncedKey = 0;
+  candidateKey = 0;
+  candidateSinceMs = millis();
+  lastKeyActivityMs = millis();
+}
+
+// High-Z matrix scan met actieve ontlading en anti-ghosting (negeert meerdere toetsen tegelijk)
+char readRawKeypadOnce() {
+  char gevonden = 0;
+  byte aantalIngedrukt = 0;
 
   for (int c = 0; c < COLS; c++) {
+    pinMode(colPins[c], OUTPUT);
     digitalWrite(colPins[c], LOW);
-    delayMicroseconds(30);
+    delayMicroseconds(80);
 
     for (int r = 0; r < ROWS; r++) {
       if (digitalRead(rowPins[r]) == LOW) {
-        delayMicroseconds(200);
-        if (digitalRead(rowPins[r]) == LOW) {
-          gevondenToets = hexaKeys[r][c];
-          break;
-        }
+        gevonden = hexaKeys[r][c];
+        aantalIngedrukt++;
       }
     }
+
+    // Kolom kort HIGH sturen voor High-Z voorkomt overspraak door kabelcapaciteit
     digitalWrite(colPins[c], HIGH);
-    if (gevondenToets != 0) break;
+    delayMicroseconds(12);
+    pinMode(colPins[c], INPUT);
   }
 
-  if (gevondenToets == 0) {
-    toetsIngedruktVorigeKeer = false;
-    return 0;
-  }
-
-  if (toetsIngedruktVorigeKeer) {
-    return 0;
-  }
-
-  if (millis() - laatsteToetsTijd < DEBOUNCE_DELAY) {
-    return 0;
-  }
-
-  toetsIngedruktVorigeKeer = true;
-  laatsteToetsTijd = millis();
-  return gevondenToets;
+  return (aantalIngedrukt == 1) ? gevonden : 0;
 }
 
-// Schone HTTPS-hulpfunctie: leest ALTIJD de response uit en sluit/heropent bij fouten
+// Dubbele controle tegen RF/WiFi storingsspikes
+char readRawKeypadStable() {
+  char r1 = readRawKeypadOnce();
+  if (r1 == 0) return 0;
+  delayMicroseconds(150);
+  char r2 = readRawKeypadOnce();
+  return (r1 == r2) ? r1 : 0;
+}
+
+// Stabiele state-machine debounce: snelle invoer zonder dubbele of gemiste toetsen
+char scanKeypad() {
+  char raw = readRawKeypadStable();
+  unsigned long now = millis();
+
+  if (raw != 0) {
+    lastKeyActivityMs = now;
+  }
+
+  if (raw != candidateKey) {
+    candidateKey = raw;
+    candidateSinceMs = now;
+    return 0;
+  }
+
+  if (candidateKey != debouncedKey) {
+    unsigned long neededMs = (candidateKey == 0) ? KEY_RELEASE_DEBOUNCE_MS : KEY_PRESS_DEBOUNCE_MS;
+    if (now - candidateSinceMs >= neededMs) {
+      debouncedKey = candidateKey;
+      if (debouncedKey != 0) {
+        laatsteToetsTijd = now;
+        return debouncedKey;
+      }
+    }
+  }
+
+  return 0;
+}
+
+// Schone HTTPS-hulpfunctie: geen hangende BearSSL keep-alive sockets tussen GET en PATCH
 bool firestoreRequest(const String& method, const String& url, const String& body, int& outCode, String& outPayload) {
+  static bool wifiLostLogged = false;
   if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiLostLogged) {
+      Serial.println("[WIFI] Verbinding kwijt, herstellen...");
+      wifiLostLogged = true;
+    }
     if (activeSsid.length() == 0) {
       outCode = -99;
       return false;
@@ -1221,37 +1303,49 @@ bool firestoreRequest(const String& method, const String& url, const String& bod
     unsigned long startWait = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startWait < 3000) {
       delay(50);
+      yield();
     }
     if (WiFi.status() != WL_CONNECTED) {
       outCode = -99;
       return false;
     }
+    Serial.println("[WIFI] Herverbonden! IP=" + WiFi.localIP().toString());
   }
+  wifiLostLogged = false;
 
   for (int attempt = 0; attempt < 2; attempt++) {
+    secureClient.stop();
+    yield();
+
     HTTPClient http;
+    unsigned long httpTimeout = (currentState == STATE_WAITING_PIN) ? 2200 : 3800;
     secureClient.setInsecure();
-    secureClient.setTimeout(3500);
-    http.setReuse(true);
-    http.setTimeout(3500);
+    secureClient.setTimeout(httpTimeout);
+    http.setReuse(false);
+    http.setTimeout(httpTimeout);
 
     if (!http.begin(secureClient, url)) {
       http.end();
       secureClient.stop();
       outCode = -100;
+      delay(35);
+      yield();
       continue;
     }
 
     if (method == "PATCH") {
       http.addHeader("Content-Type", "application/json");
     }
-    http.addHeader("Connection", "keep-alive");
+    http.addHeader("Connection", "close");
 
     outCode = (method == "GET") ? http.GET() : http.sendRequest(method.c_str(), body);
+    yield();
 
     if (outCode > 0) {
       outPayload = http.getString();
       http.end();
+      secureClient.stop();
+      yield();
       return true;
     }
 
@@ -1259,7 +1353,8 @@ bool firestoreRequest(const String& method, const String& url, const String& bod
     Serial.println(outCode);
     http.end();
     secureClient.stop();
-    delay(25);
+    delay(40);
+    yield();
   }
   return false;
 }
@@ -1269,13 +1364,23 @@ bool patchFirestore(const String& maskQuery, const JsonDocument& doc) {
   String body;
   serializeJson(doc, body);
   String url = getFirestoreDocUrl() + maskQuery;
-  int code = 0;
-  String resp;
-  if (!firestoreRequest("PATCH", url, body, code, resp)) return false;
-  return (code >= 200 && code < 300);
+
+  for (int retry = 0; retry < 2; retry++) {
+    int code = 0;
+    String resp;
+    if (firestoreRequest("PATCH", url, body, code, resp)) {
+      if (code >= 200 && code < 300) {
+        return true;
+      }
+      Serial.println("[CLOUD] PATCH HTTP fout: " + String(code));
+    }
+    delay(50);
+    yield();
+  }
+  return false;
 }
 
-void patchStatusIdle(const String& reason) {
+bool patchStatusIdle(const String& reason) {
   JsonDocument doc;
   JsonObject fields = doc["fields"].to<JsonObject>();
   fields["status"]["stringValue"] = "IDLE";
@@ -1283,52 +1388,52 @@ void patchStatusIdle(const String& reason) {
   fields["scannedUid"]["stringValue"] = "";
   fields["enteredPin"]["stringValue"] = "";
   fields["updatedAt"]["stringValue"] = "pico-" + String(millis());
-  patchFirestore(
+  return patchFirestore(
     "&updateMask.fieldPaths=status&updateMask.fieldPaths=reason&updateMask.fieldPaths=scannedUid&updateMask.fieldPaths=enteredPin&updateMask.fieldPaths=updatedAt",
     doc
   );
 }
 
-void patchCardScanned(const String& uid) {
+bool patchCardScanned(const String& uid) {
   JsonDocument doc;
   JsonObject fields = doc["fields"].to<JsonObject>();
   fields["status"]["stringValue"] = "CARD_SCANNED";
   fields["scannedUid"]["stringValue"] = uid;
   fields["updatedAt"]["stringValue"] = "pico-" + String(millis());
-  patchFirestore(
+  return patchFirestore(
     "&updateMask.fieldPaths=status&updateMask.fieldPaths=scannedUid&updateMask.fieldPaths=updatedAt",
     doc
   );
 }
 
-void patchCheckCard(const String& uid) {
+bool patchCheckCard(const String& uid) {
   JsonDocument doc;
   JsonObject fields = doc["fields"].to<JsonObject>();
   fields["status"]["stringValue"] = "CHECK_CARD";
   fields["scannedUid"]["stringValue"] = uid;
   fields["enteredPin"]["stringValue"] = "";
   fields["updatedAt"]["stringValue"] = "pico-" + String(millis());
-  patchFirestore(
+  return patchFirestore(
     "&updateMask.fieldPaths=status&updateMask.fieldPaths=scannedUid&updateMask.fieldPaths=enteredPin&updateMask.fieldPaths=updatedAt",
     doc
   );
 }
 
-void patchPaymentSubmitted(const String& uid, const String& pin) {
+bool patchPaymentSubmitted(const String& uid, const String& pin) {
   JsonDocument doc;
   JsonObject fields = doc["fields"].to<JsonObject>();
   fields["status"]["stringValue"] = "SUBMITTED";
   fields["scannedUid"]["stringValue"] = uid;
   fields["enteredPin"]["stringValue"] = pin;
   fields["updatedAt"]["stringValue"] = "pico-" + String(millis());
-  patchFirestore(
+  return patchFirestore(
     "&updateMask.fieldPaths=status&updateMask.fieldPaths=scannedUid&updateMask.fieldPaths=enteredPin&updateMask.fieldPaths=updatedAt",
     doc
   );
 }
 
 void annuleerDirect() {
-  Serial.println("Transactie geannuleerd door gebruiker.");
+  Serial.println("[STATE] Geannuleerd op keypad");
   beep(800, 120);
   lcdShow("Geannuleerd!", "Terug naar start");
   patchStatusIdle("Geannuleerd door gebruiker");
@@ -1357,15 +1462,24 @@ void startBalanceCheckState() {
   currentState = STATE_CHECK_CARD;
   stateTimer = millis();
   beep(2200, 75);
+  Serial.println("[STATE] Saldo checken");
   lcdShow("Scan pas: Saldo", "Houd pas  A=Stop");
 }
 
 void startLinkingState(const String& user) {
   activeUsername = user;
-  isLoginSession = (user == "Inloggen");
+  String lowUser = user;
+  lowUser.toLowerCase();
+  isLoginSession = (
+    lowUser.indexOf("inlog") >= 0 ||
+    lowUser.indexOf("login") >= 0 ||
+    lowUser.indexOf("ontgrendel") >= 0 ||
+    lowUser == "werkpay"
+  );
   currentState = STATE_LINKING;
   stateTimer = millis();
   beep(2400, 90);
+  Serial.println(isLoginSession ? "[STATE] Snelle pas-login gestart" : ("[STATE] Pas koppelen: " + activeUsername));
   lcdShow(isLoginSession ? "WerkPay Login" : ("Koppel: " + activeUsername), "Houd pas  A=Stop");
 }
 
@@ -1380,17 +1494,20 @@ void startPayState(double amt, const String& ordNo, const String& payUser) {
   String topLine;
   if (isLoginSession) {
     topLine = payUser.length() > 0 ? payUser : "WerkPay Login";
+    Serial.println("[STATE] Login/2FA met PIN: " + topLine);
   } else {
     topLine = "EUR " + pendingAmount;
     if (pendingOrderNo != "0" && (topLine.length() + 2 + pendingOrderNo.length()) <= 16) {
       topLine += " #" + pendingOrderNo;
     }
+    Serial.println("[STATE] Betaling: EUR " + pendingAmount + " #" + pendingOrderNo);
   }
   lcdShow(topLine, "Houd pas  A=Stop");
 }
 
 void pollFirestore() {
   if (activeTerminalId.length() == 0) return;
+  static int lastHttpErr = 0;
   int code = 0;
   String payload;
   if (!firestoreRequest("GET", getFirestoreDocUrl(), "", code, payload)) {
@@ -1398,12 +1515,21 @@ void pollFirestore() {
   }
 
   if (code == 404) {
+    if (lastHttpErr != 404) {
+      Serial.println("[CLOUD] Terminal doc aanmaken...");
+      lastHttpErr = 404;
+    }
     patchStatusIdle("Boot");
     return;
   }
   if (code != 200) {
+    if (lastHttpErr != code) {
+      Serial.println("[CLOUD] HTTP fout: " + String(code));
+      lastHttpErr = code;
+    }
     return;
   }
+  lastHttpErr = 0;
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return;
@@ -1420,12 +1546,20 @@ void pollFirestore() {
       } else if (fields["amount"]["integerValue"].is<const char*>()) {
         amt = atof(fields["amount"]["integerValue"].as<const char*>());
       }
-      String ordNo = fields["orderNo"]["integerValue"] | "0";
+      String ordNo = "0";
+      if (fields["orderNo"]["integerValue"].is<const char*>()) {
+        ordNo = fields["orderNo"]["integerValue"].as<const char*>();
+      } else if (fields["orderNo"]["doubleValue"].is<double>()) {
+        ordNo = String((long)fields["orderNo"]["doubleValue"].as<double>());
+      } else if (fields["orderNo"]["stringValue"].is<const char*>()) {
+        ordNo = fields["orderNo"]["stringValue"].as<const char*>();
+      }
       String payUser = fields["username"]["stringValue"] | "";
       startPayState(amt, ordNo, payUser);
     }
   } else if (currentState == STATE_LINKING || currentState == STATE_WAITING_CARD || currentState == STATE_WAITING_PIN) {
     if (status == "IDLE") {
+      Serial.println("[STATE] Geannuleerd door kassa");
       beep(700, 100);
       lcdShow("Geannuleerd!", "Door kassa");
       currentState = STATE_SHOW_RESULT;
@@ -1469,6 +1603,7 @@ void pollFirestore() {
         line2 += coinsSuffix;
       }
 
+      Serial.println("[CLOUD] Saldo: " + holder + " EUR " + String(bal, 2));
       beep(2400, 80);
       beep(3000, 140);
       lcdShow(line1, line2);
@@ -1477,9 +1612,14 @@ void pollFirestore() {
       stateTimer = millis();
       resultDurationMs = 4500;
     } else if (status == "LINKED") {
+      String linkedUser = fields["username"]["stringValue"] | "";
+      String lowLinked = linkedUser;
+      lowLinked.toLowerCase();
+      bool wasLogin = isLoginSession || (lowLinked.indexOf("inlog") >= 0 || lowLinked.indexOf("login") >= 0);
+      Serial.println(wasLogin ? "[AUTH] Ingelogd via pas" : ("[LINK] Pas gekoppeld: " + activeUsername));
       beep(2200, 100);
       beep(2800, 180);
-      lcdShow(isLoginSession ? "Ingelogd!" : "Pas gekoppeld!", isLoginSession ? "Welkom!" : activeUsername);
+      lcdShow(wasLogin ? "Ingelogd!" : "Pas gekoppeld!", wasLogin ? "Welkom!" : activeUsername);
       patchStatusIdle("Klaar");
       currentState = STATE_SHOW_RESULT;
       stateTimer = millis();
@@ -1489,8 +1629,10 @@ void pollFirestore() {
       beep(2500, 100);
       beep(3000, 200);
       if (isLoginSession) {
+        Serial.println("[AUTH] Ingelogd met PIN");
         lcdShow("Ingelogd!", "Welkom!");
       } else {
+        Serial.println("[PAY] Betaald: EUR " + pendingAmount);
         lastReceiptCard = scannedUid;
         lastReceiptAmount = pendingAmount;
         betalingGeslaagd = true;
@@ -1503,6 +1645,7 @@ void pollFirestore() {
     } else if (status == "DECLINED") {
       betalingGeslaagd = false;
       String reason = fields["reason"]["stringValue"] | "Geweigerd";
+      Serial.println("[PAY] Geweigerd: " + reason);
       beep(700, 220);
       beep(500, 320);
       lcdShow("Geweigerd!", formatShortReason(reason));
@@ -1518,6 +1661,12 @@ void pollFirestore() {
 
 void setup() {
   Serial.begin(115200);
+  unsigned long serWait = millis();
+  while (!Serial && millis() - serWait < 1200) {
+    delay(20);
+  }
+  Serial.println("[BOOT] WerkPay Terminal start...");
+
   EEPROM.begin(256);
   pinMode(BUZZER_PIN, OUTPUT);
 
@@ -1525,12 +1674,13 @@ void setup() {
     pinMode(rowPins[i], INPUT_PULLUP);
   }
   for (int i = 0; i < COLS; i++) {
-    pinMode(colPins[i], OUTPUT);
-    digitalWrite(colPins[i], HIGH);
+    pinMode(colPins[i], INPUT);
   }
 
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
+  Wire.setClock(100000);
+  Wire.setTimeout(50);
   Wire.begin();
   delay(100);
 
@@ -1553,14 +1703,22 @@ void setup() {
   }
 
   nfc.begin();
-  if (nfc.getFirmwareVersion()) {
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (versiondata) {
     nfc.SAMConfig();
+    nfc.setPassiveActivationRetries(0x01);
+    nfcReady = true;
+    Serial.println("[NFC] PN532 OK (v" + String((versiondata >> 16) & 0xFF) + "." + String((versiondata >> 8) & 0xFF) + ")");
+  } else {
+    nfcReady = false;
+    Serial.println("[NFC] PN532 niet gevonden!");
   }
 
   secureClient.setInsecure();
   if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
     patchStatusIdle("Online");
   }
+  Serial.println("[READY] Terminal=" + (activeTerminalId.length() > 0 ? activeTerminalId : String("(geen)")) + " IP=" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("offline")));
   beep(2000, 100);
   beep(3000, 150);
   setIdleScreen();
@@ -1569,26 +1727,24 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 0. USB configuratie en AP Setup portaal altijd responsief houden
+  // 0. Non-blocking buzzer, USB configuratie en AP Setup portaal altijd responsief houden
+  updateBuzzer();
   handleSerialCommands();
   if (apPortalActive) {
     setupPortalServer.handleClient();
     if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
       apPortalActive = false;
       WiFi.softAPdisconnect(true);
+      Serial.println("[WIFI] Online! IP=" + WiFi.localIP().toString() + " Terminal=" + activeTerminalId);
       patchStatusIdle("Online");
       setIdleScreen();
     }
   }
 
-  // 1. Scan keypad ALTIJD eerst zodat Annuleren/Saldo/toetsen direct reageren
+  // 1. Scan keypad ALTIJD eerst zodat Annuleren/toetsen direct reageren
   char key = scanKeypad();
 
   if (currentState == STATE_IDLE || currentState == STATE_SHOW_RESULT) {
-    if (key == 'B' && WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
-      startBalanceCheckState();
-      return;
-    }
     if (key == 'D' && betalingGeslaagd) {
       simuleerBonPrinten();
       return;
@@ -1599,27 +1755,39 @@ void loop() {
     }
   } else if (currentState == STATE_CHECK_CARD) {
     if (key == 'A' || key == 'D') {
-      beep(800, 100);
+      beepAsync(800, 100);
       setIdleScreen();
       return;
     }
 
-    uint8_t uid[7];
-    uint8_t uidLength = 0;
-    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 20) && uidLength > 0) {
-      scannedUid = "";
-      for (uint8_t i = 0; i < uidLength; i++) {
-        if (uid[i] < 0x10) scannedUid += "0";
-        scannedUid += String(uid[i], HEX);
-      }
-      scannedUid.toUpperCase();
-      beep(2500, 100);
+    if (nfcReady && now - lastNfcScanMs >= NFC_SCAN_INTERVAL_MS) {
+      lastNfcScanMs = now;
+      uint8_t uid[7];
+      uint8_t uidLength = 0;
+      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, NFC_READ_TIMEOUT_MS) && uidLength > 0) {
+        scannedUid = "";
+        for (uint8_t i = 0; i < uidLength; i++) {
+          if (uid[i] < 0x10) scannedUid += "0";
+          scannedUid += String(uid[i], HEX);
+        }
+        scannedUid.toUpperCase();
+        Serial.println("[NFC] Pas check: " + scannedUid);
+        beep(2500, 100);
 
-      currentState = STATE_WAITING_RESULT;
-      stateTimer = millis();
-      lcdShow("Pas checken...", "Even geduld...");
-      patchCheckCard(scannedUid);
-      return;
+        lcdShow("Pas checken...", "Even geduld...");
+        if (patchCheckCard(scannedUid)) {
+          currentState = STATE_WAITING_RESULT;
+          stateTimer = millis();
+        } else {
+          Serial.println("[ERR] PATCH check card mislukt");
+          beep(600, 220);
+          lcdShow("Verbindingsfout", "Probeer opnieuw");
+          currentState = STATE_SHOW_RESULT;
+          stateTimer = millis();
+          resultDurationMs = 1800;
+        }
+        return;
+      }
     }
 
     if (now - stateTimer > 25000) {
@@ -1632,28 +1800,52 @@ void loop() {
       return;
     }
 
-    uint8_t uid[7];
-    uint8_t uidLength = 0;
-    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 20) && uidLength > 0) {
-      scannedUid = "";
-      for (uint8_t i = 0; i < uidLength; i++) {
-        if (uid[i] < 0x10) scannedUid += "0";
-        scannedUid += String(uid[i], HEX);
-      }
-      scannedUid.toUpperCase();
-      beep(2500, 100);
+    if (nfcReady && now - lastNfcScanMs >= NFC_SCAN_INTERVAL_MS) {
+      lastNfcScanMs = now;
+      uint8_t uid[7];
+      uint8_t uidLength = 0;
+      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, NFC_READ_TIMEOUT_MS) && uidLength > 0) {
+        scannedUid = "";
+        for (uint8_t i = 0; i < uidLength; i++) {
+          if (uid[i] < 0x10) scannedUid += "0";
+          scannedUid += String(uid[i], HEX);
+        }
+        scannedUid.toUpperCase();
+        Serial.println("[NFC] Pas: " + scannedUid);
+        beep(2500, 100);
 
-      if (currentState == STATE_LINKING) {
-        currentState = STATE_WAITING_RESULT;
-        stateTimer = millis();
-        lcdShow("Pas gescand!", isLoginSession ? "Inloggen..." : "Koppelen...");
-        patchCardScanned(scannedUid);
-      } else {
-        currentState = STATE_WAITING_PIN;
-        enteredPin = "";
-        stateTimer = millis();
-        toonPincodeScherm();
+        if (currentState == STATE_LINKING) {
+          lcdShow("Pas gescand!", isLoginSession ? "Inloggen..." : "Koppelen...");
+          if (patchCardScanned(scannedUid)) {
+            currentState = STATE_WAITING_RESULT;
+            stateTimer = millis();
+          } else {
+            Serial.println("[ERR] PATCH card scanned mislukt");
+            beep(600, 220);
+            lcdShow("Verbindingsfout", "Probeer opnieuw");
+            currentState = STATE_SHOW_RESULT;
+            stateTimer = millis();
+            resultDurationMs = 1800;
+          }
+        } else {
+          currentState = STATE_WAITING_PIN;
+          enteredPin = "";
+          stateTimer = millis();
+          resetKeypadState();
+          Serial.println("[PIN] Wacht op pincode...");
+          toonPincodeScherm();
+        }
+        return;
       }
+    }
+
+    if (now - stateTimer > 90000) {
+      Serial.println("[TIMEOUT] Wachten op pas verlopen");
+      lcdShow("Tijd verstreken", "Terug naar start");
+      patchStatusIdle("Timeout");
+      currentState = STATE_SHOW_RESULT;
+      stateTimer = millis();
+      resultDurationMs = 1500;
       return;
     }
   } else if (currentState == STATE_WAITING_PIN) {
@@ -1665,30 +1857,41 @@ void loop() {
       } else if (key == '*' || key == 'C') {
         if (enteredPin.length() > 0) {
           enteredPin.remove(enteredPin.length() - 1);
-          beep(1500, 45);
+          beepAsync(1500, 45);
           updatePinDisplay();
         }
       } else if (key == '#') {
         if (enteredPin.length() >= 4) {
+          Serial.println("[PIN] Ingevoerd (" + String(enteredPin.length()) + " cijfers)");
           beep(2800, 120);
-          currentState = STATE_WAITING_RESULT;
-          stateTimer = millis();
           lcdShow("Controleren...", "Even geduld...");
-          patchPaymentSubmitted(scannedUid, enteredPin);
+          if (patchPaymentSubmitted(scannedUid, enteredPin)) {
+            currentState = STATE_WAITING_RESULT;
+            stateTimer = millis();
+          } else {
+            Serial.println("[ERR] PATCH submit mislukt");
+            beep(600, 220);
+            lcdShow("Verbindingsfout", "Probeer opnieuw");
+            currentState = STATE_SHOW_RESULT;
+            stateTimer = millis();
+            resultDurationMs = 1800;
+          }
           return;
         } else {
-          beep(600, 200);
+          Serial.println("[PIN] Minimaal 4 cijfers");
+          beepAsync(600, 180);
         }
       } else if (key >= '0' && key <= '9') {
         if (enteredPin.length() < 6) {
           enteredPin += key;
-          beep(2000, 35);
+          beepAsync(2000, 35);
           updatePinDisplay();
         }
       }
     }
 
     if (now - stateTimer > 45000) {
+      Serial.println("[TIMEOUT] PIN tijd verstreken");
       lcdShow("Tijd verstreken", "Opnieuw scannen");
       patchStatusIdle("PIN timeout");
       currentState = STATE_SHOW_RESULT;
@@ -1702,6 +1905,7 @@ void loop() {
       return;
     }
     if (now - stateTimer > 25000) {
+      Serial.println("[TIMEOUT] Geen reactie van kassa");
       lcdShow("Geen reactie", "Terug naar start");
       patchStatusIdle("Timeout");
       currentState = STATE_SHOW_RESULT;
@@ -1711,9 +1915,9 @@ void loop() {
     }
   }
 
-  // 2. Slimme polling (snelle schone Keep-Alive; tijdens PIN alleen als even niet getypt wordt)
-  unsigned long pollInterval = (currentState == STATE_WAITING_PIN) ? 1200 : 550;
-  bool magPollen = (currentState != STATE_WAITING_PIN) || (now - laatsteToetsTijd > 650);
+  // 2. Slimme polling (tijdens PIN-invoer alleen als er 2s geen toetsactiviteit is)
+  unsigned long pollInterval = (currentState == STATE_WAITING_PIN) ? 2000 : 550;
+  bool magPollen = (currentState != STATE_WAITING_PIN) || (now - lastKeyActivityMs > 2000);
   if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0 && magPollen && (now - lastPollMs >= pollInterval)) {
     lastPollMs = now;
     pollFirestore();

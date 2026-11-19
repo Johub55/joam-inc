@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
+import { getAllBankAccountsFromFirestore } from '../../services/firestoreSync';
 import { ShieldAlert, Lock, Unlock, LogOut, Key, AlertCircle, Radio, Clock } from 'lucide-react';
 import { showToast } from '../../services/appToast';
 import { PicoCardLoginPanel } from '../PicoCardLoginPanel';
@@ -7,6 +8,7 @@ import { PicoCardLoginPanel } from '../PicoCardLoginPanel';
 export const SystemLockScreen: React.FC = () => {
   const {
     currentPosUser,
+    bankAccounts,
     isSystemLocked,
     setIsSystemLocked,
     logoutPos,
@@ -36,10 +38,34 @@ export const SystemLockScreen: React.FC = () => {
 
     try {
       const cleanPass = passwordInput.trim();
-      const isPassValid =
+      const activeUserLower = currentPosUser.username.trim().replace(/^@+/, '').toLowerCase();
+      const localBankMatch = bankAccounts.find(
+        (a) => String(a.username || '').trim().replace(/^@+/, '').toLowerCase() === activeUserLower
+      );
+
+      let isPassValid =
         cleanPass === currentPosUser.password ||
         cleanPass.toLowerCase() === currentPosUser.password?.toLowerCase() ||
-        (currentPosUser.username === 'joas' && (cleanPass === '1234' || cleanPass === 'admin123' || cleanPass === '0000'));
+        (localBankMatch &&
+          (cleanPass === String(localBankMatch.pin_code ?? '').trim() ||
+            cleanPass === String(localBankMatch.password ?? '').trim())) ||
+        (activeUserLower === 'joas' && (cleanPass === '1234' || cleanPass === 'admin123' || cleanPass === '0000'));
+
+      if (!isPassValid) {
+        try {
+          const dbBanks = await getAllBankAccountsFromFirestore();
+          const remoteBankMatch = dbBanks.find(
+            (a) => String(a.username || '').trim().replace(/^@+/, '').toLowerCase() === activeUserLower
+          );
+          if (
+            remoteBankMatch &&
+            (cleanPass === String(remoteBankMatch.pin_code ?? '').trim() ||
+              cleanPass === String(remoteBankMatch.password ?? '').trim())
+          ) {
+            isPassValid = true;
+          }
+        } catch {}
+      }
 
       if (!isPassValid) {
         setErrorMsg('❌ Onjuist wachtwoord of pincode! Toegang geweigerd.');
@@ -201,6 +227,7 @@ export const SystemLockScreen: React.FC = () => {
             <PicoCardLoginPanel
               mode="unlock"
               compact
+              forcePinOnly={Boolean(currentPosUser.is_2fa_enabled)}
               onCustomCardAuth={async (uid, pin, style) => {
                 const res = await unlockSystemWithCard(uid, pin, style === 'pin', twoFactorInput);
                 if (res.success) {

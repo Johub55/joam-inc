@@ -47,7 +47,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
 
   // Simulator State
   const [simLcdLine1, setSimLcdLine1] = useState<string>('WerkPay Terminal');
-  const [simLcdLine2, setSimLcdLine2] = useState<string>('B=Saldo/PasCheck');
+  const [simLcdLine2, setSimLcdLine2] = useState<string>('');
   const [simUid, setSimUid] = useState<string>('4129883155049012');
   const [simPin, setSimPin] = useState<string>('');
   const [simState, setSimState] = useState<'idle' | 'check_card' | 'card_scanned' | 'approved' | 'declined'>('idle');
@@ -142,7 +142,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           setTimeout(() => {
             setSimState('idle');
             setSimLcdLine1('WerkPay Terminal');
-            setSimLcdLine2('B=Saldo/PasCheck');
+            setSimLcdLine2('');
           }, 2600);
         }, 450);
         return;
@@ -222,7 +222,7 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           setTimeout(() => {
             setSimState('idle');
             setSimLcdLine1('WerkPay Terminal');
-            setSimLcdLine2('B=Saldo/PasCheck');
+            setSimLcdLine2('');
             setSimPin('');
           }, 2500);
         }, 1000);
