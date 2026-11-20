@@ -3,11 +3,13 @@ import { showToast } from '../../services/appToast';
 import { useApp } from '../../context/AppContext';
 import {
   claimHardwareTerminalLinkMode,
+  extractTerminalLockOwner,
   getActiveHardwareTerminalId,
   getTerminalTabSessionId,
   HARDWARE_TERMINAL_EVENT,
   releaseHardwareTerminalIfOwned,
   setHardwareTerminalLinked,
+  setHardwareTerminalResult,
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
 } from '../../services/firebase';
@@ -129,6 +131,10 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
       }
 
       if (!res.success) {
+        if (fromPico) {
+          lockAcquiredRef.current = false;
+          await setHardwareTerminalResult('DECLINED', 'Opslaan fout', terminalIdRef.current).catch(() => {});
+        }
         setSaveError(res.message || 'Opslaan naar database mislukt.');
         setStatus(`Fout bij opslaan van UID ${uid}.`);
         return;
@@ -146,6 +152,10 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
       showToast(`NFC Pas ${uid} opgeslagen voor @${username}${transferNote}!`, 'success');
     } catch (err: any) {
       console.error('commitScannedUid error:', err);
+      if (fromPico) {
+        lockAcquiredRef.current = false;
+        await setHardwareTerminalResult('DECLINED', 'Opslaan fout', terminalIdRef.current).catch(() => {});
+      }
       setSaveError(err?.message || 'Onverwachte fout bij opslaan van NFC pas.');
       setStatus(`Fout bij opslaan van UID ${uid}.`);
     } finally {
@@ -196,15 +206,24 @@ export const LinkCardModal: React.FC<LinkCardModalProps> = ({
         lockAcquiredRef.current = true;
         setStatus(`📡 Scan nu de NFC pas op pinapparaat (${currentTerminal})...`);
 
+        let sawOwnLink = false;
         unsub = subscribeHardwareTerminal(
           async (terminalState) => {
             if (!active || !terminalState) return;
-            if (terminalState.status === 'CARD_SCANNED' && terminalState.scannedUid && !handledRef.current) {
+            const lockOwner = extractTerminalLockOwner(terminalState.reason);
+            const belongsToUs = !lockOwner || lockOwner === claimTokenRef.current;
+            if (
+              terminalState.status !== 'IDLE' &&
+              (lockOwner === claimTokenRef.current || (belongsToUs && terminalState.status === 'CARD_SCANNED'))
+            ) {
+              sawOwnLink = true;
+            }
+            if (terminalState.status === 'CARD_SCANNED' && terminalState.scannedUid && belongsToUs && !handledRef.current) {
               handledRef.current = true;
               await commitScannedUid(terminalState.scannedUid, true);
             } else if (
               terminalState.status === 'IDLE' &&
-              terminalState.reason?.toLowerCase().includes('geannuleerd') &&
+              sawOwnLink &&
               !handledRef.current
             ) {
               if (active) {

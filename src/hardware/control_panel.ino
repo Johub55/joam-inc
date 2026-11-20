@@ -8,47 +8,64 @@
  *    of stel ze draadloos in via de hotspot WerkPay-Setup (192.168.4.1)
  *  - Vereiste Arduino Libraries (Library Manager):
  *      1. LiquidCrystal I2C (Frank de Brabander / Marco Schwartz)
- *      2. Adafruit PN532 (Adafruit)
- *      3. ArduinoJson (Benoit Blanchon - versie 7+)
+ *      2. ArduinoJson (Benoit Blanchon - versie 7+)
+ *      (Geen Adafruit_PN532 library meer nodig: ingebouwde pure I2C PN532 driver!)
  *  - Exacte hardware pinout (Raspberry Pi Pico W):
- *      LCD (0x27) & PN532 (I2C): SDA = GP4, SCL = GP5 (IRQ=-1, RESET=-1)
- *      4x4 Matrix Keypad       : Rijen = {13, 12, 11, 10}, Kolommen = {9, 8, 7, 6}
- *      Buzzer                  : GP14
+ *      LCD (0x27) & PN532 (0x24): SDA = GP4, SCL = GP5 (Switch 1=ON/1, Switch 2=OFF/0)
+ *      4x4 Matrix Keypad        : Rijen = {13, 12, 11, 10}, Kolommen = {9, 8, 7, 6}
+ *      Buzzer                   : GP14
  * ==============================================================================
  */
 
 #include <Arduino.h>
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <EEPROM.h>
+#include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <Adafruit_PN532.h>
 
 // --- WIFI, TERMINAL & FIREBASE CONFIGURATIE ---
-const char* ssid = "JOUW_WIFI_NAAM";
-const char* password = "JOUW_WIFI_WACHTWOORD";
-const char* terminalId = "";
+// Tip: maak in Arduino IDE v2 een tabblad 'secrets.h' aan OF sla alles 1x op via 192.168.4.1 / IP-website (/secrets.json + EEPROM).
+#ifndef SECRET_WIFI_SSID
+  #define SECRET_WIFI_SSID "JOUW_WIFI_NAAM"
+#endif
+#ifndef SECRET_WIFI_PASS
+  #define SECRET_WIFI_PASS "JOUW_WIFI_WACHTWOORD"
+#endif
+#ifndef SECRET_TERMINAL_ID
+  #define SECRET_TERMINAL_ID ""
+#endif
+#ifndef SECRET_FIRESTORE_DOC_BASE
+  #define SECRET_FIRESTORE_DOC_BASE "https://firestore.googleapis.com/v1/projects/gen-lang-client-0031413083/databases/ai-studio-werkpayposwe-c139ebd2-3939-4781-ab60-f1b99421ae53/documents/hardware_terminals/"
+#endif
+#ifndef SECRET_FIRESTORE_API_KEY
+  #define SECRET_FIRESTORE_API_KEY "AIzaSyD9k7jmxRN-Xs2vX598yaUKhUAijPPA9fg"
+#endif
 
-const char* FIRESTORE_DOC_BASE =
-  "https://firestore.googleapis.com/v1/projects/gen-lang-client-0031413083/databases/ai-studio-werkpayposwe-c139ebd2-3939-4781-ab60-f1b99421ae53/documents/hardware_terminals/";
-const char* FIRESTORE_API_KEY = "AIzaSyD9k7jmxRN-Xs2vX598yaUKhUAijPPA9fg";
+const char* ssid = SECRET_WIFI_SSID;
+const char* password = SECRET_WIFI_PASS;
+const char* terminalId = SECRET_TERMINAL_ID;
+
+const char* FIRESTORE_DOC_BASE = SECRET_FIRESTORE_DOC_BASE;
+const char* FIRESTORE_API_KEY = SECRET_FIRESTORE_API_KEY;
 
 // --- HARDWARE PINOUT (RASPBERRY PI PICO W) ---
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
 #define BUZZER_PIN  14
-#define PN532_IRQ   (-1)
-#define PN532_RESET (-1)
+#define PN532_I2C_ADDR 0x24
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
 WebServer setupPortalServer(80);
 
-// --- EEPROM WIFI & TERMINAL OPSLAG ---
+// --- EEPROM & LITTLEFS SECRETS OPSLAG ---
 struct WifiPrefsV1 {
   char magic[4];
   char ssid[64];
@@ -62,9 +79,21 @@ struct WifiPrefsV2 {
   char terminalId[32];
 };
 
+struct WifiPrefsV3 {
+  char magic[4];
+  char ssid[64];
+  char pass[64];
+  char terminalId[32];
+  char firestoreDocBase[192];
+  char firebaseApiKey[64];
+};
+
 String activeSsid = "";
 String activePass = "";
 String activeTerminalId = "";
+String activeFirestoreDocBase = FIRESTORE_DOC_BASE;
+String activeFirestoreApiKey = FIRESTORE_API_KEY;
+bool littleFsReady = false;
 bool apPortalActive = false;
 String serialRxBuffer = "";
 
@@ -82,24 +111,45 @@ char hexaKeys[ROWS][COLS] = {
 byte rowPins[ROWS] = {13, 12, 11, 10};
 byte colPins[COLS] = {9, 8, 7, 6};
 
+#define FIRMWARE_VERSION "v3.5"
+
 unsigned long laatsteToetsTijd = 0;
 unsigned long lastKeyActivityMs = 0;
-const unsigned long KEY_PRESS_DEBOUNCE_MS = 14;
-const unsigned long KEY_RELEASE_DEBOUNCE_MS = 30;
-char debouncedKey = 0;
-char candidateKey = 0;
-unsigned long candidateSinceMs = 0;
+const unsigned long KEY_RELEASE_DEBOUNCE_MS = 25;
+bool keyArmed = true;
+char lastRawKey = 0;
+unsigned long keyZeroSinceMs = 0;
 
 unsigned long buzzerOffAt = 0;
 bool buzzerActive = false;
 bool nfcReady = false;
-bool nfcScanArmed = false;
-unsigned long nfcArmedAtMs = 0;
+bool useSoftI2cNfc = false;
+String nfcFirmwareText = "";
+String nfcDiagNote = "Controleren...";
+String lastBbDiag = "";
+byte lastNfcWriteErr = 0;
+uint32_t activeI2cClock = 100000;
+enum NfcPollPhase {
+  NFC_IDLE,
+  NFC_WAIT_ACK,
+  NFC_WAIT_TAG
+};
+NfcPollPhase nfcPhase = NFC_IDLE;
+unsigned long nfcPhaseAtMs = 0;
 unsigned long lastNfcScanMs = 0;
 unsigned long lastNfcReadyCheckMs = 0;
 unsigned long lastNfcRecoverMs = 0;
+unsigned long lastScanUiTickMs = 0;
+bool scanUiDotOn = false;
 byte nfcConsecutiveErrors = 0;
-const unsigned long NFC_SCAN_INTERVAL_MS = 160;
+const unsigned long NFC_SCAN_INTERVAL_MS = 140;
+
+bool webServerStarted = false;
+bool needsBootOnlinePatch = false;
+int lastCloudHttpCode = 0;
+String lastCloudNote = "Nog niet verbonden";
+String lastUidSeen = "";
+char lastKeySeen = 0;
 
 enum TerminalState {
   STATE_IDLE,
@@ -132,16 +182,24 @@ WiFiClientSecure secureClient;
 String getFirestoreDocUrl();
 String sanitizeTerminalId(const String& raw);
 String escapeHtmlAttr(const String& raw);
+String escapeJsonStr(const String& raw);
+String getStateName();
 void beep(int freq, int ms);
 void beepAsync(int freq, int ms);
 void updateBuzzer();
 String pad16(const String& s);
 void lcdShow(const String& line1, const String& line2);
 String formatShortReason(const String& rawReason);
+void saveSecrets(const String& newSsid, const String& newPass, const String& newTermId, const String& newDocBase, const String& newApiKey);
 void saveConfigToEeprom(const String& newSsid, const String& newPass, const String& newTermId);
 void loadWifiConfig();
-void handlePortalRoot();
+void handleWebRoot();
+void handleApiStatus();
+void handleApiAction();
+void handleSecretsDownload();
 void handlePortalSave();
+void registerWebRoutes();
+void startLocalWebServer();
 void startApSetupPortal();
 bool connectWifiBlocking(int maxTries);
 void handleSerialCommands();
@@ -152,6 +210,22 @@ void resetKeypadState();
 char readRawKeypadOnce();
 char readRawKeypadStable();
 char scanKeypad();
+bool isI2CDevicePresent(uint8_t addr);
+String scanI2CAddresses();
+bool bbSclHighWait(unsigned long maxMs);
+bool bbStart();
+void bbStop();
+bool bbWriteByte(uint8_t b, bool& ack);
+bool bbReadByte(bool sendAck, uint8_t& outByte);
+bool bbI2cWrite(uint8_t addr7, const uint8_t* data, uint8_t len);
+byte bbI2cRead(uint8_t addr7, uint8_t* outBuf, uint8_t len);
+bool pn532WriteFrame(const uint8_t* frame, uint8_t frameLen);
+byte pn532ReadRawBytes(uint8_t* outBuf, uint8_t count);
+bool pn532WriteCommand(const uint8_t* payload, uint8_t payloadLen);
+bool pn532WaitAck(unsigned long timeoutMs, String& debugHex);
+bool pn532ReadResponse(uint8_t* outPayload, uint8_t maxPayload, uint8_t& outLen, unsigned long timeoutMs, String& debugHex);
+bool pn532SendCommand(const uint8_t* cmd, uint8_t cmdLen, uint8_t* resp, uint8_t maxResp, uint8_t& respLen, unsigned long timeoutMs);
+bool pn532InitRaw();
 void recoverI2CAndNfc();
 bool pollNfcCardNonBlocking(String& outUid);
 bool firestoreRequestEx(const String& method, const String& url, const String& body, int& outCode, String& outPayload, int maxAttempts, unsigned long timeoutMs);
@@ -169,8 +243,10 @@ void startPayState(double amt, const String& ordNo, const String& payUser);
 void pollFirestore();
 
 String getFirestoreDocUrl() {
-  if (activeTerminalId.length() == 0) return String("");
-  return String(FIRESTORE_DOC_BASE) + activeTerminalId + "?key=" + String(FIRESTORE_API_KEY);
+  if (activeTerminalId.length() == 0 || activeFirestoreDocBase.length() == 0) return String("");
+  String base = activeFirestoreDocBase;
+  if (!base.endsWith("/")) base += "/";
+  return base + activeTerminalId + "?key=" + activeFirestoreApiKey;
 }
 
 String sanitizeTerminalId(const String& raw) {
@@ -194,6 +270,28 @@ String escapeHtmlAttr(const String& raw) {
   out.replace("<", "&lt;");
   out.replace(">", "&gt;");
   return out;
+}
+
+String escapeJsonStr(const String& raw) {
+  String out = raw;
+  out.replace("\\", "\\\\");
+  out.replace("\"", "\\\"");
+  out.replace("\n", " ");
+  out.replace("\r", " ");
+  return out;
+}
+
+String getStateName() {
+  switch (currentState) {
+    case STATE_IDLE: return "IDLE (Klaar)";
+    case STATE_LINKING: return "LINKING (Pas koppelen/login)";
+    case STATE_WAITING_CARD: return "WAITING_CARD (Wacht op pas)";
+    case STATE_WAITING_PIN: return "WAITING_PIN (Wacht op pincode)";
+    case STATE_CHECK_CARD: return "CHECK_CARD (Saldo check)";
+    case STATE_WAITING_RESULT: return "WAITING_RESULT (Wacht op kassa)";
+    case STATE_SHOW_RESULT: return "SHOW_RESULT";
+  }
+  return "ONBEKEND";
 }
 
 void beep(int freq, int ms) {
@@ -251,22 +349,61 @@ String formatShortReason(const String& rawReason) {
   return rawReason.substring(0, 16);
 }
 
-void saveConfigToEeprom(const String& newSsid, const String& newPass, const String& newTermId) {
-  WifiPrefsV2 prefs;
-  memset(&prefs, 0, sizeof(prefs));
-  memcpy(prefs.magic, "WPW2", 4);
-  newSsid.substring(0, 63).toCharArray(prefs.ssid, sizeof(prefs.ssid));
-  newPass.substring(0, 63).toCharArray(prefs.pass, sizeof(prefs.pass));
+void saveSecrets(const String& newSsid, const String& newPass, const String& newTermId, const String& newDocBase, const String& newApiKey) {
+  String cleanSsid = newSsid;
+  cleanSsid.trim();
   String safeTid = sanitizeTerminalId(newTermId);
+  String cleanBase = newDocBase;
+  cleanBase.trim();
+  if (cleanBase.length() == 0) cleanBase = String(FIRESTORE_DOC_BASE);
+  if (!cleanBase.endsWith("/")) cleanBase += "/";
+  String cleanKey = newApiKey;
+  cleanKey.trim();
+  if (cleanKey.length() == 0) cleanKey = String(FIRESTORE_API_KEY);
+
+  WifiPrefsV3 prefs;
+  memset(&prefs, 0, sizeof(prefs));
+  memcpy(prefs.magic, "WPW3", 4);
+  cleanSsid.substring(0, 63).toCharArray(prefs.ssid, sizeof(prefs.ssid));
+  newPass.substring(0, 63).toCharArray(prefs.pass, sizeof(prefs.pass));
   safeTid.substring(0, 31).toCharArray(prefs.terminalId, sizeof(prefs.terminalId));
+  cleanBase.substring(0, 191).toCharArray(prefs.firestoreDocBase, sizeof(prefs.firestoreDocBase));
+  cleanKey.substring(0, 63).toCharArray(prefs.firebaseApiKey, sizeof(prefs.firebaseApiKey));
   EEPROM.put(0, prefs);
   EEPROM.commit();
-  activeSsid = newSsid.substring(0, 63);
+
+  activeSsid = cleanSsid.substring(0, 63);
   activePass = newPass.substring(0, 63);
   activeTerminalId = safeTid;
+  activeFirestoreDocBase = cleanBase.substring(0, 191);
+  activeFirestoreApiKey = cleanKey.substring(0, 63);
+
+  if (littleFsReady) {
+    File f = LittleFS.open("/secrets.json", "w");
+    if (f) {
+      JsonDocument doc;
+      doc["ssid"] = activeSsid;
+      doc["password"] = activePass;
+      doc["terminalId"] = activeTerminalId;
+      doc["firestoreDocBase"] = activeFirestoreDocBase;
+      doc["firebaseApiKey"] = activeFirestoreApiKey;
+      serializeJsonPretty(doc, f);
+      f.close();
+      Serial.println("[SECRETS] Opgeslagen in /secrets.json + EEPROM (WPW3)");
+    } else {
+      Serial.println("[SECRETS] Kon /secrets.json niet schrijven, wel in EEPROM opgeslagen");
+    }
+  }
+}
+
+void saveConfigToEeprom(const String& newSsid, const String& newPass, const String& newTermId) {
+  saveSecrets(newSsid, newPass, newTermId, activeFirestoreDocBase, activeFirestoreApiKey);
 }
 
 void loadWifiConfig() {
+  activeFirestoreDocBase = String(FIRESTORE_DOC_BASE);
+  activeFirestoreApiKey = String(FIRESTORE_API_KEY);
+
   String compiledSsid = String(ssid);
   compiledSsid.trim();
   String compiledPass = String(password);
@@ -280,25 +417,74 @@ void loadWifiConfig() {
     activeTerminalId = sanitizeTerminalId(defaultTid);
   }
 
+  // 1. Direct ingevuld in sketch of secrets.h
   if (hasSketchSsid) {
     activeSsid = compiledSsid.substring(0, 63);
     activePass = (compiledPass == "JOUW_WIFI_WACHTWOORD" || compiledPass.startsWith("__WP_"))
       ? String("")
       : compiledPass.substring(0, 63);
-    Serial.println("[CONFIG] WiFi uit sketch code: " + activeSsid + " | Terminal=" + activeTerminalId);
+    Serial.println("[CONFIG] WiFi uit sketch/secrets.h: " + activeSsid + " | Terminal=" + activeTerminalId);
 
     if (activeTerminalId.length() > 0) {
-      WifiPrefsV2 existing;
-      EEPROM.get(0, existing);
-      existing.ssid[sizeof(existing.ssid) - 1] = '\0';
-      existing.pass[sizeof(existing.pass) - 1] = '\0';
-      existing.terminalId[sizeof(existing.terminalId) - 1] = '\0';
-      bool eepromMatches = (memcmp(existing.magic, "WPW2", 4) == 0) &&
-        (String(existing.ssid) == activeSsid) &&
-        (String(existing.pass) == activePass) &&
-        (String(existing.terminalId) == activeTerminalId);
-      if (!eepromMatches) {
-        saveConfigToEeprom(activeSsid, activePass, activeTerminalId);
+      saveSecrets(activeSsid, activePass, activeTerminalId, activeFirestoreDocBase, activeFirestoreApiKey);
+      return;
+    }
+  }
+
+  // 2. Persistent /secrets.json bestand op Pico flash (LittleFS) — blijft behouden bij Arduino IDE upload!
+  if (littleFsReady && LittleFS.exists("/secrets.json")) {
+    File f = LittleFS.open("/secrets.json", "r");
+    if (f) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, f);
+      f.close();
+      if (!err) {
+        String fsSsid = doc["ssid"] | "";
+        String fsPass = doc["password"] | "";
+        String fsTid = doc["terminalId"] | "";
+        String fsBase = doc["firestoreDocBase"] | "";
+        String fsKey = doc["firebaseApiKey"] | "";
+        fsSsid.trim();
+        fsTid.trim();
+        fsBase.trim();
+        fsKey.trim();
+
+        if (fsBase.length() > 0) activeFirestoreDocBase = fsBase.substring(0, 191);
+        if (fsKey.length() > 0) activeFirestoreApiKey = fsKey.substring(0, 63);
+        if (fsTid.length() > 0 && activeTerminalId.length() == 0) {
+          activeTerminalId = sanitizeTerminalId(fsTid);
+        }
+        if (!hasSketchSsid && fsSsid.length() > 0) {
+          activeSsid = fsSsid.substring(0, 63);
+          activePass = fsPass.substring(0, 63);
+          Serial.println("[SECRETS] Geladen uit LittleFS (/secrets.json): " + activeSsid + " | Terminal=" + activeTerminalId);
+          return;
+        }
+      }
+    }
+  }
+
+  // 3. EEPROM fallback (WPW3 -> WPW2 -> WPW1)
+  WifiPrefsV3 prefsV3;
+  EEPROM.get(0, prefsV3);
+  if (memcmp(prefsV3.magic, "WPW3", 4) == 0) {
+    prefsV3.ssid[sizeof(prefsV3.ssid) - 1] = '\0';
+    prefsV3.pass[sizeof(prefsV3.pass) - 1] = '\0';
+    prefsV3.terminalId[sizeof(prefsV3.terminalId) - 1] = '\0';
+    prefsV3.firestoreDocBase[sizeof(prefsV3.firestoreDocBase) - 1] = '\0';
+    prefsV3.firebaseApiKey[sizeof(prefsV3.firebaseApiKey) - 1] = '\0';
+
+    if (strlen(prefsV3.firestoreDocBase) > 0) activeFirestoreDocBase = String(prefsV3.firestoreDocBase);
+    if (strlen(prefsV3.firebaseApiKey) > 0) activeFirestoreApiKey = String(prefsV3.firebaseApiKey);
+    if (strlen(prefsV3.terminalId) > 0 && activeTerminalId.length() == 0) {
+      activeTerminalId = sanitizeTerminalId(String(prefsV3.terminalId));
+    }
+    if (!hasSketchSsid && strlen(prefsV3.ssid) > 0) {
+      activeSsid = String(prefsV3.ssid);
+      activePass = String(prefsV3.pass);
+      Serial.println("[CONFIG] Geladen uit EEPROM (WPW3): " + activeSsid + " | Terminal=" + activeTerminalId);
+      if (littleFsReady && !LittleFS.exists("/secrets.json")) {
+        saveSecrets(activeSsid, activePass, activeTerminalId, activeFirestoreDocBase, activeFirestoreApiKey);
       }
       return;
     }
@@ -318,6 +504,7 @@ void loadWifiConfig() {
       activeSsid = String(prefsV2.ssid);
       activePass = String(prefsV2.pass);
       Serial.println("[CONFIG] Geladen uit EEPROM (WPW2): " + activeSsid + " | Terminal=" + activeTerminalId);
+      saveSecrets(activeSsid, activePass, activeTerminalId, activeFirestoreDocBase, activeFirestoreApiKey);
       return;
     }
   }
@@ -336,69 +523,270 @@ void loadWifiConfig() {
   }
 
   if (!hasSketchSsid) {
-    Serial.println("[CONFIG] Geen WiFi opgeslagen");
+    Serial.println("[CONFIG] Geen WiFi / secrets opgeslagen");
   }
 }
 
-void handlePortalRoot() {
-  int n = WiFi.scanNetworks();
+void handleWebRoot() {
+  bool doScan = (apPortalActive && WiFi.status() != WL_CONNECTED) || setupPortalServer.hasArg("scan");
   String options = "";
-  for (int i = 0; i < n; i++) {
-    String net = WiFi.SSID(i);
-    if (net.length() > 0) {
-      String safeNet = escapeHtmlAttr(net);
-      options += "<option value='" + safeNet + "'>" + safeNet + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  if (doScan) {
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+      String net = WiFi.SSID(i);
+      if (net.length() > 0) {
+        String safeNet = escapeHtmlAttr(net);
+        options += "<option value='" + safeNet + "'>" + safeNet + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+      }
     }
   }
-  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>WerkPay WiFi &amp; Terminal Setup</title>"
-                "<style>body{font-family:sans-serif;background:#020617;color:#f8fafc;padding:20px;max-width:420px;margin:auto}"
-                "input,select,button{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#fff;box-sizing:border-box}"
-                "label{font-size:12px;color:#94a3b8;font-weight:bold;display:block;margin-top:8px}"
-                "button{background:#06b6d4;color:#020617;font-weight:bold;border:none;margin-top:12px}</style></head><body>"
-                "<h2>WerkPay Pinapparaat Setup</h2><p>Stel je WiFi-netwerk en het Terminal-ID in:</p>"
-                "<form method='POST' action='/save'>"
-                "<label>Gescande WiFi-netwerken</label>"
-                "<select onchange=\"document.getElementById('s').value=this.value\"><option value=''>-- Scan resultaten --</option>" + options + "</select>"
-                "<label>WiFi Naam (SSID)</label>"
-                "<input id='s' name='ssid' placeholder='WiFi Naam (SSID)' required value='" + escapeHtmlAttr(activeSsid) + "'>"
-                "<label>WiFi Wachtwoord (leeg = open netwerk)</label>"
-                "<input name='pass' type='password' placeholder='WiFi Wachtwoord'>"
-                "<label>Terminal ID (zelf instellen, verplicht)</label>"
-                "<input name='termid' placeholder='Bijv. kassa1 of bar1' required value='" + escapeHtmlAttr(activeTerminalId) + "'>"
-                "<button type='submit'>Opslaan &amp; Verbinden</button></form></body></html>";
+
+  String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("192.168.4.1");
+  String scanBlock = "";
+  if (doScan) {
+    scanBlock = "<label>Gescande WiFi-netwerken</label>"
+                "<select onchange=\"document.getElementById('s').value=this.value\"><option value=''>-- Kies netwerk --</option>" + options + "</select>";
+  } else {
+    scanBlock = "<div style='margin-bottom:8px'><a href='/?scan=1' style='color:#38bdf8;font-size:12px;font-weight:bold'>WiFi netwerken scannen...</a></div>";
+  }
+
+  String fsStatusText = littleFsReady
+    ? String("LittleFS (/secrets.json) + EEPROM")
+    : String("Alleen EEPROM (zet Arduino IDE Flash Size op 64KB/1MB FS voor /secrets.json)");
+
+  String html =
+    "<!DOCTYPE html><html lang='nl'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>WerkPay Pinapparaat (" + escapeHtmlAttr(activeTerminalId.length() ? activeTerminalId : String("Setup")) + ")</title>"
+    "<style>"
+    "*{box-sizing:border-box}"
+    "body{font-family:system-ui,-apple-system,sans-serif;background:#020617;color:#f8fafc;margin:0;padding:16px}"
+    ".wrap{max-width:500px;margin:auto}"
+    ".card{background:#0f172a;border:1px solid #1e293b;border-radius:14px;padding:16px;margin-bottom:14px}"
+    "h1{font-size:19px;margin:0 0 4px;display:flex;align-items:center;justify-content:space-between}"
+    ".sub{font-size:12px;color:#94a3b8;margin:0 0 12px}"
+    ".badge{font-size:11px;padding:3px 8px;border-radius:6px;background:#083344;color:#22d3ee;border:1px solid #155e75}"
+    ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px}"
+    ".kv{background:#020617;border:1px solid #1e293b;border-radius:10px;padding:8px 10px}"
+    ".k{color:#94a3b8;font-size:10px;text-transform:uppercase;display:block;margin-bottom:2px}"
+    ".v{font-weight:700;word-break:break-word}"
+    ".ok{color:#34d399}.err{color:#fb7185}.warn{color:#fbbf24}"
+    ".btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}"
+    "button{width:100%;padding:10px;border-radius:10px;border:none;font-weight:700;font-size:12px;cursor:pointer}"
+    ".b-pri{background:#06b6d4;color:#020617;margin-top:10px}"
+    ".b-sec{background:#1e293b;color:#e2e8f0;border:1px solid #334155}"
+    ".b-sec:hover{background:#334155}"
+    "input,select{width:100%;padding:10px;margin:6px 0 10px;border-radius:10px;border:1px solid #334155;background:#020617;color:#fff;font-size:13px}"
+    "input[type=checkbox]{width:auto;margin:0 8px 0 0}"
+    "label{font-size:12px;color:#cbd5e1;font-weight:600;display:block}"
+    ".row{display:flex;align-items:center;font-size:12px;color:#94a3b8;margin:2px 0 10px}"
+    "#msg{font-size:12px;margin-top:8px;min-height:16px;color:#38bdf8}"
+    "</style></head><body><div class='wrap'>"
+    "<div class='card'>"
+    "<h1><span>WerkPay Pinapparaat</span><span class='badge'>" + String(FIRMWARE_VERSION) + "</span></h1>"
+    "<p class='sub'>IP: <b>" + ipStr + "</b> &middot; Terminal: <b id='tid'>" + escapeHtmlAttr(activeTerminalId.length() ? activeTerminalId : String("(geen)")) + "</b></p>"
+    "<div class='grid'>"
+    "<div class='kv'><span class='k'>Status</span><span class='v' id='st'>Laden...</span></div>"
+    "<div class='kv'><span class='k'>NFC Lezer (0x24)</span><span class='v' id='nfc'>...</span></div>"
+    "<div class='kv'><span class='k'>WiFi</span><span class='v' id='wifi'>...</span></div>"
+    "<div class='kv'><span class='k'>Cloud (Firestore)</span><span class='v' id='cloud'>...</span></div>"
+    "<div class='kv'><span class='k'>Laatste Pas UID</span><span class='v' id='uid'>-</span></div>"
+    "<div class='kv'><span class='k'>Laatste Toets / Uptime</span><span class='v' id='key'>-</span></div>"
+    "<div class='kv' style='grid-column:span 2'><span class='k'>I2C Bus Scan (GP4/GP5)</span><span class='v' id='i2c'>...</span></div>"
+    "</div>"
+    "<div class='btns'>"
+    "<button class='b-sec' type='button' onclick=\"act('beep')\">Test Pieper</button>"
+    "<button class='b-sec' type='button' onclick=\"act('nfc_recover')\">Herstel NFC / I2C</button>"
+    "<button class='b-sec' type='button' onclick=\"act('cloud_test')\">Test Cloud</button>"
+    "<button class='b-sec' type='button' onclick=\"act('reset')\">Reset naar IDLE</button>"
+    "</div>"
+    "<div id='msg'></div>"
+    "</div>"
+    "<div class='card'>"
+    "<h1 style='font-size:15px;margin-bottom:4px'>Blijvend Secrets Bestand (WiFi, ID &amp; Firebase)</h1>"
+    "<p class='sub'>Opslag: <b>" + fsStatusText + "</b> &middot; <a href='/secrets.json' style='color:#38bdf8'>Download secrets.json</a></p>"
+    "<form method='POST' action='/save'>"
+    + scanBlock +
+    "<label>WiFi Naam (SSID)</label>"
+    "<input id='s' name='ssid' placeholder='WiFi Naam (SSID)' required value='" + escapeHtmlAttr(activeSsid) + "'>"
+    "<label>WiFi Wachtwoord (leeg laten = huidig wachtwoord behouden)</label>"
+    "<input name='pass' type='password' placeholder='Nieuw wachtwoord of leeg laten'>"
+    "<label class='row'><input type='checkbox' name='openwifi' value='1'>Open WiFi netwerk zonder wachtwoord</label>"
+    "<label>Terminal ID</label>"
+    "<input name='termid' placeholder='Bijv. kassa1 of pin01' required value='" + escapeHtmlAttr(activeTerminalId) + "'>"
+    "<details style='margin:6px 0 8px'><summary style='font-size:12px;color:#94a3b8;cursor:pointer;font-weight:bold'>Firebase API &amp; Database URL (optioneel)</summary>"
+    "<div style='margin-top:8px'>"
+    "<label>Firestore Document Base URL</label>"
+    "<input name='fburl' value='" + escapeHtmlAttr(activeFirestoreDocBase) + "'>"
+    "<label>Firebase API Key</label>"
+    "<input name='fbkey' value='" + escapeHtmlAttr(activeFirestoreApiKey) + "'>"
+    "</div></details>"
+    "<button class='b-pri' type='submit'>Opslaan in Secrets &amp; Herstarten</button>"
+    "</form></div></div>"
+    "<script>"
+    "function rf(){"
+    "fetch('/api/status').then(function(r){return r.json();}).then(function(d){"
+    "document.getElementById('st').textContent=d.state;"
+    "document.getElementById('tid').textContent=d.terminalId||'(geen)';"
+    "var n=document.getElementById('nfc');n.textContent=d.nfcReady?('OK (0x24 '+d.nfcFw+')'):(d.nfcDiag||'NIET GEVONDEN (0x24)');n.className='v '+(d.nfcReady?'ok':'err');"
+    "var w=document.getElementById('wifi');w.textContent=d.wifiConnected?(d.ssid+' ('+d.rssi+' dBm)'):'Niet verbonden';"
+    "var c=document.getElementById('cloud');c.textContent=(d.lastHttp>0?('HTTP '+d.lastHttp+': '):'')+d.cloudNote;c.className='v '+(d.lastHttp===200?'ok':(d.lastHttp===0?'warn':'err'));"
+    "document.getElementById('uid').textContent=d.lastUid||'-';"
+    "document.getElementById('key').textContent=(d.lastKey||'-')+' / '+d.uptimeSec+'s';"
+    "document.getElementById('i2c').textContent=d.i2cAddrs||'Geen';}"
+    ").catch(function(){});"
+    "}"
+    "function act(cmd){"
+    "document.getElementById('msg').textContent='Uitvoeren: '+cmd+'...';"
+    "fetch('/api/action?cmd='+encodeURIComponent(cmd),{method:'POST'}).then(function(r){return r.text();}).then(function(t){"
+    "document.getElementById('msg').textContent=t;rf();"
+    "}).catch(function(e){document.getElementById('msg').textContent='Fout: '+e;});"
+    "}"
+    "rf();setInterval(rf,2000);"
+    "</script></body></html>";
+
   setupPortalServer.send(200, "text/html", html);
+}
+
+void handleApiStatus() {
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  static String cachedI2cList = "";
+  static bool cachedI2cAck = false;
+  static unsigned long lastI2cScanMs = 0;
+  unsigned long now = millis();
+  if (currentState == STATE_IDLE && nfcPhase == NFC_IDLE && (lastI2cScanMs == 0 || now - lastI2cScanMs >= 10000)) {
+    lastI2cScanMs = now;
+    cachedI2cAck = isI2CDevicePresent(PN532_I2C_ADDR);
+    cachedI2cList = scanI2CAddresses();
+  }
+  bool i2cAck = cachedI2cAck;
+  String i2cList = cachedI2cList;
+  String keyStr = (lastKeySeen >= 32 && lastKeySeen <= 126) ? String(lastKeySeen) : String("");
+  String json = "{";
+  json += "\"fw\":\"" + escapeJsonStr(String(FIRMWARE_VERSION)) + "\",";
+  json += "\"state\":\"" + escapeJsonStr(getStateName()) + "\",";
+  json += "\"terminalId\":\"" + escapeJsonStr(activeTerminalId) + "\",";
+  json += "\"ssid\":\"" + escapeJsonStr(activeSsid) + "\",";
+  json += "\"ip\":\"" + (wifiOk ? WiFi.localIP().toString() : String("192.168.4.1")) + "\",";
+  json += "\"wifiConnected\":" + String(wifiOk ? "true" : "false") + ",";
+  json += "\"rssi\":" + String(wifiOk ? WiFi.RSSI() : 0) + ",";
+  json += "\"nfcReady\":" + String(nfcReady ? "true" : "false") + ",";
+  json += "\"nfcFw\":\"" + escapeJsonStr(nfcFirmwareText) + "\",";
+  json += "\"nfcDiag\":\"" + escapeJsonStr(nfcDiagNote) + "\",";
+  json += "\"i2cAck\":" + String(i2cAck ? "true" : "false") + ",";
+  json += "\"i2cAddrs\":\"" + escapeJsonStr(i2cList) + "\",";
+  json += "\"littleFs\":" + String(littleFsReady ? "true" : "false") + ",";
+  json += "\"lastHttp\":" + String(lastCloudHttpCode) + ",";
+  json += "\"cloudNote\":\"" + escapeJsonStr(lastCloudNote) + "\",";
+  json += "\"lastUid\":\"" + escapeJsonStr(lastUidSeen) + "\",";
+  json += "\"lastKey\":\"" + escapeJsonStr(keyStr) + "\",";
+  json += "\"uptimeSec\":" + String(millis() / 1000UL);
+  json += "}";
+  setupPortalServer.send(200, "application/json", json);
+}
+
+void handleApiAction() {
+  String cmd = setupPortalServer.arg("cmd");
+  if (cmd == "beep") {
+    beepAsync(2400, 140);
+    setupPortalServer.send(200, "text/plain", "Pieper getest!");
+  } else if (cmd == "nfc_recover") {
+    lastNfcRecoverMs = 0;
+    recoverI2CAndNfc();
+    String scanRes = scanI2CAddresses();
+    setupPortalServer.send(200, "text/plain", nfcReady
+      ? ("PN532 NFC actief (" + nfcFirmwareText + ")! I2C: " + scanRes)
+      : ("PN532 fout: " + nfcDiagNote + " | I2C: " + scanRes));
+  } else if (cmd == "cloud_test") {
+    if (activeTerminalId.length() == 0) {
+      setupPortalServer.send(200, "text/plain", "Stel eerst een Terminal ID in.");
+      return;
+    }
+    pollFirestore();
+    setupPortalServer.send(200, "text/plain", "Cloud test klaar: HTTP " + String(lastCloudHttpCode) + " (" + lastCloudNote + ")");
+  } else if (cmd == "reset") {
+    nfcPhase = NFC_IDLE;
+    setIdleScreen();
+    patchStatusIdle("Reset via web");
+    setupPortalServer.send(200, "text/plain", "Terminal gereset naar IDLE.");
+  } else {
+    setupPortalServer.send(400, "text/plain", "Onbekende actie");
+  }
+}
+
+void handleSecretsDownload() {
+  JsonDocument doc;
+  doc["ssid"] = activeSsid;
+  doc["password"] = activePass;
+  doc["terminalId"] = activeTerminalId;
+  doc["firestoreDocBase"] = activeFirestoreDocBase;
+  doc["firebaseApiKey"] = activeFirestoreApiKey;
+  String out;
+  serializeJsonPretty(doc, out);
+  setupPortalServer.sendHeader("Content-Disposition", "attachment; filename=\"secrets.json\"");
+  setupPortalServer.send(200, "application/json", out);
 }
 
 void handlePortalSave() {
   String s = setupPortalServer.arg("ssid");
   String p = setupPortalServer.arg("pass");
+  bool openWifi = setupPortalServer.hasArg("openwifi");
   String t = setupPortalServer.arg("termid");
+  String fbUrl = setupPortalServer.arg("fburl");
+  String fbKey = setupPortalServer.arg("fbkey");
   s.trim();
   t.trim();
+  fbUrl.trim();
+  fbKey.trim();
+
+  String nextPass = openWifi ? String("") : (p.length() > 0 ? p : activePass);
   String nextTid = t.length() > 0 ? sanitizeTerminalId(t) : activeTerminalId;
+  String nextBase = fbUrl.length() > 0 ? fbUrl : activeFirestoreDocBase;
+  String nextKey = fbKey.length() > 0 ? fbKey : activeFirestoreApiKey;
+
   if (s.length() == 0 || nextTid.length() == 0) {
     setupPortalServer.send(400, "text/plain", "WiFi SSID en Terminal ID zijn verplicht.");
     return;
   }
-  saveConfigToEeprom(s, p, nextTid);
+  saveSecrets(s, nextPass, nextTid, nextBase, nextKey);
   Serial.println("[SETUP] Opgeslagen: SSID=" + s + " Terminal=" + nextTid);
-  setupPortalServer.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#020617;color:#10b981;padding:24px'><h2>Opgeslagen!</h2><p>Terminal <b>" + escapeHtmlAttr(nextTid) + "</b> herstart nu en verbindt met " + escapeHtmlAttr(s) + "...</p></body></html>");
-  lcdShow("WiFi Opgeslagen", nextTid);
+  setupPortalServer.send(200, "text/html", "<html><body style='font-family:sans-serif;background:#020617;color:#10b981;padding:24px'><h2>Opgeslagen!</h2><p>Secrets opgeslagen voor terminal <b>" + escapeHtmlAttr(nextTid) + "</b>. Herstarten...</p></body></html>");
+  lcdShow("Secrets bewaard", nextTid);
   delay(800);
   rp2040.reboot();
 }
 
-void startApSetupPortal() {
-  if (apPortalActive) return;
-  apPortalActive = true;
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("WerkPay-Setup");
-  setupPortalServer.on("/", HTTP_GET, handlePortalRoot);
+void registerWebRoutes() {
+  static bool routesRegistered = false;
+  if (routesRegistered) return;
+  routesRegistered = true;
+  setupPortalServer.on("/", HTTP_GET, handleWebRoot);
+  setupPortalServer.on("/api/status", HTTP_GET, handleApiStatus);
+  setupPortalServer.on("/api/action", HTTP_POST, handleApiAction);
+  setupPortalServer.on("/secrets.json", HTTP_GET, handleSecretsDownload);
   setupPortalServer.on("/save", HTTP_POST, handlePortalSave);
+}
+
+void startLocalWebServer() {
+  if (webServerStarted) return;
+  registerWebRoutes();
   setupPortalServer.begin();
-  Serial.println("[SETUP] Hotspot actief: 'WerkPay-Setup' -> http://192.168.4.1");
+  webServerStarted = true;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WEB] Dashboard actief op http://" + WiFi.localIP().toString() + "/");
+  }
+}
+
+void startApSetupPortal() {
+  if (!apPortalActive) {
+    apPortalActive = true;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("WerkPay-Setup");
+    Serial.println("[SETUP] Hotspot actief: 'WerkPay-Setup' -> http://192.168.4.1");
+  }
+  startLocalWebServer();
   if (activeTerminalId.length() == 0 && WiFi.status() == WL_CONNECTED) {
-    lcdShow("Geen Terminal-ID", "AP:192.168.4.1");
+    lcdShow("Geen Terminal-ID", WiFi.localIP().toString());
   } else {
     lcdShow("WiFi:WerkPay-Set", "IP: 192.168.4.1");
   }
@@ -439,12 +827,22 @@ void handleSerialCommands() {
       serialRxBuffer = "";
       cmd.trim();
       if (cmd == "PING") {
-        Serial.println("PONG:WERKPAY_TERMINAL:" + activeTerminalId);
+        Serial.println("PONG:WERKPAY_TERMINAL:" + activeTerminalId + ":" + String(FIRMWARE_VERSION));
+      } else if (cmd == "STATUS") {
+        Serial.println("[STATUS] FW=" + String(FIRMWARE_VERSION) +
+          " State=" + String((int)currentState) +
+          " NFC=" + String(nfcReady ? "OK" : "ERR") +
+          " I2C_0x24=" + String(isI2CDevicePresent(0x24) ? "ACK" : "NOACK") +
+          " WiFi=" + String((int)WiFi.status()) +
+          " Term=" + activeTerminalId);
       } else if (cmd == "CLEAR_WIFI") {
-        WifiPrefsV2 empty;
+        WifiPrefsV3 empty;
         memset(&empty, 0, sizeof(empty));
         EEPROM.put(0, empty);
         EEPROM.commit();
+        if (littleFsReady && LittleFS.exists("/secrets.json")) {
+          LittleFS.remove("/secrets.json");
+        }
         activeSsid = "";
         activePass = "";
         activeTerminalId = "";
@@ -489,6 +887,7 @@ void handleSerialCommands() {
           if (connectWifiBlocking(30)) {
             Serial.println("WIFI_SAVED:" + activeSsid + " TERM=" + activeTerminalId + " IP=" + WiFi.localIP().toString());
             lcdShow("WiFi Verbonden!", WiFi.localIP().toString());
+            startLocalWebServer();
             beep(2400, 120);
             delay(800);
             setIdleScreen();
@@ -507,7 +906,7 @@ void handleSerialCommands() {
 void setIdleScreen() {
   bool wasBusy = (currentState != STATE_IDLE);
   currentState = STATE_IDLE;
-  nfcScanArmed = false;
+  nfcPhase = NFC_IDLE;
   activeUsername = "";
   pendingAmount = "0.00";
   pendingOrderNo = "0";
@@ -517,9 +916,11 @@ void setIdleScreen() {
   if (apPortalActive && WiFi.status() != WL_CONNECTED) {
     lcdShow("WiFi:WerkPay-Set", "IP: 192.168.4.1");
   } else if (activeTerminalId.length() == 0) {
-    lcdShow("Geen Terminal-ID", apPortalActive ? "AP:192.168.4.1" : "Stel in USB / AP");
+    lcdShow("Geen Terminal-ID", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("AP: 192.168.4.1"));
   } else {
-    lcdShow("WerkPay Terminal", "");
+    String top = (activeTerminalId.length() <= 7) ? ("WerkPay " + activeTerminalId) : String("WerkPay " + String(FIRMWARE_VERSION));
+    String bot = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("Geen WiFi");
+    lcdShow(top, bot);
   }
   if (wasBusy) {
     Serial.println("[STATE] Klaar (IDLE)");
@@ -543,9 +944,9 @@ void updatePinDisplay() {
 }
 
 void resetKeypadState() {
-  debouncedKey = 0;
-  candidateKey = 0;
-  candidateSinceMs = millis();
+  keyArmed = true;
+  lastRawKey = 0;
+  keyZeroSinceMs = millis();
   lastKeyActivityMs = millis();
 }
 
@@ -579,38 +980,390 @@ char readRawKeypadOnce() {
 char readRawKeypadStable() {
   char r1 = readRawKeypadOnce();
   if (r1 == 0) return 0;
-  delayMicroseconds(150);
+  delay(3);
   char r2 = readRawKeypadOnce();
   return (r1 == r2) ? r1 : 0;
 }
 
-// Stabiele state-machine debounce: snelle invoer zonder dubbele of gemiste toetsen
+// Directe 1-pass toetsdetectie: mist nooit een toets ook tijdens netwerkpolling
 char scanKeypad() {
   char raw = readRawKeypadStable();
   unsigned long now = millis();
 
   if (raw != 0) {
     lastKeyActivityMs = now;
-  }
-
-  if (raw != candidateKey) {
-    candidateKey = raw;
-    candidateSinceMs = now;
+    if (keyArmed) {
+      keyArmed = false;
+      lastRawKey = raw;
+      lastKeySeen = raw;
+      laatsteToetsTijd = now;
+      return raw;
+    }
     return 0;
   }
 
-  if (candidateKey != debouncedKey) {
-    unsigned long neededMs = (candidateKey == 0) ? KEY_RELEASE_DEBOUNCE_MS : KEY_PRESS_DEBOUNCE_MS;
-    if (now - candidateSinceMs >= neededMs) {
-      debouncedKey = candidateKey;
-      if (debouncedKey != 0) {
-        laatsteToetsTijd = now;
-        return debouncedKey;
-      }
+  if (!keyArmed) {
+    if (lastRawKey != 0) {
+      lastRawKey = 0;
+      keyZeroSinceMs = now;
+    } else if (now - keyZeroSinceMs >= KEY_RELEASE_DEBOUNCE_MS) {
+      keyArmed = true;
     }
   }
-
   return 0;
+}
+
+bool isI2CDevicePresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return (Wire.endTransmission() == 0);
+}
+
+String scanI2CAddresses() {
+  String found = "";
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      if (found.length() > 0) found += ", ";
+      found += "0x";
+      if (addr < 16) found += "0";
+      found += String(addr, HEX);
+    }
+  }
+  return found.length() > 0 ? found : String("Geen");
+}
+
+bool bbSclHighWait(unsigned long maxMs) {
+  pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+  unsigned long t0 = millis();
+  while (digitalRead(I2C_SCL_PIN) == LOW) {
+    if (millis() - t0 >= maxMs) return false;
+    delayMicroseconds(20);
+  }
+  return true;
+}
+
+bool bbStart() {
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(10);
+  if (digitalRead(I2C_SCL_PIN) == LOW) { lastBbDiag = "SCL laag voor start"; return false; }
+  if (digitalRead(I2C_SDA_PIN) == LOW) { lastBbDiag = "SDA laag voor start"; return false; }
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);
+  delayMicroseconds(8);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  digitalWrite(I2C_SCL_PIN, LOW);
+  delayMicroseconds(8);
+  return true;
+}
+
+void bbStop() {
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);
+  delayMicroseconds(8);
+  bbSclHighWait(40);
+  delayMicroseconds(8);
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  delayMicroseconds(10);
+}
+
+bool bbWriteByte(uint8_t b, bool& ack) {
+  for (int i = 7; i >= 0; i--) {
+    if ((b >> i) & 0x01) {
+      pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    } else {
+      pinMode(I2C_SDA_PIN, OUTPUT);
+      digitalWrite(I2C_SDA_PIN, LOW);
+    }
+    delayMicroseconds(6);
+    if (!bbSclHighWait(80)) { lastBbDiag = "SCL timeout bit"; return false; }
+    delayMicroseconds(8);
+    pinMode(I2C_SCL_PIN, OUTPUT);
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(6);
+  }
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  delayMicroseconds(6);
+  if (!bbSclHighWait(80)) { lastBbDiag = "SCL timeout ACK"; return false; }
+  delayMicroseconds(6);
+  ack = (digitalRead(I2C_SDA_PIN) == LOW);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  digitalWrite(I2C_SCL_PIN, LOW);
+  delayMicroseconds(6);
+  return true;
+}
+
+bool bbReadByte(bool sendAck, uint8_t& outByte) {
+  uint8_t val = 0;
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  for (int i = 7; i >= 0; i--) {
+    delayMicroseconds(6);
+    if (!bbSclHighWait(80)) { lastBbDiag = "SCL timeout read"; return false; }
+    if (digitalRead(I2C_SDA_PIN) == HIGH) val |= (1 << i);
+    delayMicroseconds(6);
+    pinMode(I2C_SCL_PIN, OUTPUT);
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(6);
+  }
+  if (sendAck) {
+    pinMode(I2C_SDA_PIN, OUTPUT);
+    digitalWrite(I2C_SDA_PIN, LOW);
+  } else {
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  }
+  delayMicroseconds(6);
+  if (!bbSclHighWait(80)) { lastBbDiag = "SCL timeout rACK"; return false; }
+  delayMicroseconds(6);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  digitalWrite(I2C_SCL_PIN, LOW);
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  delayMicroseconds(6);
+  outByte = val;
+  return true;
+}
+
+bool bbI2cWrite(uint8_t addr7, const uint8_t* data, uint8_t len) {
+  Wire.end();
+  delayMicroseconds(40);
+  lastBbDiag = "";
+  bool ok = false;
+  if (bbStart()) {
+    bool ack = false;
+    if (bbWriteByte((uint8_t)(addr7 << 1), ack)) {
+      if (!ack) {
+        lastBbDiag = "Addr 0x" + String(addr7 << 1, HEX) + " NACK";
+      } else {
+        ok = true;
+        for (uint8_t i = 0; i < len; i++) {
+          bool bAck = false;
+          if (!bbWriteByte(data[i], bAck)) { ok = false; break; }
+          if (!bAck) { lastBbDiag = "Data NACK b" + String(i); ok = false; break; }
+        }
+      }
+    }
+    bbStop();
+  }
+  Wire.setSDA(I2C_SDA_PIN);
+  Wire.setSCL(I2C_SCL_PIN);
+  Wire.begin();
+  return ok;
+}
+
+byte bbI2cRead(uint8_t addr7, uint8_t* outBuf, uint8_t len) {
+  Wire.end();
+  delayMicroseconds(40);
+  byte got = 0;
+  if (bbStart()) {
+    bool ack = false;
+    if (bbWriteByte((uint8_t)((addr7 << 1) | 0x01), ack) && ack) {
+      for (uint8_t i = 0; i < len; i++) {
+        uint8_t b = 0;
+        if (!bbReadByte(i + 1 < len, b)) break;
+        outBuf[got++] = b;
+      }
+    }
+    bbStop();
+  }
+  Wire.setSDA(I2C_SDA_PIN);
+  Wire.setSCL(I2C_SCL_PIN);
+  Wire.begin();
+  return got;
+}
+
+bool pn532WriteFrame(const uint8_t* frame, uint8_t frameLen) {
+  if (!useSoftI2cNfc) {
+    Wire.beginTransmission((uint8_t)PN532_I2C_ADDR);
+    Wire.write(frame, frameLen);
+    lastNfcWriteErr = Wire.endTransmission();
+    if (lastNfcWriteErr == 0) {
+      return true;
+    }
+    // Hardware Wire faalde (bijv. RP2040 clock-stretch timeout err=5): schakel over op open-drain Soft I2C!
+    bool bbOk = bbI2cWrite(PN532_I2C_ADDR, frame, frameLen);
+    if (!bbOk) {
+      delay(12);
+      bbOk = bbI2cWrite(PN532_I2C_ADDR, frame, frameLen);
+    }
+    if (bbOk) {
+      useSoftI2cNfc = true;
+      Serial.println("[NFC] Hardware Wire err=" + String(lastNfcWriteErr) + " -> overgeschakeld op Soft I2C!");
+      return true;
+    }
+    return false;
+  }
+
+  if (bbI2cWrite(PN532_I2C_ADDR, frame, frameLen)) {
+    return true;
+  }
+  delay(8);
+  return bbI2cWrite(PN532_I2C_ADDR, frame, frameLen);
+}
+
+byte pn532ReadRawBytes(uint8_t* outBuf, uint8_t count) {
+  if (useSoftI2cNfc) {
+    return bbI2cRead(PN532_I2C_ADDR, outBuf, count);
+  }
+  byte got = Wire.requestFrom((uint8_t)PN532_I2C_ADDR, count);
+  byte idx = 0;
+  while (Wire.available() && idx < count) {
+    outBuf[idx++] = Wire.read();
+  }
+  while (Wire.available()) Wire.read();
+  return idx;
+}
+
+bool pn532WriteCommand(const uint8_t* payload, uint8_t payloadLen) {
+  if (payloadLen == 0 || payloadLen > 32) return false;
+  uint8_t frame[40];
+  uint8_t len = payloadLen + 1; // +1 voor TFI (0xD4)
+  uint8_t lcs = (uint8_t)(0x100 - len);
+  uint8_t sum = 0xD4;
+  for (uint8_t i = 0; i < payloadLen; i++) {
+    sum += payload[i];
+  }
+  uint8_t dcs = (uint8_t)(0x100 - sum);
+
+  frame[0] = 0x00;
+  frame[1] = 0x00;
+  frame[2] = 0xFF;
+  frame[3] = len;
+  frame[4] = lcs;
+  frame[5] = 0xD4;
+  memcpy(&frame[6], payload, payloadLen);
+  frame[6 + payloadLen] = dcs;
+  frame[7 + payloadLen] = 0x00;
+  uint8_t frameLen = (uint8_t)(8 + payloadLen);
+
+  return pn532WriteFrame(frame, frameLen);
+}
+
+bool pn532WaitAck(unsigned long timeoutMs, String& debugHex) {
+  debugHex = "";
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    uint8_t buf[8] = {0};
+    byte idx = pn532ReadRawBytes(buf, 7);
+
+    if (idx > 0) {
+      debugHex = "got=" + String(idx) + " [";
+      for (byte i = 0; i < idx && i < 7; i++) {
+        if (i > 0) debugHex += " ";
+        if (buf[i] < 16) debugHex += "0";
+        debugHex += String(buf[i], HEX);
+      }
+      debugHex += "]";
+    }
+
+    if (idx >= 6 && (buf[0] & 0x01) == 0x01) {
+      for (byte off = 1; off + 4 < idx; off++) {
+        if (buf[off] == 0x00 && buf[off + 1] == 0x00 && buf[off + 2] == 0xFF &&
+            buf[off + 3] == 0x00 && buf[off + 4] == 0xFF) {
+          return true;
+        }
+      }
+    }
+    delay(4);
+  }
+  if (debugHex.length() == 0) debugHex = "geen bytes (NACK)";
+  return false;
+}
+
+bool pn532ReadResponse(uint8_t* outPayload, uint8_t maxPayload, uint8_t& outLen, unsigned long timeoutMs, String& debugHex) {
+  outLen = 0;
+  debugHex = "";
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    uint8_t buf[32] = {0};
+    uint8_t reqLen = (uint8_t)min((int)(maxPayload + 10), 32);
+    byte idx = pn532ReadRawBytes(buf, reqLen);
+
+    if (idx > 0) {
+      debugHex = "got=" + String(idx) + " [";
+      for (byte i = 0; i < idx && i < 10; i++) {
+        if (i > 0) debugHex += " ";
+        if (buf[i] < 16) debugHex += "0";
+        debugHex += String(buf[i], HEX);
+      }
+      debugHex += "]";
+    }
+
+    if (idx >= 9 && (buf[0] & 0x01) == 0x01) {
+      for (byte off = 1; off + 6 < idx; off++) {
+        if (buf[off] == 0x00 && buf[off + 1] == 0x00 && buf[off + 2] == 0xFF) {
+          uint8_t len = buf[off + 3];
+          uint8_t lcs = buf[off + 4];
+          if (len >= 2 && ((uint8_t)(len + lcs) == 0x00) && (off + 5 + len) <= idx) {
+            if (buf[off + 5] == 0xD5) {
+              uint8_t payloadBytes = len - 1;
+              if (payloadBytes <= maxPayload) {
+                memcpy(outPayload, &buf[off + 6], payloadBytes);
+                outLen = payloadBytes;
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+    delay(5);
+  }
+  if (debugHex.length() == 0) debugHex = "timeout";
+  return false;
+}
+
+bool pn532SendCommand(const uint8_t* cmd, uint8_t cmdLen, uint8_t* resp, uint8_t maxResp, uint8_t& respLen, unsigned long timeoutMs) {
+  String dbg;
+  if (!pn532WriteCommand(cmd, cmdLen)) {
+    nfcDiagNote = "0x24 HW err=" + String(lastNfcWriteErr) + (lastBbDiag.length() > 0 ? (" | BB: " + lastBbDiag) : "");
+    return false;
+  }
+  if (!pn532WaitAck(180, dbg)) {
+    nfcDiagNote = "0x24 geen frame-ACK (" + dbg + ")";
+    return false;
+  }
+  if (!pn532ReadResponse(resp, maxResp, respLen, timeoutMs, dbg)) {
+    nfcDiagNote = "0x24 geen antwoord (" + dbg + ")";
+    return false;
+  }
+  return true;
+}
+
+bool pn532InitRaw() {
+  nfcFirmwareText = "";
+  useSoftI2cNfc = false;
+
+  uint8_t resp[24] = {0};
+  uint8_t respLen = 0;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    const uint8_t cmdFw[1] = {0x02}; // GetFirmwareVersion
+    if (pn532SendCommand(cmdFw, 1, resp, sizeof(resp), respLen, 220)) {
+      if (respLen >= 5 && resp[0] == 0x03) {
+        uint8_t icType = resp[1];
+        nfcFirmwareText = "v" + String(resp[2]) + "." + String(resp[3]);
+        const uint8_t cmdSam[4] = {0x14, 0x01, 0x14, 0x01};
+        if (pn532SendCommand(cmdSam, 4, resp, sizeof(resp), respLen, 220) && respLen >= 1 && resp[0] == 0x15) {
+          const uint8_t cmdRetries[5] = {0x32, 0x05, 0xFF, 0x01, 0x01};
+          pn532SendCommand(cmdRetries, 5, resp, sizeof(resp), respLen, 160);
+
+          nfcReady = true;
+          nfcConsecutiveErrors = 0;
+          String busMode = useSoftI2cNfc ? String("SoftI2C") : String("HW");
+          nfcDiagNote = "OK (" + nfcFirmwareText + " " + busMode + ")";
+          Serial.println("[NFC] PN532 OK (" + nfcFirmwareText + ", IC=0x" + String(icType, HEX) + ", " + busMode + ")");
+          return true;
+        } else {
+          nfcDiagNote = "FW " + nfcFirmwareText + " ok, SAMConfig mislukt";
+        }
+      } else {
+        nfcDiagNote = "0x24 onverwachte FW-bytes (len=" + String(respLen) + ")";
+      }
+    }
+    delay(25);
+  }
+
+  nfcReady = false;
+  Serial.println("[NFC] Init mislukt: " + nfcDiagNote);
+  return false;
 }
 
 // Herstelt een vastgelopen I2C-bus (bijv. na PN532 RF-piek) zonder reboot
@@ -618,7 +1371,7 @@ void recoverI2CAndNfc() {
   unsigned long now = millis();
   if (now - lastNfcRecoverMs < 2500) return;
   lastNfcRecoverMs = now;
-  nfcScanArmed = false;
+  nfcPhase = NFC_IDLE;
 
   Serial.println("[NFC] I2C & PN532 herstel uitvoeren...");
   Wire.end();
@@ -632,26 +1385,18 @@ void recoverI2CAndNfc() {
   }
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
-  Wire.setClock(100000);
-  Wire.setTimeout(25);
   Wire.begin();
-  delay(20);
+  delay(25);
 
-  nfc.begin();
-  uint32_t versiondata = nfc.getFirmwareVersion();
-  if (versiondata) {
-    nfc.SAMConfig();
-    nfc.setPassiveActivationRetries(0x01);
-    nfcReady = true;
-    nfcConsecutiveErrors = 0;
-    Serial.println("[NFC] PN532 hersteld!");
-  } else {
-    nfcReady = false;
-    Serial.println("[NFC] PN532 reageert nog niet op I2C");
+  if (isI2CDevicePresent(0x27)) {
+    lcd.init();
+    lcd.backlight();
   }
+
+  pn532InitRaw();
 }
 
-// Non-blocking NFC detectie: blokkeert loop() nooit zodat Annuleren (A/D) altijd direct werkt
+// Volledig non-blocking single-shot I2C PN532 detectie (< 1ms per loop)
 bool pollNfcCardNonBlocking(String& outUid) {
   unsigned long now = millis();
   if (!nfcReady) {
@@ -661,14 +1406,19 @@ bool pollNfcCardNonBlocking(String& outUid) {
     return false;
   }
 
-  if (!nfcScanArmed) {
+  if (nfcPhase == NFC_IDLE) {
     if (now - lastNfcScanMs < NFC_SCAN_INTERVAL_MS) {
       return false;
     }
     lastNfcScanMs = now;
-    if (nfc.startPassiveTargetIDDetection(PN532_MIFARE_ISO14443A)) {
-      nfcScanArmed = true;
-      nfcArmedAtMs = now;
+
+    // Stuur InListPassiveTarget (MaxTg=1, 106kbps Type A)
+    const uint8_t cmdInList[11] = {
+      0x00, 0x00, 0xFF, 0x04, 0xFC, 0xD4, 0x4A, 0x01, 0x00, 0xE1, 0x00
+    };
+    if (pn532WriteFrame(cmdInList, sizeof(cmdInList))) {
+      nfcPhase = NFC_WAIT_ACK;
+      nfcPhaseAtMs = now;
       lastNfcReadyCheckMs = now;
       nfcConsecutiveErrors = 0;
     } else {
@@ -680,32 +1430,78 @@ bool pollNfcCardNonBlocking(String& outUid) {
     return false;
   }
 
-  if (now - lastNfcReadyCheckMs >= 20) {
-    lastNfcReadyCheckMs = now;
-    byte got = Wire.requestFrom((uint8_t)0x24, (uint8_t)1);
-    if (got == 1 && Wire.available() >= 1) {
-      uint8_t st = Wire.read();
-      if (st == 0x01) {
-        nfcScanArmed = false;
-        lastNfcScanMs = now;
-        uint8_t uid[7];
-        uint8_t uidLength = 0;
-        if (nfc.readDetectedPassiveTargetID(uid, &uidLength) && uidLength > 0) {
-          outUid = "";
-          for (uint8_t i = 0; i < uidLength; i++) {
-            if (uid[i] < 0x10) outUid += "0";
-            outUid += String(uid[i], HEX);
+  if (nfcPhase == NFC_WAIT_ACK) {
+    if (now - lastNfcReadyCheckMs >= 5) {
+      lastNfcReadyCheckMs = now;
+      uint8_t ackBuf[8] = {0};
+      byte idx = pn532ReadRawBytes(ackBuf, 7);
+
+      if (idx >= 6 && (ackBuf[0] & 0x01) == 0x01) {
+        bool validAck = false;
+        for (byte off = 1; off + 4 < idx; off++) {
+          if (ackBuf[off] == 0x00 && ackBuf[off + 1] == 0x00 && ackBuf[off + 2] == 0xFF &&
+              ackBuf[off + 3] == 0x00 && ackBuf[off + 4] == 0xFF) {
+            validAck = true;
+            break;
           }
-          outUid.toUpperCase();
-          return true;
         }
+        if (validAck) {
+          nfcPhase = NFC_WAIT_TAG;
+          nfcPhaseAtMs = now;
+          lastNfcReadyCheckMs = now;
+          return false;
+        }
+        nfcPhase = NFC_IDLE;
+        lastNfcScanMs = now;
         return false;
       }
     }
+    if (now - nfcPhaseAtMs >= 70) {
+      nfcPhase = NFC_IDLE;
+      lastNfcScanMs = now;
+      nfcConsecutiveErrors++;
+      if (nfcConsecutiveErrors >= 3) {
+        recoverI2CAndNfc();
+      }
+    }
+    return false;
   }
 
-  if (now - nfcArmedAtMs >= 750) {
-    nfcScanArmed = false;
+  // NFC_WAIT_TAG: single-shot 28 bytes (RDY byte + max 10-byte UID response frame)
+  if (now - lastNfcReadyCheckMs >= 16) {
+    lastNfcReadyCheckMs = now;
+    uint8_t buf[28] = {0};
+    byte idx = pn532ReadRawBytes(buf, 28);
+
+    if (idx >= 10 && (buf[0] & 0x01) == 0x01) {
+      nfcPhase = NFC_IDLE;
+      lastNfcScanMs = now;
+
+      for (byte off = 1; off + 8 < idx; off++) {
+        if (buf[off] == 0x00 && buf[off + 1] == 0x00 && buf[off + 2] == 0xFF &&
+            buf[off + 5] == 0xD5 && buf[off + 6] == 0x4B) {
+          if (buf[off + 7] >= 1 && (off + 13) < idx) {
+            uint8_t uidLen = buf[off + 12];
+            if (uidLen > 0 && uidLen <= 10 && (off + 13 + uidLen) <= idx) {
+              outUid = "";
+              for (uint8_t i = 0; i < uidLen; i++) {
+                if (buf[off + 13 + i] < 0x10) outUid += "0";
+                outUid += String(buf[off + 13 + i], HEX);
+              }
+              outUid.toUpperCase();
+              lastUidSeen = outUid;
+              return true;
+            }
+          }
+          return false;
+        }
+      }
+      return false;
+    }
+  }
+
+  if (now - nfcPhaseAtMs >= 450) {
+    nfcPhase = NFC_IDLE;
     lastNfcScanMs = now;
   }
   return false;
@@ -802,10 +1598,16 @@ bool patchFirestore(const String& maskQuery, const JsonDocument& doc) {
     int code = 0;
     String resp;
     if (firestoreRequest("PATCH", url, body, code, resp)) {
+      lastCloudHttpCode = code;
       if (code >= 200 && code < 300) {
+        lastCloudNote = "OK (PATCH)";
         return true;
       }
+      lastCloudNote = "PATCH fout " + String(code);
       Serial.println("[CLOUD] PATCH HTTP fout: " + String(code));
+    } else {
+      lastCloudHttpCode = code;
+      lastCloudNote = "Geen verbinding (" + String(code) + ")";
     }
     delay(50);
     yield();
@@ -867,7 +1669,7 @@ bool patchPaymentSubmitted(const String& uid, const String& pin) {
 
 void annuleerDirect() {
   Serial.println("[STATE] Geannuleerd op keypad");
-  nfcScanArmed = false;
+  nfcPhase = NFC_IDLE;
   beep(800, 120);
   lcdShow("Geannuleerd!", "Terug naar start");
   patchStatusIdle("Geannuleerd door gebruiker");
@@ -894,9 +1696,10 @@ void simuleerBonPrinten() {
 
 void startBalanceCheckState() {
   currentState = STATE_CHECK_CARD;
-  nfcScanArmed = false;
+  nfcPhase = NFC_IDLE;
   lastNfcScanMs = millis();
   stateTimer = millis();
+  lastScanUiTickMs = millis();
   resetKeypadState();
   beep(2200, 75);
   Serial.println("[STATE] Saldo checken");
@@ -914,9 +1717,10 @@ void startLinkingState(const String& user) {
     lowUser == "werkpay"
   );
   currentState = STATE_LINKING;
-  nfcScanArmed = false;
+  nfcPhase = NFC_IDLE;
   lastNfcScanMs = millis();
   stateTimer = millis();
+  lastScanUiTickMs = millis();
   resetKeypadState();
   beep(2400, 90);
   Serial.println(isLoginSession ? "[STATE] Snelle pas-login gestart" : ("[STATE] Pas koppelen: " + activeUsername));
@@ -928,9 +1732,10 @@ void startPayState(double amt, const String& ordNo, const String& payUser) {
   pendingOrderNo = ordNo;
   isLoginSession = (amt <= 0.001);
   currentState = STATE_WAITING_CARD;
-  nfcScanArmed = false;
+  nfcPhase = NFC_IDLE;
   lastNfcScanMs = millis();
   stateTimer = millis();
+  lastScanUiTickMs = millis();
   resetKeypadState();
   beep(2400, 90);
 
@@ -954,10 +1759,14 @@ void pollFirestore() {
   int code = 0;
   String payload;
   if (!firestoreRequestEx("GET", getFirestoreDocUrl(), "", code, payload, 1, 1600)) {
+    lastCloudHttpCode = code;
+    lastCloudNote = "Time-out / Netwerkfout (" + String(code) + ")";
     return;
   }
 
+  lastCloudHttpCode = code;
   if (code == 404) {
+    lastCloudNote = "Doc aanmaken (404)";
     if (lastHttpErr != 404) {
       Serial.println("[CLOUD] Terminal doc aanmaken...");
       lastHttpErr = 404;
@@ -966,6 +1775,7 @@ void pollFirestore() {
     return;
   }
   if (code != 200) {
+    lastCloudNote = "HTTP fout " + String(code);
     if (lastHttpErr != code) {
       Serial.println("[CLOUD] HTTP fout: " + String(code));
       lastHttpErr = code;
@@ -973,6 +1783,7 @@ void pollFirestore() {
     return;
   }
   lastHttpErr = 0;
+  lastCloudNote = "Online";
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return;
@@ -1108,9 +1919,11 @@ void setup() {
   while (!Serial && millis() - serWait < 1200) {
     delay(20);
   }
-  Serial.println("[BOOT] WerkPay Terminal start...");
+  Serial.println("[BOOT] WerkPay Terminal " + String(FIRMWARE_VERSION) + " start...");
 
-  EEPROM.begin(256);
+  EEPROM.begin(512);
+  littleFsReady = LittleFS.begin();
+  Serial.println(littleFsReady ? "[SECRETS] LittleFS actief (/secrets.json ondersteund)" : "[SECRETS] LittleFS niet actief (Flash Size staat op 'no FS', EEPROM wordt gebruikt)");
   pinMode(BUZZER_PIN, OUTPUT);
 
   for (int i = 0; i < ROWS; i++) {
@@ -1122,23 +1935,25 @@ void setup() {
 
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
-  Wire.setClock(100000);
-  Wire.setTimeout(25);
   Wire.begin();
   delay(100);
 
   lcd.init();
   lcd.backlight();
   lcd.clear();
-  lcdShow("WerkPay Terminal", "WiFi verbinden..");
+  lcdShow("WerkPay " + String(FIRMWARE_VERSION), "NFC checken...");
+  pn532InitRaw();
+
+  lcdShow("WerkPay " + String(FIRMWARE_VERSION), "WiFi verbinden..");
 
   loadWifiConfig();
   if (connectWifiBlocking(45)) {
     lcdShow("WiFi Verbonden!", WiFi.localIP().toString());
-    delay(700);
+    startLocalWebServer();
+    delay(650);
     if (activeTerminalId.length() == 0) {
       startApSetupPortal();
-      delay(900);
+      delay(800);
     }
   } else {
     if (activeSsid.length() > 0) {
@@ -1149,49 +1964,51 @@ void setup() {
     delay(1200);
   }
 
-  nfc.begin();
-  uint32_t versiondata = nfc.getFirmwareVersion();
-  if (versiondata) {
-    nfc.SAMConfig();
-    nfc.setPassiveActivationRetries(0x01);
-    nfcReady = true;
-    Serial.println("[NFC] PN532 OK (v" + String((versiondata >> 16) & 0xFF) + "." + String((versiondata >> 8) & 0xFF) + ")");
-  } else {
-    nfcReady = false;
-    Serial.println("[NFC] PN532 niet gevonden!");
+  if (!nfcReady) {
+    lcdShow("NFC checken...", (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("192.168.4.1"));
+    if (!pn532InitRaw()) {
+      lcdShow("NFC fout (0x24)", nfcDiagNote);
+      delay(900);
+    }
   }
 
   secureClient.setInsecure();
-  if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
-    patchStatusIdle("Online");
-  }
-  Serial.println("[READY] Terminal=" + (activeTerminalId.length() > 0 ? activeTerminalId : String("(geen)")) + " IP=" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("offline")));
-  beep(2000, 100);
-  beep(3000, 150);
+  needsBootOnlinePatch = (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0);
+  Serial.println("[READY] " + String(FIRMWARE_VERSION) + " Terminal=" + (activeTerminalId.length() > 0 ? activeTerminalId : String("(geen)")) + " IP=" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("offline")));
+  beep(2000, 90);
+  beep(3000, 130);
   setIdleScreen();
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // 0. Non-blocking buzzer, USB configuratie en AP Setup portaal altijd responsief houden
+  // 0. Non-blocking buzzer, USB configuratie en lokale website / AP portaal altijd responsief houden
   updateBuzzer();
   handleSerialCommands();
-  if (apPortalActive) {
+  if (webServerStarted) {
     setupPortalServer.handleClient();
-    if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
-      apPortalActive = false;
-      WiFi.softAPdisconnect(true);
-      Serial.println("[WIFI] Online! IP=" + WiFi.localIP().toString() + " Terminal=" + activeTerminalId);
-      patchStatusIdle("Online");
-      setIdleScreen();
-    }
+  }
+  if (apPortalActive && WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
+    apPortalActive = false;
+    WiFi.softAPdisconnect(true);
+    Serial.println("[WIFI] Online! IP=" + WiFi.localIP().toString() + " Terminal=" + activeTerminalId);
+    needsBootOnlinePatch = true;
+    setIdleScreen();
+  }
+  if (needsBootOnlinePatch && WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0) {
+    needsBootOnlinePatch = false;
+    patchStatusIdle("Online");
   }
 
   // 1. Scan keypad ALTIJD eerst zodat Annuleren/toetsen direct reageren
   char key = scanKeypad();
 
   if (currentState == STATE_IDLE || currentState == STATE_SHOW_RESULT) {
+    if (key == 'B' && currentState == STATE_IDLE) {
+      startBalanceCheckState();
+      return;
+    }
     if (key == 'D' && betalingGeslaagd) {
       simuleerBonPrinten();
       return;
@@ -1203,7 +2020,7 @@ void loop() {
   } else if (currentState == STATE_CHECK_CARD) {
     if (key == 'A' || key == 'D') {
       Serial.println("[KEY] Annuleren ingedrukt: " + String(key));
-      nfcScanArmed = false;
+      nfcPhase = NFC_IDLE;
       beepAsync(800, 100);
       setIdleScreen();
       return;
@@ -1269,6 +2086,14 @@ void loop() {
         toonPincodeScherm();
       }
       return;
+    }
+
+    // Live heartbeat dot op LCD (col 8, row 1): bewijst dat loop() draait en toont ! als NFC niet reageert
+    if (now - lastScanUiTickMs >= 550) {
+      lastScanUiTickMs = now;
+      scanUiDotOn = !scanUiDotOn;
+      lcd.setCursor(8, 1);
+      lcd.print(!nfcReady ? "!" : (scanUiDotOn ? "." : " "));
     }
 
     if (now - stateTimer > 90000) {
@@ -1352,11 +2177,11 @@ void loop() {
   // 2. Slimme polling (tijdens wachten op pas/PIN minder vaak, zodat NFC & keypad voorrang krijgen)
   unsigned long pollInterval = 650;
   if (currentState == STATE_LINKING || currentState == STATE_WAITING_CARD || currentState == STATE_CHECK_CARD) {
-    pollInterval = 2400;
+    pollInterval = 3200;
   } else if (currentState == STATE_WAITING_PIN || currentState == STATE_WAITING_RESULT) {
     pollInterval = 1800;
   }
-  unsigned long keyQuietMs = (currentState == STATE_WAITING_PIN) ? 2000 : 450;
+  unsigned long keyQuietMs = (currentState == STATE_WAITING_PIN) ? 2000 : 350;
   bool magPollen = (now - lastKeyActivityMs > keyQuietMs);
   if (WiFi.status() == WL_CONNECTED && activeTerminalId.length() > 0 && magPollen && (now - lastPollMs >= pollInterval)) {
     lastPollMs = now;

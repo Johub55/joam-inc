@@ -3,15 +3,19 @@ import { useApp } from '../../context/AppContext';
 import { euro, normalizeCardUid, accountMatchesUid, formatCardUid } from '../../services/store';
 import { showToast } from '../../services/appToast';
 import {
+  claimHardwareTerminalLinkMode,
   claimHardwareTerminalPayMode,
+  extractTerminalLockOwner,
   getActiveHardwareTerminalId,
   getTerminalTabSessionId,
   HARDWARE_TERMINAL_EVENT,
   isHardwareTerminalBusy,
   releaseHardwareTerminalIfOwned,
+  setHardwareTerminalLinked,
   setHardwareTerminalResult,
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
+  toPicoShortReason,
   triggerHardwareTerminalCheckCard,
   HardwareTerminalState
 } from '../../services/firebase';
@@ -101,6 +105,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     setActiveReceiptOrder,
     processSumUpPayment,
     refundSumUpTransaction,
+    refundToWerkPayAccount,
     updateOrderStatus,
     toggleOrderPrio,
     cancelOrder,
@@ -172,9 +177,30 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   } | null>(null);
 
   // History & Refunds
-  const [historyFilter, setHistoryFilter] = useState<'all' | 'sumup' | 'workpay' | 'cash'>('sumup');
+  const [historyFilter, setHistoryFilter] = useState<'all' | 'sumup' | 'workpay' | 'cash'>('all');
+  const [historySearch, setHistorySearch] = useState<string>('');
   const [confirmRefundNo, setConfirmRefundNo] = useState<number | null>(null);
   const [refundBusyNo, setRefundBusyNo] = useState<number | null>(null);
+
+  // Direct WerkPin Refund (Geld Terugboeken) Sheet State
+  const [showRefundSheet, setShowRefundSheet] = useState<boolean>(false);
+  const [refundMethod, setRefundMethod] = useState<'pico' | 'account' | 'uid'>('pico');
+  const [refundPicoWaiting, setRefundPicoWaiting] = useState<boolean>(false);
+  const refundPicoWaitingRef = useRef<boolean>(false);
+  refundPicoWaitingRef.current = refundPicoWaiting;
+  const refundClaimTokenRef = useRef<string>('');
+  const handledRefundSigRef = useRef<string>('');
+  const [refundProcessing, setRefundProcessing] = useState<boolean>(false);
+  const [refundError, setRefundError] = useState<string>('');
+  const [refundAccountSearch, setRefundAccountSearch] = useState<string>('');
+  const [refundUidInput, setRefundUidInput] = useState<string>('');
+  const [completedRefund, setCompletedRefund] = useState<{
+    amount: number;
+    accountHolder: string;
+    username: string;
+    newBalance?: number;
+    at: string;
+  } | null>(null);
 
   // Mobile Orders Tab State
   const [mobileOrderSearch, setMobileOrderSearch] = useState<string>('');
@@ -226,7 +252,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
 
   useEffect(() => {
     const syncTerm = () => {
-      if (!picoWaitingRef.current) {
+      if (!picoWaitingRef.current && !refundPicoWaitingRef.current) {
         setSelectedTerminalId(getActiveHardwareTerminalId());
       }
     };
@@ -234,9 +260,9 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     return () => window.removeEventListener(HARDWARE_TERMINAL_EVENT, syncTerm);
   }, []);
 
-  // Keep global Firebase subscription active in Tools, Pay Sheet, or while waiting on Pico
+  // Keep global Firebase subscription active in Tools, Pay Sheet, Refund Sheet, or while waiting on Pico
   useEffect(() => {
-    if (activeTab !== 'tools' && !picoWaiting && !showPaySheet) return;
+    if (activeTab !== 'tools' && !picoWaiting && !showPaySheet && !showRefundSheet && !refundPicoWaiting) return;
     const unsub = subscribeHardwareTerminal(
       (st) => {
         setPicoLiveState(st);
@@ -255,7 +281,7 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
       selectedTerminalId
     );
     return () => unsub();
-  }, [activeTab, picoWaiting, showPaySheet, selectedTerminalId]);
+  }, [activeTab, picoWaiting, showPaySheet, showRefundSheet, refundPicoWaiting, selectedTerminalId]);
 
   // Execute payment helper
   const executeCharge = async (
@@ -320,15 +346,23 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         setCashApprovalPin('');
         showToast(res.message, 'success');
       } else {
+        const shortReason = toPicoShortReason(res.message);
         if (fromPicoCloud) {
-          await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16), currentTerm).catch(() => {});
+          await setHardwareTerminalResult('DECLINED', shortReason, currentTerm).catch(() => {});
         }
         if (terminalManager.getIsConnected()) {
-          await terminalManager.notifyDeclined(res.message.slice(0, 16)).catch(() => {});
+          await terminalManager.notifyDeclined(shortReason).catch(() => {});
         }
         setPayError(res.message);
       }
     } catch (e: any) {
+      const currentTerm = selectedTerminalIdRef.current;
+      if (fromPicoCloud) {
+        await setHardwareTerminalResult('DECLINED', 'Systeemfout', currentTerm).catch(() => {});
+      }
+      if (terminalManager.getIsConnected()) {
+        await terminalManager.notifyDeclined('Systeemfout').catch(() => {});
+      }
       setPayError(e?.message || 'Betaling mislukt.');
     } finally {
       setIsProcessing(false);
@@ -337,6 +371,68 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
 
   const executeChargeRef = useRef(executeCharge);
   executeChargeRef.current = executeCharge;
+
+  // Execute direct refund helper (Geld Terugboeken)
+  const executeDirectRefund = async (
+    target: { accountUsername?: string; cardUid?: string },
+    fromPicoCloud = false
+  ) => {
+    setRefundProcessing(true);
+    setRefundError('');
+    try {
+      const refundAmt = baseAmount > 0 ? baseAmount : finalTotal;
+      const res = await refundToWerkPayAccount({
+        amount: refundAmt,
+        accountUsername: target.accountUsername,
+        cardUid: target.cardUid,
+        description: description.trim() || 'WerkPin Terugboeking'
+      });
+
+      const currentTerm = selectedTerminalIdRef.current;
+      if (res.success && res.account) {
+        if (fromPicoCloud) {
+          await setHardwareTerminalLinked('Teruggeboekt', target.cardUid || '', currentTerm).catch(() => {});
+        }
+        setRefundPicoWaiting(false);
+        setShowRefundSheet(false);
+        setCompletedRefund({
+          amount: refundAmt,
+          accountHolder: res.account.account_holder,
+          username: res.account.username,
+          newBalance: res.newBalance,
+          at: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })
+        });
+        setCompletedOrder(null);
+        setCurrentInput('0');
+        setAccumulatedTotal(0);
+        setEntryCount(0);
+        setQuickCart([]);
+        setSendToKitchen(false);
+        setDescription('');
+        setTipPercent(0);
+        setRefundUidInput('');
+        setRefundAccountSearch('');
+        showToast(res.message, 'success');
+      } else {
+        const shortReason = toPicoShortReason(res.message);
+        if (fromPicoCloud) {
+          await setHardwareTerminalResult('DECLINED', shortReason, currentTerm).catch(() => {});
+        }
+        setRefundError(res.message);
+      }
+    } catch (e: any) {
+      const currentTerm = selectedTerminalIdRef.current;
+      if (fromPicoCloud) {
+        await setHardwareTerminalResult('DECLINED', 'Systeemfout', currentTerm).catch(() => {});
+      }
+      setRefundError(e?.message || 'Terugboeken mislukt.');
+    } finally {
+      setRefundProcessing(false);
+    }
+  };
+
+  const executeDirectRefundRef = useRef(executeDirectRefund);
+  executeDirectRefundRef.current = executeDirectRefund;
 
   // Listen to USB Web Serial callbacks when pay sheet is open
   useEffect(() => {
@@ -349,17 +445,27 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     terminalManager.setCallbacks(cb);
   }, [showPaySheet]);
 
-  // Listen to Firebase Cloud submits when waiting on Pico W
+  // Listen to Firebase Cloud submits when waiting on Pico W (Betaling)
   useEffect(() => {
     if (!picoWaiting) return;
-    let sawActive = false;
+    let sawOwnSession = false;
+    const expectedToken = activeClaimTokenRef.current;
     const unsub = subscribeHardwareTerminal(
       async (st) => {
         if (!st) return;
         setPicoLiveState(st);
-        if (st.status !== 'IDLE') sawActive = true;
+        const lockOwner = extractTerminalLockOwner(st.reason);
+        const belongsToSession = !expectedToken || !lockOwner || lockOwner === expectedToken;
 
-        if (st.status === 'SUBMITTED' && st.scannedUid && st.enteredPin) {
+        if (
+          st.status !== 'IDLE' &&
+          (lockOwner === expectedToken ||
+            (belongsToSession && (st.status === 'SUBMITTED' || st.status === 'CARD_SCANNED')))
+        ) {
+          sawOwnSession = true;
+        }
+
+        if (st.status === 'SUBMITTED' && st.scannedUid && st.enteredPin && belongsToSession) {
           const sig = `${st.scannedUid}:${st.enteredPin}:${st.updatedAt}`;
           if (handledCloudSigRef.current === sig) return;
           handledCloudSigRef.current = sig;
@@ -370,16 +476,14 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
             { mode: 'terminal', cardUid: st.scannedUid, pin: st.enteredPin },
             true
           );
-        } else if (
-          st.status === 'IDLE' &&
-          (sawActive ||
-            st.updatedAt?.startsWith('pico-') ||
-            st.reason?.toLowerCase().includes('geannuleerd') ||
-            st.reason?.toLowerCase().includes('timeout'))
-        ) {
+        } else if (st.status === 'IDLE' && sawOwnSession) {
           activeClaimTokenRef.current = '';
           setPicoWaiting(false);
-          setPayError(st.reason || 'Geannuleerd op het pinapparaat.');
+          setPayError(st.reason && st.reason !== 'Klaar' ? st.reason : 'Geannuleerd op het pinapparaat.');
+        } else if (st.status === 'DECLINED' && sawOwnSession) {
+          activeClaimTokenRef.current = '';
+          setPicoWaiting(false);
+          setPayError(st.reason || 'Betaling geweigerd op het pinapparaat.');
         }
       },
       () => {
@@ -392,12 +496,62 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     return () => unsub();
   }, [picoWaiting, selectedTerminalId]);
 
+  // Listen to Firebase Cloud card scans when waiting on Pico W (Terugboeken)
+  useEffect(() => {
+    if (!refundPicoWaiting) return;
+    let sawOwnSession = false;
+    const expectedToken = refundClaimTokenRef.current;
+    const unsub = subscribeHardwareTerminal(
+      async (st) => {
+        if (!st) return;
+        setPicoLiveState(st);
+        const lockOwner = extractTerminalLockOwner(st.reason);
+        const belongsToSession = !expectedToken || !lockOwner || lockOwner === expectedToken;
+
+        if (
+          st.status !== 'IDLE' &&
+          (lockOwner === expectedToken || (belongsToSession && st.status === 'CARD_SCANNED'))
+        ) {
+          sawOwnSession = true;
+        }
+
+        if (st.status === 'CARD_SCANNED' && st.scannedUid && belongsToSession) {
+          const sig = `refund:${st.scannedUid}:${st.updatedAt}`;
+          if (handledRefundSigRef.current === sig) return;
+          handledRefundSigRef.current = sig;
+          setRefundPicoWaiting(false);
+          refundClaimTokenRef.current = '';
+          await executeDirectRefundRef.current({ cardUid: st.scannedUid }, true);
+        } else if (st.status === 'IDLE' && sawOwnSession) {
+          refundClaimTokenRef.current = '';
+          setRefundPicoWaiting(false);
+          setRefundError(st.reason && st.reason !== 'Klaar' ? st.reason : 'Terugboeken geannuleerd op het pinapparaat.');
+        } else if (st.status === 'DECLINED' && sawOwnSession) {
+          refundClaimTokenRef.current = '';
+          setRefundPicoWaiting(false);
+          setRefundError(st.reason || 'Terugboeken geweigerd op het pinapparaat.');
+        }
+      },
+      () => {
+        refundClaimTokenRef.current = '';
+        setRefundPicoWaiting(false);
+        setRefundError('Verbinding met Firebase terminal onderbroken.');
+      },
+      selectedTerminalId
+    );
+    return () => unsub();
+  }, [refundPicoWaiting, selectedTerminalId]);
+
   // Release OWN lock cleanly if component unmounts while waiting
   useEffect(() => {
     return () => {
       if (picoWaitingRef.current && activeClaimTokenRef.current) {
         releaseHardwareTerminalIfOwned(activeClaimTokenRef.current, selectedTerminalIdRef.current).catch(() => {});
         activeClaimTokenRef.current = '';
+      }
+      if (refundPicoWaitingRef.current && refundClaimTokenRef.current) {
+        releaseHardwareTerminalIfOwned(refundClaimTokenRef.current, selectedTerminalIdRef.current).catch(() => {});
+        refundClaimTokenRef.current = '';
       }
     };
   }, []);
@@ -465,14 +619,30 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     setCashReceived(finalTotal.toFixed(2));
   };
 
-  const picoBusyCheck = !picoWaiting
-    ? isHardwareTerminalBusy(picoLiveState, activeClaimTokenRef.current || undefined)
-    : { busy: false };
+  const openRefundSheet = () => {
+    const refundAmt = baseAmount > 0 ? baseAmount : finalTotal;
+    if (refundAmt <= 0) {
+      showToast('Toets eerst het terug te boeken bedrag in (of kies een order in Historie).', 'info');
+      return;
+    }
+    setRefundError('');
+    setRefundMethod('pico');
+    setShowRefundSheet(true);
+  };
+
+  const picoBusyCheck =
+    !picoWaiting && !isProcessing && !refundPicoWaiting && !refundProcessing
+      ? isHardwareTerminalBusy(
+          picoLiveState,
+          activeClaimTokenRef.current || refundClaimTokenRef.current || undefined
+        )
+      : { busy: false };
 
   const handleStartPicoCloud = async () => {
     setPayError('');
     handledCloudSigRef.current = '';
     const claimToken = `${getTerminalTabSessionId()}_werkpin_${Date.now()}`;
+    activeClaimTokenRef.current = claimToken;
     try {
       const claimRes = await claimHardwareTerminalPayMode(
         finalTotal,
@@ -482,15 +652,16 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
         selectedTerminalIdRef.current
       );
       if (!claimRes.acquired) {
+        activeClaimTokenRef.current = '';
         setPayError(claimRes.busyMessage || 'Pinapparaat is al bezig met een andere betaling.');
         return;
       }
-      activeClaimTokenRef.current = claimToken;
       setPicoWaiting(true);
       if (terminalManager.getIsConnected()) {
         await terminalManager.startPayment(finalTotal, orderNo).catch(() => {});
       }
     } catch (e: any) {
+      activeClaimTokenRef.current = '';
       setPayError(e?.message || 'Kon Pico W terminal niet activeren.');
     }
   };
@@ -502,6 +673,38 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
     if (terminalManager.getIsConnected()) {
       await terminalManager.cancel().catch(() => {});
     }
+    if (token) {
+      await releaseHardwareTerminalIfOwned(token, selectedTerminalIdRef.current).catch(() => {});
+    }
+  };
+
+  const handleStartRefundPicoCloud = async () => {
+    setRefundError('');
+    handledRefundSigRef.current = '';
+    const claimToken = `${getTerminalTabSessionId()}_refund_${Date.now()}`;
+    refundClaimTokenRef.current = claimToken;
+    try {
+      const claimRes = await claimHardwareTerminalLinkMode(
+        'Terugboeken',
+        claimToken,
+        selectedTerminalIdRef.current
+      );
+      if (!claimRes.acquired) {
+        refundClaimTokenRef.current = '';
+        setRefundError(claimRes.busyMessage || 'Pinapparaat is al bezig met een andere sessie.');
+        return;
+      }
+      setRefundPicoWaiting(true);
+    } catch (e: any) {
+      refundClaimTokenRef.current = '';
+      setRefundError(e?.message || 'Kon Pico W terminal niet activeren.');
+    }
+  };
+
+  const handleCancelRefundPicoCloud = async () => {
+    const token = refundClaimTokenRef.current;
+    refundClaimTokenRef.current = '';
+    setRefundPicoWaiting(false);
     if (token) {
       await releaseHardwareTerminalIfOwned(token, selectedTerminalIdRef.current).catch(() => {});
     }
@@ -569,15 +772,33 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
   }, [orders]);
 
   const filteredTransactions = useMemo(() => {
+    const q = historySearch.trim().toLowerCase().replace(/^#/, '');
     return orders
       .filter(o => {
-        if (historyFilter === 'sumup') return Boolean(o.paymentMeta?.isSumUp);
-        if (historyFilter === 'workpay') return o.paymentMethod === 'workpay';
-        if (historyFilter === 'cash') return o.paymentMethod === 'cash';
-        return true;
+        if (historyFilter === 'sumup' && !o.paymentMeta?.isSumUp) return false;
+        if (historyFilter === 'workpay' && o.paymentMethod !== 'workpay') return false;
+        if (historyFilter === 'cash' && o.paymentMethod !== 'cash') return false;
+        if (!q) return true;
+        if (String(o.no).includes(q)) return true;
+        if ((o.identifier || '').toLowerCase().includes(q)) return true;
+        if ((o.paymentMeta?.account || '').toLowerCase().includes(q)) return true;
+        if ((o.paymentMeta?.sumupDescription || '').toLowerCase().includes(q)) return true;
+        if ((o.cashier || '').toLowerCase().includes(q)) return true;
+        return false;
       })
       .slice(0, 60);
-  }, [orders, historyFilter]);
+  }, [orders, historyFilter, historySearch]);
+
+  const matchingRefundAccounts = useMemo(() => {
+    const q = refundAccountSearch.trim().toLowerCase();
+    if (!q) return bankAccounts.slice(0, 12);
+    const normQ = normalizeCardUid(refundAccountSearch);
+    return bankAccounts.filter(a =>
+      a.username.toLowerCase().includes(q) ||
+      a.account_holder.toLowerCase().includes(q) ||
+      (normQ.length >= 2 && accountMatchesUid(a, normQ))
+    ).slice(0, 12);
+  }, [bankAccounts, refundAccountSearch]);
 
   const matchingAccounts = useMemo(() => {
     const q = toolSearch.trim().toLowerCase();
@@ -858,6 +1079,33 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
           {/* ============================================================== */}
           {activeTab === 'charge' && (
             <div className="space-y-3.5">
+              {/* Refund Confirmation Banner right after direct refund */}
+              {completedRefund && (
+                <div className="p-4 rounded-2xl bg-amber-950/40 border border-amber-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                      <RotateCcw className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-black text-amber-200">
+                        Terugboeking Geslaagd · {euro(completedRefund.amount)}
+                      </p>
+                      <p className="text-xs text-slate-300">
+                        Bijgeschreven bij {completedRefund.accountHolder} (@{completedRefund.username})
+                        {completedRefund.newBalance !== undefined ? ` · Nieuw saldo: ${euro(completedRefund.newBalance)}` : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setCompletedRefund(null)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs font-bold self-end sm:self-center"
+                  >
+                    Sluit
+                  </button>
+                </div>
+              )}
+
               {/* Receipt Confirmation Banner right after a payment */}
               {completedOrder && (
                 <div className="p-4 rounded-2xl bg-emerald-950/50 border border-emerald-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1234,6 +1482,35 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                   <span>Afrekenen {finalTotal > 0 ? euro(finalTotal) : ''}</span>
                 </button>
               </div>
+
+              {/* Direct Refund / Terugboeken Action Bar */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={openRefundSheet}
+                  className={`min-h-[44px] py-2.5 px-4 rounded-2xl border font-black text-xs sm:text-sm flex items-center justify-center gap-2 transition ${
+                    baseAmount > 0
+                      ? 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/40 text-amber-300 shadow-lg shadow-amber-500/10'
+                      : 'bg-slate-900 hover:bg-slate-800 border-slate-800 text-slate-300'
+                  }`}
+                >
+                  <RotateCcw className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>
+                    {baseAmount > 0 ? `Geld Terugboeken (${euro(baseAmount)})` : 'Los Bedrag Terugboeken op Pas'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHistoryFilter('all');
+                    setActiveTab('history');
+                  }}
+                  className="min-h-[44px] py-2.5 px-4 rounded-2xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition"
+                >
+                  <History className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <span>Eerdere Bon Terugbetalen</span>
+                </button>
+              </div>
             </div>
           )}
 
@@ -1266,27 +1543,59 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                 </div>
               </div>
 
-              {/* Filter Bar */}
-              <div className="flex items-center gap-1.5 overflow-x-auto">
-                {([
-                  { id: 'sumup', label: '💳 Alleen WerkPin' },
-                  { id: 'all', label: 'Alles (incl. Kassa)' },
-                  { id: 'workpay', label: 'WerkPay' },
-                  { id: 'cash', label: 'Contant' }
-                ] as const).map(f => (
+              {/* Search & Filter Bar */}
+              <div className="space-y-2">
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={historySearch}
+                      onChange={e => setHistorySearch(e.target.value)}
+                      placeholder="Zoek op #bonnummer, klant, @account of omschrijving..."
+                      className="w-full min-h-[40px] bg-slate-900 border border-slate-800 rounded-xl pl-9 pr-8 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                    />
+                    {historySearch && (
+                      <button
+                        type="button"
+                        onClick={() => setHistorySearch('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs font-bold"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
                   <button
-                    key={f.id}
                     type="button"
-                    onClick={() => setHistoryFilter(f.id)}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap border transition ${
-                      historyFilter === f.id
-                        ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-black'
-                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
-                    }`}
+                    onClick={() => setActiveTab('charge')}
+                    className="min-h-[40px] px-3.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 font-black text-xs flex items-center justify-center gap-1.5 whitespace-nowrap"
                   >
-                    {f.label}
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>+ Los Bedrag Terugboeken</span>
                   </button>
-                ))}
+                </div>
+
+                <div className="flex items-center gap-1.5 overflow-x-auto">
+                  {([
+                    { id: 'all', label: 'Alles (incl. Kassa)' },
+                    { id: 'sumup', label: '💳 Alleen WerkPin' },
+                    { id: 'workpay', label: 'WerkPay' },
+                    { id: 'cash', label: 'Contant' }
+                  ] as const).map(f => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setHistoryFilter(f.id)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap border transition ${
+                        historyFilter === f.id
+                          ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-black'
+                          : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               {/* Transaction List */}
@@ -2405,6 +2714,218 @@ export const SumUpTerminalScreen: React.FC<SumUpTerminalScreenProps> = ({
                     {isProcessing ? 'Verwerken...' : `Bevestig Contant ${euro(finalTotal)}`}
                   </button>
                 </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
+      {/* REFUND SHEET MODAL (GELD TERUGBOEKEN OP PAS OF ACCOUNT) */}
+      {/* ============================================================== */}
+      {showRefundSheet && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-slate-900 border border-amber-500/40 w-full max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+            <div className="p-4 sm:p-5 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+              <div>
+                <div className="text-[11px] font-bold uppercase tracking-wider text-amber-400">
+                  WerkPin Terugboeken · {description.trim() || 'WerkPin Terugboeking'}
+                </div>
+                <div className="text-2xl font-black text-white font-mono">
+                  {euro(baseAmount > 0 ? baseAmount : finalTotal)}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (refundPicoWaiting) handleCancelRefundPicoCloud();
+                  setShowRefundSheet(false);
+                }}
+                className="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300"
+              >
+                <XCircle className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-slate-950/60 border-b border-slate-800 grid grid-cols-3 gap-1.5">
+              {([
+                { id: 'pico', label: 'Scan op Pico W', icon: Radio },
+                { id: 'account', label: 'WerkPay Account', icon: Wallet },
+                { id: 'uid', label: 'Pas UID', icon: CreditCard }
+              ] as const).map(m => {
+                const Icon = m.icon;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => {
+                      if (refundPicoWaiting && m.id !== 'pico') handleCancelRefundPicoCloud();
+                      setRefundMethod(m.id);
+                      setRefundError('');
+                    }}
+                    className={`py-2 px-1 rounded-xl text-[11px] font-bold flex flex-col items-center gap-1 border transition ${
+                      refundMethod === m.id
+                        ? 'bg-amber-500 text-slate-950 border-amber-400 font-black'
+                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4" />
+                    <span>{m.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="p-4 sm:p-5 overflow-y-auto space-y-4">
+              {refundError && (
+                <div className="p-3 rounded-xl bg-rose-950/60 border border-rose-500/40 text-rose-300 text-xs font-bold flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{refundError}</span>
+                </div>
+              )}
+
+              {refundMethod === 'pico' && (
+                <div className="space-y-4 text-center">
+                  {!refundPicoWaiting ? (
+                    <>
+                      <TerminalSelector
+                        compact
+                        disabled={refundPicoWaiting || refundProcessing}
+                        value={selectedTerminalId}
+                        onChange={setSelectedTerminalId}
+                      />
+
+                      <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
+                        <RotateCcw className="w-10 h-10 text-amber-400 mx-auto" />
+                        <p className="text-sm font-bold text-white">
+                          {selectedTerminalId
+                            ? `Boek ${euro(baseAmount > 0 ? baseAmount : finalTotal)} terug via Pico W (${selectedTerminalId})`
+                            : 'Nog geen pinapparaat ingesteld'}
+                        </p>
+                        <p className="text-xs text-slate-400">
+                          {selectedTerminalId
+                            ? 'Houd de gekoppelde NFC-pas van de klant tegen het pinapparaat. Het bedrag wordt direct bijgeschreven zonder pincode.'
+                            : 'Voeg hierboven eerst zelf een pinapparaat toe of kies WerkPay Account / Pas UID.'}
+                        </p>
+                      </div>
+
+                      {picoBusyCheck.busy && (
+                        <div className="p-3 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-amber-200 text-xs text-left space-y-2">
+                          <div className="flex items-start gap-2 font-bold">
+                            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                            <span>{picoBusyCheck.reason}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await setHardwareTerminalIdle(selectedTerminalIdRef.current).catch(() => {});
+                              setRefundError('');
+                              showToast(`Pinapparaat (${selectedTerminalIdRef.current}) vrijgegeven (IDLE).`, 'info');
+                            }}
+                            className="w-full py-1.5 px-3 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 font-bold text-[11px] flex items-center justify-center gap-1.5"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Forceer Vrijgeven (IDLE)</span>
+                          </button>
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        disabled={!selectedTerminalId || Boolean(picoBusyCheck.busy) || refundProcessing}
+                        onClick={handleStartRefundPicoCloud}
+                        className="w-full py-3.5 rounded-2xl bg-amber-500 hover:bg-amber-400 disabled:opacity-45 text-slate-950 font-black text-sm shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2"
+                      >
+                        <Radio className="w-4 h-4" />
+                        <span>Activeer Pinapparaat voor Terugboeking</span>
+                      </button>
+                    </>
+                  ) : (
+                    <div className="p-5 rounded-2xl bg-amber-950/30 border border-amber-500/40 space-y-3">
+                      <Loader2 className="w-10 h-10 text-amber-400 mx-auto animate-spin" />
+                      <div>
+                        <p className="text-sm font-black text-amber-200">
+                          Houd de NFC-pas tegen het pinapparaat...
+                        </p>
+                        <p className="text-xs text-slate-400 mt-1">
+                          Status: <span className="font-mono text-white">{picoLiveState?.status || 'LINK'}</span>
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleCancelRefundPicoCloud}
+                        className="w-full py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs"
+                      >
+                        Annuleer Terminal Verzoek
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {refundMethod === 'account' && (
+                <div className="space-y-3">
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={refundAccountSearch}
+                      onChange={e => setRefundAccountSearch(e.target.value)}
+                      placeholder="Zoek klant, @gebruikersnaam of pas UID..."
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                  <div className="space-y-2 max-h-64 overflow-y-auto">
+                    {matchingRefundAccounts.map(acc => (
+                      <button
+                        key={acc.id}
+                        type="button"
+                        disabled={refundProcessing}
+                        onClick={() => executeDirectRefund({ accountUsername: acc.username }, false)}
+                        className="w-full text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-amber-500/40 flex items-center justify-between gap-2 transition disabled:opacity-50"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-bold text-sm text-white truncate">{acc.account_holder}</div>
+                          <div className="text-[11px] font-mono text-slate-400 truncate">
+                            @{acc.username} · Huidig: {acc.is_admin ? '€ ∞' : euro(acc.balance)}
+                          </div>
+                        </div>
+                        <span className="px-2.5 py-1.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-black shrink-0">
+                          +{euro(baseAmount > 0 ? baseAmount : finalTotal)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {refundMethod === 'uid' && (
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    await executeDirectRefund({ cardUid: refundUidInput }, false);
+                  }}
+                  className="space-y-3"
+                >
+                  <div>
+                    <label className="text-xs font-bold text-slate-400 block mb-1">NFC Pas UID of pasnummer</label>
+                    <input
+                      type="text"
+                      required
+                      value={refundUidInput}
+                      onChange={e => setRefundUidInput(e.target.value.toUpperCase())}
+                      placeholder="Bijv. 04A1B2C3"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={refundProcessing}
+                    className="w-full py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-black text-sm"
+                  >
+                    {refundProcessing ? 'Verwerken...' : `Boek ${euro(baseAmount > 0 ? baseAmount : finalTotal)} Terug op Pas`}
+                  </button>
+                </form>
               )}
             </div>
           </div>

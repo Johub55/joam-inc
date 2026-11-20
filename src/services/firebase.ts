@@ -399,7 +399,31 @@ export function setActiveHardwareTerminalId(id: string): string {
 
 const TERMINAL_BUSY_STATUSES: HardwareTerminalStatus[] = ['PAY', 'SUBMITTED', 'LINK', 'CARD_SCANNED', 'CHECK_CARD'];
 const TERMINAL_LOCK_TIMEOUT_MS = 90000;
-const TERMINAL_RESULT_HOLD_MS = 2200;
+const TERMINAL_SUBMIT_STALE_MS = 35000;
+const TERMINAL_RESULT_HOLD_MS = 1500;
+const picoNonIsoFirstSeenAt = new Map<string, number>();
+
+export function toPicoShortReason(message?: string): string {
+  const raw = String(message || '').trim();
+  const low = raw.toLowerCase();
+  if (!raw) return 'Geweigerd!';
+  if (low.includes('onbekend') || low.includes('niet gekoppeld') || low.includes('niet gevonden')) {
+    return 'Pas onbekend!';
+  }
+  if (low.includes('pincode') || low.includes('wachtwoord')) {
+    return 'Foute pincode!';
+  }
+  if (low.includes('saldo')) {
+    return 'Te weinig saldo';
+  }
+  if (low.includes('geblokkeerd')) {
+    return 'Pas geblokkeerd';
+  }
+  if (low.includes('systeemfout') || low.includes('time-out')) {
+    return 'Systeemfout';
+  }
+  return raw.slice(0, 16);
+}
 
 export function getTerminalTabSessionId(): string {
   if (typeof window === 'undefined') return `srv_${Date.now()}`;
@@ -425,7 +449,7 @@ export function isHardwareTerminalBusy(
   state: HardwareTerminalState | null | undefined,
   myClaimToken?: string
 ): { busy: boolean; reason?: string } {
-  if (!state) return { busy: false };
+  if (!state || state.status === 'IDLE') return { busy: false };
 
   const owner = extractTerminalLockOwner(state.reason);
   if (myClaimToken && owner && owner === myClaimToken) {
@@ -434,11 +458,30 @@ export function isHardwareTerminalBusy(
 
   const parsedTs = Date.parse(state.updatedAt || '');
   const hasIsoAge = Number.isFinite(parsedTs);
-  const ageMs = hasIsoAge ? Math.max(0, Date.now() - parsedTs) : 0;
+  let ageMs = hasIsoAge ? Math.max(0, Date.now() - parsedTs) : 0;
+
+  if (!hasIsoAge) {
+    const sig = `${state.status}|${state.updatedAt || ''}|${state.scannedUid || ''}|${state.reason || ''}`;
+    let firstSeen = picoNonIsoFirstSeenAt.get(sig);
+    if (firstSeen === undefined) {
+      if (picoNonIsoFirstSeenAt.size > 50) {
+        picoNonIsoFirstSeenAt.clear();
+      }
+      firstSeen = Date.now();
+      picoNonIsoFirstSeenAt.set(sig, firstSeen);
+    }
+    ageMs = Math.max(0, Date.now() - firstSeen);
+  }
 
   if (TERMINAL_BUSY_STATUSES.includes(state.status)) {
-    // Als een sessie >90s stilstaat (bijv. tabblad gesloten zonder annuleren), mag hij overgenomen worden
-    if (hasIsoAge && ageMs > TERMINAL_LOCK_TIMEOUT_MS) {
+    const isPicoWaitResult =
+      state.status === 'SUBMITTED' ||
+      state.status === 'CARD_SCANNED' ||
+      state.status === 'CHECK_CARD';
+    const maxTimeout = isPicoWaitResult ? TERMINAL_SUBMIT_STALE_MS : TERMINAL_LOCK_TIMEOUT_MS;
+
+    // Als een sessie te lang stilstaat (bijv. tabblad gesloten of Pico timeout gemist), mag hij overgenomen worden
+    if (ageMs > maxTimeout) {
       return { busy: false };
     }
     const orderInfo = state.orderNo ? ` (Bon #${state.orderNo})` : '';
@@ -456,7 +499,6 @@ export function isHardwareTerminalBusy(
 
   if (
     (state.status === 'APPROVED' || state.status === 'DECLINED' || state.status === 'CHECK_RESULT') &&
-    hasIsoAge &&
     ageMs < TERMINAL_RESULT_HOLD_MS
   ) {
     return {
@@ -550,9 +592,9 @@ export async function claimHardwareTerminalPayMode(
     }, path);
 
   let attempt = await tryClaimOnce();
-  // Als de vorige transactie nog 1-2 seconden "Betaald!" op het LCD toont, wacht kort en probeer 1x opnieuw
+  // Als de vorige transactie nog heel even "Betaald!" op het LCD toont, wacht kort en probeer 1x opnieuw
   if (!attempt.acquired && attempt.isResultHold) {
-    await new Promise((r) => setTimeout(r, 1400));
+    await new Promise((r) => setTimeout(r, 1600));
     attempt = await tryClaimOnce();
   }
 
@@ -603,7 +645,7 @@ export async function claimHardwareTerminalLinkMode(
 
   let attempt = await tryClaimOnce();
   if (!attempt.acquired && attempt.isResultHold) {
-    await new Promise((r) => setTimeout(r, 1400));
+    await new Promise((r) => setTimeout(r, 1600));
     attempt = await tryClaimOnce();
   }
 

@@ -10,6 +10,8 @@ import { showToast } from '../../services/appToast';
 import { useApp } from '../../context/AppContext';
 import { findLoyaltyCustomerByPhoneOrName } from '../../services/loyalty';
 import { accountMatchesUid } from '../../services/store';
+import { FIREBASE_REST_BASE } from '../../services/firebase';
+import firebaseConfig from '../../../firebase-applet-config.json';
 import { 
   Cpu, 
   Usb, 
@@ -43,6 +45,8 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
   const [logs, setLogs] = useState<string[]>([]);
   const [copied, setCopied] = useState<boolean>(false);
   const [downloaded, setDownloaded] = useState<boolean>(false);
+  const [secretsCopied, setSecretsCopied] = useState<boolean>(false);
+  const [secretsDownloaded, setSecretsDownloaded] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<'code' | 'wiring' | 'guide' | 'connect' | 'simulator'>('code');
 
   // Simulator State
@@ -123,6 +127,52 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
     document.body.removeChild(link);
     setDownloaded(true);
     setTimeout(() => setDownloaded(false), 2000);
+  };
+
+  const secretsHeaderCode = `// secrets.h - Plaats als apart tabblad naast WerkPay_PicoW_I2C_NFC_Terminal.ino in Arduino IDE v2!
+// Deze gegevens blijven behouden bij het flashen van nieuwe firmware (.ino updates).
+
+#pragma once
+
+#define SECRET_WIFI_SSID           "JOUW_WIFI_NAAM"
+#define SECRET_WIFI_PASS           "JOUW_WIFI_WACHTWOORD"
+#define SECRET_TERMINAL_ID         "pin01"
+#define SECRET_FIRESTORE_DOC_BASE  "${FIREBASE_REST_BASE}/hardware_terminals/"
+#define SECRET_FIRESTORE_API_KEY   "${firebaseConfig.apiKey}"
+`;
+
+  const handleCopySecretsH = () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(secretsHeaderCode);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = secretsHeaderCode;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+    } catch (e) {
+      console.warn('Clipboard copy failed:', e);
+    }
+    setSecretsCopied(true);
+    setTimeout(() => setSecretsCopied(false), 2000);
+  };
+
+  const handleDownloadSecretsH = () => {
+    const blob = new Blob([secretsHeaderCode], { type: 'text/plain;charset=utf-8' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'secrets.h';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setSecretsDownloaded(true);
+    setTimeout(() => setSecretsDownloaded(false), 2000);
   };
 
   // Simulator actions
@@ -780,8 +830,8 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                   {selectedBoard === 'pico_w' && nfcMode === 'i2c' ? (
                     <ul className="list-disc list-inside space-y-1 text-slate-300 pl-1 font-mono text-[11px]">
                       <li><strong className="text-white font-sans">LiquidCrystal I2C</strong> (door Frank de Brabander of Marco Schwartz)</li>
-                      <li><strong className="text-white font-sans">Adafruit PN532</strong> (door Adafruit)</li>
                       <li><strong className="text-white font-sans">ArduinoJson</strong> (door Benoit Blanchon)</li>
+                      <li className="text-emerald-400 font-sans">💡 <em>Adafruit PN532 is vanaf v3.3 ingebouwd (pure I2C driver), dus niet meer nodig!</em></li>
                     </ul>
                   ) : (
                     <ul className="list-disc list-inside space-y-1 text-slate-300 pl-1 font-mono text-[11px]">
@@ -800,6 +850,9 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
                   </div>
                   <p className="text-slate-300">
                     Ga naar <strong>Hulpmiddelen (Tools) &gt; Board &gt; Raspberry Pi RP2040 Boards &gt; Raspberry Pi Pico W</strong>.
+                  </p>
+                  <p className="text-slate-300">
+                    Zet optioneel <strong>Tools &gt; Flash Size</strong> op bijv. <code className="text-cyan-300 bg-slate-900 px-1.5 py-0.5 rounded">2MB (Sketch: 1984KB, FS: 64KB)</code> zodat ook <code className="text-white bg-slate-900 px-1 py-0.5 rounded">/secrets.json</code> op de RPi werkt. <em>(Een apart &ldquo;Erase Flash&rdquo;-menu bestaat niet bij Pico W — Arduino IDE v2 laat je opgeslagen secrets/EEPROM vanzelf staan bij een nieuwe upload!)</em>
                   </p>
                   <p className="text-slate-400">
                     💡 <em>Eerste keer uploaden?</em> Houd de witte <strong>BOOTSEL knop</strong> op de Raspberry Pi Pico W ingedrukt terwijl je de Micro-USB kabel in de computer steekt. Laat de knop na 2 seconden los. Arduino IDE v2 vindt de Pico W dan automatisch als UF2 drive en uploadt de code!
@@ -827,23 +880,51 @@ export const DiyTerminalModal: React.FC<DiyTerminalModalProps> = ({ onClose, onS
           {activeTab === 'code' && (
             <div className="space-y-3">
               {selectedBoard === 'pico_w' && nfcMode === 'i2c' && (
-                <div className="p-3.5 rounded-2xl bg-cyan-950/30 border border-cyan-500/35 text-xs text-slate-200 space-y-1">
-                  <div className="font-black text-cyan-300 flex items-center gap-1.5">
-                    <Info className="w-4 h-4 shrink-0" />
-                    <span>WiFi &amp; Terminal-ID zelf instellen (zonder wachtwoord in de website)</span>
+                <div className="p-3.5 rounded-2xl bg-cyan-950/30 border border-cyan-500/35 text-xs text-slate-200 space-y-2.5">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="font-black text-cyan-300 flex items-center gap-1.5">
+                      <Key className="w-4 h-4 shrink-0" />
+                      <span>Blijvend Secrets Bestand (blijft behouden bij flashen in Arduino IDE v2)</span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={handleDownloadSecretsH}
+                        className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+                      >
+                        {secretsDownloaded ? <Check className="w-3 h-3 text-emerald-400" /> : <Download className="w-3 h-3" />}
+                        <span>{secretsDownloaded ? 'secrets.h gedownload!' : 'Download secrets.h'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCopySecretsH}
+                        className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40 transition"
+                      >
+                        {secretsCopied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                        <span>{secretsCopied ? 'Gekopieerd!' : 'Kopieer secrets.h'}</span>
+                      </button>
+                    </div>
                   </div>
                   <p className="text-[11px] text-slate-300 leading-relaxed">
-                    Kopieer of download de code voor <strong>Arduino IDE v2</strong>. Vul bovenaan in de code zelf <code className="text-cyan-300 font-mono">ssid</code>, <code className="text-cyan-300 font-mono">password</code> en <code className="text-cyan-300 font-mono">terminalId</code> in — óf upload zonder WiFi en verbind daarna via de tijdelijke Pico-hotspot <code className="text-white font-bold">WerkPay-Setup</code> op <code className="text-white font-mono">192.168.4.1</code>.
+                    <strong>Manier 1 (Via de Pico-website — allermakkelijkst):</strong> Upload de <code className="text-cyan-300 font-mono">.ino</code> code en ga in je browser naar <code className="text-white font-mono">http://&lt;PICO-IP&gt;/</code> (of <code className="text-white font-mono">192.168.4.1</code>). Vul het formulier 1x in en klik op <em>Opslaan</em>: de Pico maakt dan zelf <code className="text-emerald-300 font-mono">/secrets.json</code> + EEPROM aan! <em>(Zet hiervoor <strong>Tools &gt; Flash Size</strong> op bijv. <code className="text-cyan-300 font-mono">2MB (Sketch: 1984KB, FS: 64KB)</code>; bij Pico W wist een normale upload je secrets nooit.)</em>
+                  </p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    <strong>Manier 2 (Als tabblad in Arduino IDE v2):</strong> Druk in Arduino IDE v2 op <code className="text-white font-mono">Ctrl+Shift+N</code> (of rechtsboven <code className="text-white font-mono">... &gt; New Tab</code>), noem het tabblad exact <code className="text-cyan-300 font-mono">secrets.h</code>, plak de gekopieerde code erin en vul je gegevens in. Daarna gewoon op <strong>Upload</strong> klikken!
                   </p>
                 </div>
               )}
 
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                <span className="text-xs font-bold text-slate-300 flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-300 flex items-center gap-2 flex-wrap">
                   <span>Code voor {selectedBoard === 'pico_w' ? 'Raspberry Pi Pico W' : 'Arduino Uno/Nano'}:</span>
                   <span className="font-mono text-cyan-400 bg-slate-950 px-2 py-0.5 rounded text-[11px] border border-slate-800">
                     {currentFilename}
                   </span>
+                  {selectedBoard === 'pico_w' && nfcMode === 'i2c' && (
+                    <span className="font-mono text-emerald-300 bg-emerald-950/60 px-2 py-0.5 rounded text-[11px] border border-emerald-500/40 font-black">
+                      v3.5 (Soft-I2C Fallback NFC + Secrets)
+                    </span>
+                  )}
                 </span>
                 <div className="flex items-center gap-2">
                   <button

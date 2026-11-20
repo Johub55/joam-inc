@@ -244,6 +244,18 @@ interface AppContextType {
     notes?: string;
   }) => Promise<{ success: boolean; message: string; order?: Order }>;
   refundSumUpTransaction: (orderNo: number) => Promise<{ success: boolean; message: string }>;
+  refundToWerkPayAccount: (params: {
+    amount: number;
+    accountUsername?: string;
+    cardUid?: string;
+    description?: string;
+  }) => Promise<{
+    success: boolean;
+    message: string;
+    account?: BankAccount;
+    transaction?: BankTransaction;
+    newBalance?: number;
+  }>;
 
   // Cash Payment Requests (Cross-terminal / Staff authorization)
   cashRequests: CashPaymentRequest[];
@@ -2216,36 +2228,44 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
             handledCheckCardSigRef.current[tid] = sig;
 
             const normUid = normalizeCardUid(st.scannedUid);
-            let matched = bankAccountsRef.current.find((a) => accountMatchesUid(a, normUid));
-            if (!matched) {
-              try {
-                const dbAccs = await getAllBankAccountsFromFirestore();
-                matched = dbAccs.find((a) => accountMatchesUid(a, normUid));
-              } catch {}
-            }
+            try {
+              let matched = bankAccountsRef.current.find((a) => accountMatchesUid(a, normUid));
+              if (!matched) {
+                try {
+                  const dbAccs = await getAllBankAccountsFromFirestore();
+                  matched = dbAccs.find((a) => accountMatchesUid(a, normUid));
+                } catch {}
+              }
 
-            if (!matched) {
+              if (!matched) {
+                await setHardwareTerminalCheckResult(
+                  { found: false, scannedUid: normUid, reason: 'Pas onbekend!' },
+                  tid
+                ).catch(() => {});
+                return;
+              }
+
+              const loyalty =
+                findLoyaltyCustomerByPhoneOrName(matched.account_holder) ||
+                findLoyaltyCustomerByPhoneOrName(matched.username);
+              await setHardwareTerminalCheckResult(
+                {
+                  found: true,
+                  accountHolder: matched.account_holder,
+                  balance: matched.is_admin ? 99999 : Number(matched.balance || 0),
+                  coins: loyalty?.coins ?? 0,
+                  tier: loyalty?.tier ?? (matched.is_admin ? 'VIP' : 'Brons'),
+                  scannedUid: normUid
+                },
+                tid
+              ).catch(() => {});
+            } catch (checkErr) {
+              console.warn('CHECK_CARD fout:', checkErr);
               await setHardwareTerminalCheckResult(
                 { found: false, scannedUid: normUid, reason: 'Pas onbekend!' },
                 tid
               ).catch(() => {});
-              return;
             }
-
-            const loyalty =
-              findLoyaltyCustomerByPhoneOrName(matched.account_holder) ||
-              findLoyaltyCustomerByPhoneOrName(matched.username);
-            await setHardwareTerminalCheckResult(
-              {
-                found: true,
-                accountHolder: matched.account_holder,
-                balance: matched.is_admin ? 99999 : Number(matched.balance || 0),
-                coins: loyalty?.coins ?? 0,
-                tier: loyalty?.tier ?? (matched.is_admin ? 'VIP' : 'Brons'),
-                scannedUid: normUid
-              },
-              tid
-            ).catch(() => {});
           },
           () => {},
           tid
@@ -3052,21 +3072,33 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
           return { success: false, message: 'Voer de 4-cijferige pincode van de bankpas in.' };
         }
 
-        const matchesCardPin = (a: BankAccount) => {
-          const matchUid = accountMatchesUid(a, cleanUid);
-          const matchPin = String(a.pin_code ?? '').trim() === pin || String(a.password ?? '').trim() === pin;
-          return matchUid && matchPin;
-        };
-
-        chargedAccount = bankAccountsRef.current.find(matchesCardPin) || null;
-
-        // Try live Firestore if not found locally (supports spaces, casing & linked_uids)
-        if (!chargedAccount) {
+        let cardAcc = bankAccountsRef.current.find((a) => accountMatchesUid(a, cleanUid)) || null;
+        if (!cardAcc) {
           try {
             const allDbAccs = await getAllBankAccountsFromFirestore();
-            chargedAccount = allDbAccs.find(matchesCardPin) || null;
+            cardAcc = allDbAccs.find((a) => accountMatchesUid(a, cleanUid)) || null;
           } catch {}
         }
+
+        if (!cardAcc) {
+          return {
+            success: false,
+            message: `Pas onbekend! NFC-pas (${cleanUid}) is nog niet gekoppeld aan een WerkPay account.`
+          };
+        }
+
+        if (cardAcc.is_banned || cardAcc.is_suspended) {
+          return { success: false, message: 'Deze WerkPay pas is geblokkeerd.' };
+        }
+
+        const pinMatches =
+          String(cardAcc.pin_code ?? '').trim() === pin ||
+          String(cardAcc.password ?? '').trim() === pin;
+        if (!pinMatches) {
+          return { success: false, message: 'Onjuiste pincode voor deze NFC-pas!' };
+        }
+
+        chargedAccount = cardAcc;
       }
 
       if (!chargedAccount) {
@@ -3443,18 +3475,33 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         if (!cleanUid) return { success: false, message: 'Geen pasnummer of NFC kaart gescand!' };
         if (!pin) return { success: false, message: 'Voer de 4-cijferige pincode in.' };
 
-        const matchesCard = (a: BankAccount) =>
-          accountMatchesUid(a, cleanUid) &&
-          (String(a.pin_code ?? '').trim() === pin || String(a.password ?? '').trim() === pin);
-
-        chargedAccount = bankAccountsRef.current.find(matchesCard) || null;
-
-        if (!chargedAccount) {
+        let cardAcc = bankAccountsRef.current.find((a) => accountMatchesUid(a, cleanUid)) || null;
+        if (!cardAcc) {
           try {
             const allDbAccs = await getAllBankAccountsFromFirestore();
-            chargedAccount = allDbAccs.find(matchesCard) || null;
+            cardAcc = allDbAccs.find((a) => accountMatchesUid(a, cleanUid)) || null;
           } catch {}
         }
+
+        if (!cardAcc) {
+          return {
+            success: false,
+            message: `Pas onbekend! NFC-pas (${cleanUid}) is nog niet gekoppeld aan een WerkPay account.`
+          };
+        }
+
+        if (cardAcc.is_banned || cardAcc.is_suspended) {
+          return { success: false, message: 'Deze WerkPay pas is geblokkeerd.' };
+        }
+
+        const pinMatches =
+          String(cardAcc.pin_code ?? '').trim() === pin ||
+          String(cardAcc.password ?? '').trim() === pin;
+        if (!pinMatches) {
+          return { success: false, message: 'Onjuiste pincode voor deze NFC-pas!' };
+        }
+
+        chargedAccount = cardAcc;
       }
 
       if (!chargedAccount) {
@@ -3683,7 +3730,126 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
     logAuditAction('WERKPIN_REFUND', `Transactie #${targetOrderNo} (€ ${targetOrder.total.toFixed(2)}) terugbetaald door ${refundedBy}.`);
     return {
       success: true,
-      message: `€ ${targetOrder.total.toFixed(2)} succesvol terugbetaald!`
+      message: targetOrder.paymentMethod === 'workpay' && targetOrder.paymentMeta?.account
+        ? `€ ${targetOrder.total.toFixed(2)} teruggeboekt naar @${targetOrder.paymentMeta.account}!`
+        : `€ ${targetOrder.total.toFixed(2)} (contant/bon #${targetOrderNo}) terugbetaald!`
+    };
+  };
+
+  const refundToWerkPayAccount = async (params: {
+    amount: number;
+    accountUsername?: string;
+    cardUid?: string;
+    description?: string;
+  }): Promise<{
+    success: boolean;
+    message: string;
+    account?: BankAccount;
+    transaction?: BankTransaction;
+    newBalance?: number;
+  }> => {
+    const safeAmount = Math.round((Number(params.amount) || 0) * 100) / 100;
+    if (!Number.isFinite(safeAmount) || safeAmount <= 0 || safeAmount > 100000) {
+      return { success: false, message: 'Voer een geldig terugboek-bedrag hoger dan € 0,00 in.' };
+    }
+
+    const cleanUser = (params.accountUsername || '').trim().replace(/^@+/, '').toLowerCase();
+    const cleanUid = normalizeCardUid(params.cardUid || '');
+    if (!cleanUser && !cleanUid) {
+      return { success: false, message: 'Scan eerst een NFC-pas of kies een WerkPay account.' };
+    }
+
+    const findMatch = (list: BankAccount[]) => {
+      if (cleanUser) {
+        return list.find((a) => String(a.username || '').trim().toLowerCase() === cleanUser) || null;
+      }
+      return list.find((a) => accountMatchesUid(a, cleanUid)) || null;
+    };
+
+    let targetAcc = findMatch(bankAccountsRef.current);
+    if (!targetAcc) {
+      try {
+        const allDbAccs = await getAllBankAccountsFromFirestore();
+        targetAcc = findMatch(allDbAccs);
+      } catch {}
+    }
+
+    if (!targetAcc) {
+      return {
+        success: false,
+        message: cleanUid
+          ? `Pas onbekend! NFC-pas (${cleanUid}) is nog niet gekoppeld aan een WerkPay account.`
+          : `WerkPay account @${cleanUser} niet gevonden.`
+      };
+    }
+
+    if (targetAcc.is_banned || targetAcc.is_suspended) {
+      return { success: false, message: `Account @${targetAcc.username} is geblokkeerd.` };
+    }
+
+    let newBal = targetAcc.is_admin
+      ? targetAcc.balance
+      : Math.round((targetAcc.balance + safeAmount) * 100) / 100;
+
+    if (!targetAcc.is_admin) {
+      try {
+        const txRes = await adjustBankBalanceTransaction(targetAcc.username, safeAmount, targetAcc);
+        if (!txRes.success) {
+          return { success: false, message: txRes.error || 'Terugboeking naar WerkPay mislukt.' };
+        }
+        newBal = txRes.newBalance;
+      } catch (err) {
+        console.warn('Firestore direct refund transaction queued offline:', err);
+        enqueueOfflineMutation({
+          type: 'bank_delta',
+          payload: {
+            username: targetAcc.username,
+            delta: safeAmount,
+            fallbackAccount: targetAcc
+          }
+        });
+      }
+    }
+
+    setBankAccounts((prev) => prev.map((a) => (a.id === targetAcc!.id ? { ...a, balance: newBal } : a)));
+    if (currentBankAccount && currentBankAccount.id === targetAcc.id) {
+      setCurrentBankAccount((prev) => (prev ? { ...prev, balance: newBal } : null));
+    }
+
+    const currentBrandKey = activeBrand || 'koekploeg';
+    const brandName = currentBrandKey === 'koekploeg' ? 'De Koekploeg' : 'Werkdonalds';
+    const refundedBy = currentPosUser?.name || 'Medewerker';
+    const cleanDesc = (params.description || '').trim();
+
+    const refundTx: BankTransaction = {
+      id: Date.now(),
+      from_account: `${brandName} WerkPin Terugboeking`,
+      to_account: targetAcc.username,
+      amount: safeAmount,
+      label: cleanDesc ? `Terugboeking: ${cleanDesc}` : 'WerkPin Terugboeking',
+      note: `Direct teruggeboekt via WerkPin${cleanUid ? ` (Pas ${cleanUid})` : ''} door ${refundedBy}`,
+      when: new Date().toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' }),
+      timestamp: Date.now()
+    };
+    setBankTransactions((prev) => [refundTx, ...prev]);
+
+    saveBankTransactionToFirestore(refundTx).catch((err) => {
+      console.warn('Firestore direct refund tx queued offline:', err);
+      enqueueOfflineMutation({ type: 'bank_tx', payload: refundTx });
+    });
+
+    AudioFX.bell();
+    logAuditAction(
+      'WERKPIN_DIRECTE_TERUGBOEKING',
+      `€ ${safeAmount.toFixed(2)} teruggeboekt naar ${targetAcc.account_holder} (@${targetAcc.username}) door ${refundedBy}${cleanDesc ? ` (${cleanDesc})` : ''}.`
+    );
+
+    return {
+      success: true,
+      message: `€ ${safeAmount.toFixed(2)} teruggeboekt naar ${targetAcc.account_holder} (@${targetAcc.username})!`,
+      account: targetAcc,
+      transaction: refundTx,
+      newBalance: newBal
     };
   };
 
@@ -5706,6 +5872,7 @@ const formatDbCashRequest = (row: any): CashPaymentRequest => {
         processCheckout,
         processSumUpPayment,
         refundSumUpTransaction,
+        refundToWerkPayAccount,
         cashRequests,
         createCashRequest,
         approveCashRequest,

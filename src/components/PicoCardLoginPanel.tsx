@@ -12,6 +12,7 @@ import {
   setHardwareTerminalLinked,
   setHardwareTerminalResult,
   subscribeHardwareTerminal,
+  toPicoShortReason,
 } from '../services/firebase';
 import { showToast } from '../services/appToast';
 import { TerminalSelector } from './WerkPayPOS/TerminalSelector';
@@ -130,7 +131,7 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
         showToast(res.message, 'success');
         if (onSuccess) onSuccess();
       } else {
-        await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16), currentTermId).catch(() => {});
+        await setHardwareTerminalResult('DECLINED', toPicoShortReason(res.message), currentTermId).catch(() => {});
         if (isMountedRef.current) {
           setErrorMsg(res.message);
         }
@@ -181,11 +182,14 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
 
         if (!st) return;
 
-        // Verify ownership if someone forced a reset
+        const expectedToken = activeClaimTokenRef.current;
         const lockOwner = extractTerminalLockOwner(st.reason);
+        const belongsToSession = !expectedToken || !lockOwner || lockOwner === expectedToken;
+
         if (
           st.status !== 'IDLE' &&
-          (!lockOwner || lockOwner === activeClaimTokenRef.current)
+          (lockOwner === expectedToken ||
+            (belongsToSession && (st.status === 'SUBMITTED' || st.status === 'CARD_SCANNED')))
         ) {
           sawActiveForClaimRef.current = true;
         }
@@ -194,7 +198,8 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
           authStyleRef.current === 'pin' &&
           st.status === 'SUBMITTED' &&
           st.scannedUid &&
-          st.enteredPin
+          st.enteredPin &&
+          belongsToSession
         ) {
           const sig = `pin:${st.scannedUid}:${st.enteredPin}:${st.updatedAt}`;
           if (handledSigRef.current === sig) return;
@@ -206,7 +211,8 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
         } else if (
           authStyleRef.current === 'quick' &&
           st.status === 'CARD_SCANNED' &&
-          st.scannedUid
+          st.scannedUid &&
+          belongsToSession
         ) {
           const sig = `quick:${st.scannedUid}:${st.updatedAt}`;
           if (handledSigRef.current === sig) return;
@@ -215,17 +221,16 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
           activeClaimTokenRef.current = '';
           setWaiting(false);
           await performLoginRef.current(st.scannedUid, undefined, 'quick');
-        } else if (
-          st.status === 'IDLE' &&
-          (sawActiveForClaimRef.current ||
-            st.updatedAt?.startsWith('pico-') ||
-            st.reason?.toLowerCase().includes('geannuleerd') ||
-            st.reason?.toLowerCase().includes('timeout'))
-        ) {
+        } else if (st.status === 'IDLE' && sawActiveForClaimRef.current) {
           waitingRef.current = false;
           activeClaimTokenRef.current = '';
           setWaiting(false);
-          setErrorMsg(st.reason || 'Inloggen geannuleerd op het pinapparaat.');
+          setErrorMsg(st.reason && st.reason !== 'Klaar' ? st.reason : 'Inloggen geannuleerd op het pinapparaat.');
+        } else if (st.status === 'DECLINED' && sawActiveForClaimRef.current) {
+          waitingRef.current = false;
+          activeClaimTokenRef.current = '';
+          setWaiting(false);
+          setErrorMsg(st.reason || 'Inloggen geweigerd op het pinapparaat.');
         }
       },
       () => {
@@ -271,6 +276,8 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
 
     const token = `${getTerminalTabSessionId()}_login_${Date.now()}`;
     activeClaimTokenRef.current = token;
+    waitingRef.current = true;
+    setWaiting(true);
 
     try {
       const label = forcePinOnly
@@ -286,8 +293,10 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
           : await claimHardwareTerminalLinkMode(label, token, targetTermId);
 
       if (!claimRes.acquired) {
+        waitingRef.current = false;
         activeClaimTokenRef.current = '';
         if (isMountedRef.current) {
+          setWaiting(false);
           setErrorMsg(
             claimRes.busyMessage ||
               'Het pinapparaat is momenteel bezig met een betaling of andere sessie.'
@@ -296,16 +305,16 @@ export const PicoCardLoginPanel: React.FC<PicoCardLoginPanelProps> = ({
         return;
       }
 
-      if (isMountedRef.current) {
-        waitingRef.current = true;
-        setWaiting(true);
-      } else {
+      if (!isMountedRef.current) {
+        waitingRef.current = false;
         activeClaimTokenRef.current = '';
         releaseHardwareTerminalIfOwned(token, targetTermId).catch(() => {});
       }
     } catch (err: any) {
+      waitingRef.current = false;
       activeClaimTokenRef.current = '';
       if (isMountedRef.current) {
+        setWaiting(false);
         setErrorMsg(err?.message || 'Kon pinapparaat niet activeren.');
       }
     }

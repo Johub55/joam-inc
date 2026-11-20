@@ -7,6 +7,7 @@ import { terminalManager, TerminalCallbacks } from '../../services/terminalServi
 import { TerminalSelector } from './TerminalSelector';
 import {
   claimHardwareTerminalPayMode,
+  extractTerminalLockOwner,
   getActiveHardwareTerminalId,
   getTerminalTabSessionId,
   HARDWARE_TERMINAL_EVENT,
@@ -16,6 +17,7 @@ import {
   setHardwareTerminalResult,
   setHardwareTerminalIdle,
   subscribeHardwareTerminal,
+  toPicoShortReason,
 } from '../../services/firebase';
 import { CashPaymentRequest } from '../../types';
 import { 
@@ -202,17 +204,23 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
       if (res.success) {
         try { await setHardwareTerminalResult('APPROVED', 'Eet smakelijk!', currentTerm); } catch {}
         if (terminalManager.getIsConnected()) {
-          await terminalManager.notifyApproved('Eet smakelijk!');
+          await terminalManager.notifyApproved('Eet smakelijk!').catch(() => {});
         }
         onClose();
       } else {
-        try { await setHardwareTerminalResult('DECLINED', res.message.slice(0, 16), currentTerm); } catch {}
+        const shortReason = toPicoShortReason(res.message);
+        try { await setHardwareTerminalResult('DECLINED', shortReason, currentTerm); } catch {}
         if (terminalManager.getIsConnected()) {
-          await terminalManager.notifyDeclined(res.message.slice(0, 16));
+          await terminalManager.notifyDeclined(shortReason).catch(() => {});
         }
         setErrorMessage(res.message);
       }
     } catch (e: any) {
+      const currentTerm = selectedTerminalIdRef.current;
+      try { await setHardwareTerminalResult('DECLINED', 'Systeemfout', currentTerm); } catch {}
+      if (terminalManager.getIsConnected()) {
+        await terminalManager.notifyDeclined('Systeemfout').catch(() => {});
+      }
       setErrorMessage(e?.message || 'Terminal betaling mislukt.');
     } finally {
       setIsProcessing(false);
@@ -280,14 +288,24 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
   useEffect(() => {
     if (!terminalCloudWaiting) return;
     let sawActiveCloudState = false;
+    const expectedToken = activeClaimTokenRef.current;
     const unsub = subscribeHardwareTerminal(
       async (state) => {
         if (!state) return;
         setTerminalLiveState(state);
-        if (state.status !== 'IDLE') {
+        const lockOwner = extractTerminalLockOwner(state.reason);
+        const belongsToSession =
+          !expectedToken || !lockOwner || lockOwner === expectedToken;
+
+        if (
+          state.status !== 'IDLE' &&
+          (lockOwner === expectedToken ||
+            (belongsToSession && (state.status === 'SUBMITTED' || state.status === 'CARD_SCANNED')))
+        ) {
           sawActiveCloudState = true;
         }
-        if (state.status === 'SUBMITTED' && state.scannedUid && state.enteredPin) {
+
+        if (state.status === 'SUBMITTED' && state.scannedUid && state.enteredPin && belongsToSession) {
           const submitSig = `${state.scannedUid}:${state.enteredPin}:${state.updatedAt}`;
           if (handledCloudSubmitRef.current === submitSig) return;
           handledCloudSubmitRef.current = submitSig;
@@ -298,17 +316,16 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
           setTerminalWaitingCard(false);
           activeClaimTokenRef.current = '';
           await executeTerminalCheckoutRef.current(state.scannedUid, state.enteredPin);
-        } else if (
-          state.status === 'IDLE' &&
-          (sawActiveCloudState ||
-            state.updatedAt?.startsWith('pico-') ||
-            state.reason?.toLowerCase().includes('geannuleerd') ||
-            state.reason?.toLowerCase().includes('timeout'))
-        ) {
+        } else if (state.status === 'IDLE' && sawActiveCloudState) {
           activeClaimTokenRef.current = '';
           setTerminalCloudWaiting(false);
           setTerminalWaitingCard(false);
-          setErrorMessage(state.reason || 'Betaling geannuleerd op het pinapparaat.');
+          setErrorMessage(state.reason && state.reason !== 'Klaar' ? state.reason : 'Betaling geannuleerd op het pinapparaat.');
+        } else if (state.status === 'DECLINED' && sawActiveCloudState) {
+          activeClaimTokenRef.current = '';
+          setTerminalCloudWaiting(false);
+          setTerminalWaitingCard(false);
+          setErrorMessage(state.reason || 'Betaling geweigerd op het pinapparaat.');
         }
       },
       (err) => {
@@ -339,7 +356,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
     };
   }, []);
 
-  const terminalBusyCheck = !terminalCloudWaiting
+  const terminalBusyCheck = !terminalCloudWaiting && !isProcessing
     ? isHardwareTerminalBusy(terminalLiveState, activeClaimTokenRef.current || undefined)
     : { busy: false };
 
@@ -351,6 +368,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
     handledCloudSubmitRef.current = '';
 
     const claimToken = `${getTerminalTabSessionId()}_pospay_${Date.now()}`;
+    activeClaimTokenRef.current = claimToken;
     let cloudActivated = false;
     let usbActivated = false;
     let cloudErrMessage = '';
@@ -365,16 +383,17 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ onClose }) => {
         selectedTerminalIdRef.current
       );
       if (!claimRes.acquired) {
+        activeClaimTokenRef.current = '';
         setErrorMessage(
           claimRes.busyMessage || 'Pinapparaat is al bezig met een andere betaling.'
         );
         return;
       }
-      activeClaimTokenRef.current = claimToken;
       cloudActivated = true;
       setTerminalCloudWaiting(true);
       setTerminalWaitingCard(true);
     } catch (e: any) {
+      activeClaimTokenRef.current = '';
       console.warn('Firebase terminal relay warning:', e);
       cloudErrMessage = e?.message || 'Firebase terminal niet bereikbaar.';
     }
